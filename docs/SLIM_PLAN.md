@@ -1,6 +1,7 @@
 # slim-reader-vowifi 精简重构计划
 
-> 状态：**计划待确认**（已收到第一批设备信息，见 F12/F13）（阶段 0 未开始，尚未改动任何代码）
+> **工作分支：`slim-reader-vowifi`**（推送实测可用；`claude/nifty-tesla-7e6qmr` 只保存了计划的最初两次提交）
+> 状态：计划已确认（2026-10-26），按 §11 分阶段执行；会话中断后从 §11 第一个未勾选的阶段继续
 > 基线：`761d38e`（MddIdd/mdd-sim-gateway v1.14.0 合并提交）
 > 基线测试：`python -m unittest discover -s tests` 在 Python 3.12 下 2015 个测试全部通过；`webui npm run build` 成功（2026-10-26 10:37 CST）
 
@@ -20,7 +21,7 @@ swap 191 MB，根分区可用 1.6 GB，读卡器 2ce3:9563（Alcor AK9563，本�
 | F5 | `control/app/failover.py` **不是**蜂窝故障转移，而是"国家出口节点该不该切换"的判定（HOLD/SWITCH/BACK_OFF）。 | 文件头文档、`main.py:2387-2457` | 建议**保留**（属于国家出口），见待定问题 Q3 |
 | F6 | `notify_push` 与引擎回调是两回事：`engine/notify.py`（引擎→控制面 `/api/engine/event`，携带 call_in/registered/tunnel_up 等）必须保留；`control/app/notify_push.py` 只是对外推送，在 main.py 有 39 处调用，可整体移除。 | grep | 符合任务要求 |
 | F7 | `media.py` 和 `rtp_forward.py` 都直接依赖 Docker：relay 模式是 coturn 容器 + 内部 Docker 网络；rtp_forward 是为 SOCKS 线路起的转发容器。direct 模式本质只是"Docker 发布 RTP 端口 + Asterisk 把 ICE host 候选改成宿主 LAN 地址"。 | 两个文件头 | 原生下用 nft DNAT 替代端口发布，见 §4.4、Q5 |
-| F8 | 线路上限当前是 `config.MAX_SIM_LINES = 10`，由 `tests/test_product_boundaries.py` 强制。 | | 改为可配置、默认 2 |
+| F8 | 线路上限当前是 `config.MAX_SIM_LINES = 10`，由 `tests/test_product_boundaries.py` 强制。 | | 改为可配置、默认 1（D3） |
 | F9 | lpac 2.3.0 需要 CMake ≥ 3.31（bullseye 是 3.18）；install.sh 已固定 Kitware 二进制 SHA-256。pcsc-lite 2.3.3 / ccid 1.6.2 用 meson 构建，bullseye 自带 meson 0.56 可能偏旧。 | `install.sh:1794-1800, 89-104` | CI 里用 Kitware cmake + pip 安装的 meson |
 | F10 | Debian 11 LTS 已于 2026-08-31 结束，现在（2026-10）bullseye 源可能已迁到 archive.debian.org。 | 公开时间表，需要设备上验证 | install.sh 的"安装运行依赖"可能要处理源；见 Q11 |
 | F12 | 设备实测（2026-10-26）：`CONFIG_MEMCG=y`，cgroup2 已启用 memory 控制器 → `MemoryMax` 有效；`CONFIG_NET_NS=y`，`ip netns add` 实测成功；`VETH`/`TUN`/`NF_TABLES`/`NFT_NAT`/`ZRAM` 均为模块（=m）；系统未安装 `nft` 命令；已有 `/dev/zram0` 191 MB swap；349c:0418 是 U 盘类大容量存储设备，不是读卡器（目前只有 1 个 SIM 读卡器）；apt 走阿里云 bullseye 源，可用，security 源被注释掉 | 设备输出 | install.sh：`modprobe` 并写 `/etc/modules-load.d/mdd.conf`；安装 nftables；检测到已有 zram 则跳过；当前硬件只能跑 1 条线路 |
@@ -40,7 +41,7 @@ swap 191 MB，根分区可用 1.6 GB，读卡器 2ce3:9563（Alcor AK9563，本�
 | main.py (8759 行) | M → 拆分 | 先删功能再拆成 routers（§3） |
 | auth.py, authz.py, gate.py | K/M | 基础鉴权保留；authz/gate 中 SMS/MMS/联系人权限项删除 |
 | clients.py | 待定 Q4 | 原生客户端 Bearer 令牌（非浏览器） |
-| config.py | M | 删 SMS/MMS/保号/通知/更新/模块配置项；`MAX_SIM_LINES` → `settings.max_lines`（默认 2） |
+| config.py | M | 删 SMS/MMS/保号/通知/更新/模块配置项；`MAX_SIM_LINES` → `settings.max_lines`（默认 1，可改 2，D3） |
 | store.py (3014 行) | M | 只保留 calls、line_states、legacy_history_imports 等通话/线路表；删 messages/sms*/mms*/allowance*/keepalive*/voicemails/contacts* |
 | status.py, carrier_id.py, vowifi_support.py, version.py, ami.py, card.py | K/M | status.py 去掉 docker 引用 |
 | sim.py, usbreader.py | K | PC/SC 读卡器检测与 PIN |
@@ -293,7 +294,7 @@ nft table inet mdd:
 | # | 风险 | 应对 |
 |---|---|---|
 | R1 | 内存：估算（未实测）pcscd 3 + sing-box 30–40 + orchestrator 25–30 + control 60–80 + 每线路（asterisk 25–40、swu_ike 25–35、ami_usim 约 20、pin_keeper 约 15）≈ 90–110 MB。1 条线路约 210–260 MB，2 条约 300–370 MB，超过当前可用 286 MB。 | zram + MemoryMax + MALLOC_ARENA_MAX；第一次构建后在设备上实测 RSS，再决定默认值是否需要从 2 降到 1 或合并 pin_keeper/ami_usim 进程 |
-| R2 | 内核：NET_NS/MEMCG/ZRAM/VETH/TUN/NF_TABLES/NFT_NAT 已确认（F12）；IP_MULTIPLE_TABLES、NFT_MASQ、NFT_CT、NF_CONNTRACK_MARK 未确认。 | Q16 |
+| R2 | 内核特性已全部确认（§10 D-设备）。`nft_fib_inet` 不可用，nftables 为 0.9.8。 | nft 规则禁止 fib 表达式与 0.9.8 之后的语法，加测试检查生成的规则集 |
 | R3 | sysmocom Asterisk 在 bullseye（gcc 10、OpenSSL 1.1.1）上从未构建过，原 Dockerfile 用的是 Fedora 44。 | 先单独跑通 build-arm64 的 Asterisk 步骤再做后续 |
 | R4 | main.py 拆分时大量测试 patch `main.xxx`，移动后 patch 失效但测试可能"假通过"或失败。 | 每个 router 一步、只改 patch 目标；加路由集合一致性测试 |
 | R5 | 删除 SMS 后网络侧行为（F11）。 | Q2 |
@@ -305,51 +306,35 @@ nft table inet mdd:
 
 ---
 
-## 10. 待定问题
+## 10. 已确认的决定（2026-10-26，以此为准）
 
-- **Q1 分支**：会话设定的开发分支是 `claude/nifty-tesla-7e6qmr`，你要求的是 `slim-reader-vowifi`。我的理解是以你为准：从 `761d38e` 新建 `slim-reader-vowifi` 并推送到它。请确认；如果推送被代理拒绝（只允许 `claude/` 前缀），退而在 `claude/nifty-tesla-7e6qmr` 上开发，CI 触发分支相应调整。
-- **Q2 短信删除后的网络侧处理**：(a) 完全删除 `res_pjsip_messaging`，网络下发的短信会被拒收，SMSC 重发直至失败；(b) 保留模块和一条最小拨号计划，只回 200/RP-ACK、丢弃内容、不入库（需要保留 `mt_rpack_routing` 补丁或等价逻辑）。我倾向 (b)，代价是多保留一个补丁。
-- **Q3** `failover.py` 属于国家出口节点切换，建议保留；`line_offline.py` 只服务于离线通知，建议随 notify_push 删除。是否同意？
-- **Q4** `clients.py`（原生客户端 Bearer 令牌登录）保留还是删除？只用浏览器的话可删。
-- **Q5** 媒体只保留 direct 模式，删除 coturn relay 模式；`rtp_forward.py` 改写为 nft DNAT 规则生成（不再是转发容器）。是否同意？
-- **Q6** 国家出口在原生下只实现 TUN 模式（§4.3）。SOCKS5 传输（`outer_transport.py` + `egress_contract.py`）代码保留但不接入，还是也做成可选模式？我倾向保留代码、暂不接入。
-- **Q7** `patches/asterisk/resolve_config_docs.py` 不在你的清单里，我建议保留（理由见 §2.2）。
-- **Q8** 不做从 Docker 版的数据迁移，只支持全新安装。是否同意？
-- **Q9** `release.yml` 删完推 GHCR/发 Release 后不剩任何 job，是否整个文件删除？
-- **Q10** 请在设备上执行并贴回：
-  ```
-  zcat /proc/config.gz 2>/dev/null | grep -E 'CONFIG_(NET_NS|VETH|TUN|NF_TABLES|NFT_NAT|NFT_MASQ|NFT_CT|NF_TABLES_INET|IP_MULTIPLE_TABLES|IP_ADVANCED_ROUTER|MEMCG|ZRAM|ZSMALLOC|CRYPTO_LZ4|CRYPTO_LZO|XFRM_USER)=' || ls /boot/config-*
-  cat /sys/fs/cgroup/cgroup.controllers; stat -fc %T /sys/fs/cgroup
-  cat /proc/swaps; lsmod | grep -E 'zram|veth|nf_tables'
-  systemctl --version | head -1
-  ip netns add t && ip link add t0 type veth peer name t1 && ip link del t0; ip netns del t; nft list ruleset | head
-  lsusb -v -d 2ce3:9563 2>/dev/null | grep -E 'bInterfaceClass|iProduct'
-  lsusb -v -d 349c:0418 2>/dev/null | grep -E 'bInterfaceClass|iProduct|iManufacturer'
-  dpkg -l | grep -E 'pcscd|libccid|libpcsclite' ; cat /etc/apt/sources.list
-  ```
-- **Q11** `apt-get update` 在设备上是否还能正常工作？如已切到 archive.debian.org，install.sh 只检测并提示，不自动改源，是否可以？
-- **Q12** fork 仓库是公开还是私有（决定 ubuntu-24.04-arm runner 能否使用）？
-- **Q13** Xray 作为可选组件：打进主包但默认不启用，还是单独出一个 `mdd-slim-xray-arm64-<version>.tar.gz`？我倾向单独打包（主包省约 30 MB）。
-- **Q15** 中国大陆网络下，建议 (a) 默认开启国家出口：没有健康出口的线路不启动（原版是可选）；(b) ePDG 域名经该国出口解析（复用 `egress.resolve_ipv4_via_socks` 的思路，sing-box 上开一个仅本机可达的 DNS/SOCKS 入口），不再用宿主 DNS。是否同意？
-- **Q16** 第二批设备检查（策略路由、nft masquerade/ct mark、veth 实际可加载）结果待回。若内核没有 `CONFIG_IP_MULTIPLE_TABLES`，§4.3 的策略路由不可用，备选：netns 内不设任何出口路由，swu_ike 走 veth 网关上的 SOCKS5（即保留的 `outer_transport.py`），同样做到"出口不通不泄漏"。
-- **Q14** 控制面以非 root `mdd` 用户运行 + sudo 只放行 `mdd-enginectl`（§4.2），多一个约 25–30 MB 的 root orchestrator。若内存紧张，可合并为一个 root 进程。先按分离方案做，是否同意？
-
----
+- **D1 分支**：`slim-reader-vowifi`。不推 main、不推 tag、不改仓库设置。
+- **D2 网络下发短信**：只回 RP-ACK、丢弃内容。从 `mt_rpack_routing` 只保留实现确认所需的最小部分。测试要证明：短信被确认、内容不落盘、不出现在 UI 与 API。
+- **D3 线路上限**：默认 1，配置可改为 2；设备实测内存后再定。
+- **D4** 保留 `failover.py`（出口节点切换）；删除 `line_offline.py`（离线通知）；删除 `clients.py`（原生客户端令牌）；只保留 direct 媒体模式，删 relay/coturn，`rtp_forward.py` 改写为 nft DNAT 规则生成；`release.yml` 整个删除；Xray 单独打包（`mdd-slim-xray-arm64-<version>.tar.gz`）；不做 Docker 版数据迁移；保留 `resolve_config_docs.py`；控制面非 root + sudo 只放行 `mdd-enginectl`。
+- **D5 出口能力**（不要与容器栈的 "socks5 transport" 混淆）：代理库里**订阅、手动粘贴单个节点、手动 SOCKS5** 三种上游都保留（`host/mdd_orchestrator.py` 的 `parse_share_link`/`parse_manual_outbound`/订阅解析）。保留出口 UDP 健康检查（IKE 用 UDP 500/4500）和"出口不通即阻断对应 VoWiFi 线路"。容器栈专用的 SOCKS transport 状态契约不接入原生路径，`outer_transport.py`/`egress_contract.py` 代码保留。
+- **D6 中国内地网络**：设备安装与运行不依赖 GitHub/PyPI/npm。sing-box、Xray、lpac、python-build-standalone 3.12 与全部 Python 依赖打进发布包；install.sh 只用 apt 装系统依赖，其余从本地 tarball 离线安装。默认开启国家出口；ePDG 经该国出口解析。install.sh 检查 NTP 同步，未同步时提示（建议 ntp.aliyun.com），不改系统配置。不修改 `/etc/apt/sources.list`。
+- **D7 设备**：内核 5.15.0-handsomekernel+；CGROUPS/MEMCG/NET_NS/IP_ADVANCED_ROUTER/IP_MULTIPLE_TABLES=y；NF_TABLES、NFT_NAT、NFT_CT、NFT_MASQ、NFT_REJECT、NF_CONNTRACK、NF_NAT、TUN、VETH、ZRAM 为模块；实测可 modprobe：veth tun nf_tables nft_nat nft_chain_nat nft_ct nft_reject_inet nft_masq；**nft_fib_inet 不可用**；nftables 0.9.8；cgroup2 控制器 cpuset cpu io memory hugetlb pids；已有 /dev/zram0 约 191 MB；读卡器 2ce3:9563 bInterfaceClass 11（CCID），pcscd 显示 "Alcor Link AK9563"，Debian ccid 1.4.34 可识别；卡为 ESTKme Plus 实体 eUICC，最多 6 条逻辑通道；349c:0418 是 U 盘，忽略。
+- **D8 由设备带来的要求**：
+  - nft 规则不用 fib 表达式、不用 0.9.8 之后的语法。
+  - install.sh 预加载上述模块并写 `/etc/modules-load.d/mdd.conf`，uninstall 删除。
+  - 已有 zram 则跳过。
+  - pcscd：install 时停用并 mask 系统 `pcscd.socket`/`pcscd.service`，卸载 apt 的 pcscd、libccid（保留 pcsc-tools），装固定版本 pcsc-lite 2.3.3 + ccid，由自己的单元启动；uninstall 恢复原状。
+  - ccid：确认固定版本源码 Info.plist 含 2ce3:9563，含则不为它加补丁；保留现有 patches/ccid（含 SCR Prime）。
+  - eSIM：保留 estkme.py 与 lpac 路径，确认在直接 PC/SC 读卡器模式（不经 vpcd 模块桥）下可用，并补测试。
 
 ## 11. 阶段与进度
 
-每个阶段结束：全量测试 + `npm run build` 通过后提交；失败先修再进入下一阶段。
+规则：每阶段结束跑全量测试 + `npm run build`，全部通过后提交、推送，并更新本节。删除前先 grep 引用；`engine/notify.py` 与 `/api/engine/event`（来电、注册状态等）必须保留。遇到会改变已确认架构的问题先停下报告。
 
-- [ ] 阶段 0：建分支、提交本计划、记录基线
-- [ ] 阶段 1：删外围（workflows：issue-triage/drivers、.github/scripts、.github/codex、runtime/、drivers/、tools/container-runtime、tools/drivers、tools/pve-*、update-policy.json、NAS 模板、相关测试/文档）
-- [ ] 阶段 2：删功能——通知推送、自动更新、余额/保号、联系人、语音留言（control + webui + i18n + 测试）
-- [ ] 阶段 3：删功能——短信/彩信/USSD（含 Asterisk 补丁、模板、store 表）
-- [ ] 阶段 4：删蜂窝模块路径（cellular_*、modem_*、device_state 模块逻辑、host/vpcd_modem_bridge、host/modem_probe、orchestrator 的 MM/NM 部分、4G/飞行模式 UI）
-- [ ] 阶段 5：拆分 main.py（state.py → 逐个 router）
-- [ ] 阶段 6：线路上限可配置（默认 2）
-- [ ] 阶段 7：systemd 后端——mdd_netns.py + 泄漏测试、engine.py/runtime.py/media/rtp_forward/softphone_ws 改造、orchestrator 去 Docker/去模块、enginectl、单元文件、engine 运行脚本
-- [ ] 阶段 8：Asterisk 模块/模板精简、日志级别
-- [ ] 阶段 9：新 install.sh（含 zram）
-- [ ] 阶段 10：CI——ci.yml、build-arm64.yml、release.yml 处理；删 Dockerfile/compose
-- [ ] 阶段 11：文档（README、INSTALL、ARCHITECTURE、TROUBLESHOOTING）
-- [ ] 阶段 12：在设备上实测（需要你执行），按实测调整 MemoryMax 和默认线路数
+- [x] 阶段 0：建分支 `slim-reader-vowifi`、写入已确认决定、记录基线（2015 测试通过、WebUI 构建成功）
+- [ ] 阶段 1：删除短信/彩信/USSD（保留 D2 的最小 RP-ACK）、余额保号、通知推送、语音留言、联系人、自动更新，连同测试、UI、i18n
+- [ ] 阶段 2：删除蜂窝模块路径与全部容器部署文件（runtime/、Dockerfile、compose、drivers/、相关 tools 与 workflow）
+- [ ] 阶段 3：拆分 main.py 为 routers（每拆一块跑一次测试）
+- [ ] 阶段 4：systemd 替换 Docker 编排——引擎、netns 隔离、出口防泄漏、RTP DNAT，补测试
+- [ ] 阶段 5：重写 install.sh（install/status/logs/uninstall）与 systemd 单元
+- [ ] 阶段 6：CI——ci.yml 在工作分支 push/PR 上跑；新增 build-arm64.yml；删除 release.yml
+- [ ] 阶段 7（需要你在设备上执行）：实测内存与功能，调整 MemoryMax 与线路上限
+
+### 进度日志
+- 2026-10-26 阶段 0 完成。
