@@ -48,21 +48,6 @@ class NotificationTemplateUiTests(unittest.TestCase):
         self.assertIn('.u-notifications-page>.u-tabs+.u-device-grid { grid-template-columns:repeat(2,minmax(0,1fr))', CSS)
         self.assertIn('.u-notifications-page>.u-tabs+.u-device-grid { grid-template-columns:1fr;', CSS)
 
-    def test_telegram_and_updates_offer_library_and_country_routes(self):
-        self.assertIn("tg.proxy_mode === 'library'", SOURCE)
-        self.assertIn("s.updates?.proxy_mode === 'country'", SOURCE)
-
-    def test_subscription_profiles_are_filtered_from_generic_proxy_pickers(self):
-        self.assertIn("profile?.type !== 'subscription'", SOURCE)
-        self.assertEqual(SOURCE.count("selectableProxyProfiles(s).map"), 2)
-
-    def test_network_and_version_notes_follow_their_own_controls(self):
-        network_note = SOURCE.index("SOCKS5 entries connect directly")
-        update_method = SOURCE.index("<div><label>{t('Update method')}")
-        version_note = SOURCE.index("The All versions option follows")
-        self.assertLess(network_note, update_method)
-        self.assertLess(update_method, version_note)
-
 
 if __name__ == "__main__":
     unittest.main()

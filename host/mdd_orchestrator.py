@@ -358,9 +358,7 @@ MM_RESETTABLE_FAILURES = {"unknown-capabilities", "unknown"}
 MM_FAILED_GRACE_SECONDS = 60.0
 MM_RESET_BACKOFF_SECONDS = 300.0
 MM_RESET_ATTEMPTS = 3
-# Grace between publishing "launching" and expecting systemd to report the updater unit as
-# active, so a loop pass that races a launch cannot retire the run it just started.
-UPDATE_LAUNCH_GRACE_SECONDS = 90.0
+
 COUNTRY_PROXY_LISTEN = os.environ.get("MDD_COUNTRY_PROXY_LISTEN", "172.17.0.1")
 # The control plane's container in docker installs; install.sh owns the same name.
 CONTROL_CONTAINER = "mdd-sim-gateway-control"
@@ -881,153 +879,6 @@ class Orchestrator:
     def service_active(name: str) -> bool:
         return run(["systemctl", "is-active", "--quiet", name]).returncode == 0
 
-    # ------------------------------------------------------------------ self-update
-    def process_update_request(self):
-        """Launch the detached self-updater when the control plane requests one.
-
-        The updater must outlive this process (``install.sh reload`` restarts the
-        orchestrator and the control plane), so it runs as a transient systemd unit from a
-        staged copy of ``host/mdd_update.py`` — the checkout under ``self.repo`` is replaced
-        while it runs.  The request file is consumed before launching so a restart loop can
-        never spawn a second updater for the same request.
-        """
-        request_path = self.root / "update-request.json"
-        request = read_json(request_path)
-        if not request:
-            return
-        try:
-            request_path.unlink()
-        except OSError:
-            pass
-        status_path = self.root / "update-status.json"
-        version = str(request.get("version") or "")
-        repository = str(request.get("repository") or "")
-        network = request.get("network") or {}
-        raw_asset_sizes = request.get("asset_sizes") or {}
-        asset_sizes = {}
-        if isinstance(raw_asset_sizes, dict):
-            for name, size in raw_asset_sizes.items():
-                try:
-                    parsed_size = int(size)
-                except (TypeError, ValueError):
-                    continue
-                if re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", str(name)) \
-                        and 0 < parsed_size < 20 * 1024 * 1024 * 1024:
-                    asset_sizes[str(name)] = parsed_size
-
-        def fail(reason: str):
-            atomic_json(status_path, {"state": "failed", "phase": "launch", "error": reason,
-                                      "target": version, "updated_at": int(time.time())})
-
-        if not re.fullmatch(r"\d+(?:\.\d+)*(?:-[0-9A-Za-z.]+)?", version) \
-                or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
-            fail("invalid update request")
-            return
-        desired = read_json(self.desired_path)
-        proxy = desired.get("proxy") or {}
-        live = read_json(self.status_path).get("exits") or {}
-
-        def resolve_route(selection: dict) -> dict:
-            mode = str(selection.get("proxy_mode") or "direct").lower()
-            if mode == "direct":
-                return {"proxy_url": "", "route": "direct", "route_name": ""}
-            if mode == "country":
-                country = str(selection.get("proxy_country") or "").strip().lower()
-                exit_cfg = (proxy.get("exits") or {}).get(country) or {}
-                state = live.get(country) or {}
-                try:
-                    proxy_port = int(state.get("proxy_port") or 0)
-                except (TypeError, ValueError):
-                    proxy_port = 0
-                proxy_host = str(state.get("proxy_host") or "").strip()
-                if (not re.fullmatch(r"[a-z]{2}", country) or not exit_cfg.get("enabled")
-                        or not state.get("ready") or proxy_host != COUNTRY_PROXY_LISTEN
-                        or not 1 <= proxy_port <= 65535):
-                    raise ValueError("selected update country exit is not ready")
-                return {"proxy_url": f"socks5h://{proxy_host}:{proxy_port}",
-                        "route": "country", "route_name": country.upper()}
-            if mode != "library":
-                raise ValueError("invalid update proxy mode")
-            profile_id = str(selection.get("proxy_profile_id") or "").strip()
-            profile = (proxy.get("profiles") or {}).get(profile_id) or {}
-            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", profile_id) or not profile:
-                raise ValueError("selected update proxy is not in the proxy library")
-            route_name = str(profile.get("name") or profile_id).strip()[:120]
-            if profile.get("type") == "socks5":
-                host = str(profile.get("server") or "").strip()
-                try:
-                    port = int(profile.get("port") or 1080)
-                except (TypeError, ValueError):
-                    port = 0
-                if not host or not 1 <= port <= 65535 or any(ch in host for ch in "\r\n/@"):
-                    raise ValueError("selected SOCKS5 update proxy is invalid")
-                username = urllib.parse.quote(str(profile.get("username") or ""), safe="")
-                password = urllib.parse.quote(str(profile.get("password") or ""), safe="")
-                auth = f"{username}:{password}@" if username or password else ""
-                proxy_url = f"socks5h://{auth}{host}:{port}"
-            else:
-                exits = proxy.get("exits") or {}
-                state = next((live.get(country) or {} for country, exit_cfg in exits.items()
-                              if isinstance(exit_cfg, dict) and exit_cfg.get("enabled")
-                              and exit_cfg.get("profile_id") == profile_id
-                              and (live.get(country) or {}).get("ready")), {})
-                try:
-                    proxy_port = int(state.get("proxy_port") or 0)
-                except (TypeError, ValueError):
-                    proxy_port = 0
-                proxy_host = str(state.get("proxy_host") or "").strip()
-                if proxy_host != COUNTRY_PROXY_LISTEN or not 1 <= proxy_port <= 65535:
-                    raise ValueError("selected update proxy has no ready country exit")
-                proxy_url = f"socks5h://{proxy_host}:{proxy_port}"
-            return {"proxy_url": proxy_url, "route": "library", "route_name": route_name}
-
-        requested_routes = request.get("networks")
-        selections = requested_routes if isinstance(requested_routes, list) else [network]
-        routes, route_error = [], ""
-        for selection in selections:
-            if not isinstance(selection, dict):
-                continue
-            try:
-                resolved = resolve_route(selection)
-            except ValueError as exc:
-                route_error = str(exc)
-                continue
-            if not any(item["proxy_url"] == resolved["proxy_url"] for item in routes):
-                routes.append(resolved)
-        if not routes:
-            fail(route_error or "no usable update download route")
-            return
-        if self.dry_run:
-            fail("dry-run orchestrator does not apply updates")
-            return
-        if self.service_active("mdd-sim-gateway-update.service"):
-            return  # an update is already running; drop the duplicate request
-        runner = self.data / "update" / "runner.py"
-        try:
-            runner.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            shutil.copy2(self.repo / "host" / "mdd_update.py", runner)
-            network_path = runner.parent / "network.json"
-            # Proxy credentials stay in a root-only file and never appear in systemd's command
-            # line, unit metadata, progress status or journal output.
-            atomic_json(network_path, {"proxy_url": routes[0]["proxy_url"],
-                                      "route": routes[0]["route"],
-                                      "route_name": routes[0]["route_name"],
-                                      "routes": routes,
-                                      "asset_sizes": asset_sizes})
-        except OSError as exc:
-            fail(f"could not stage the updater: {exc}")
-            return
-        run(["systemctl", "reset-failed", "mdd-sim-gateway-update.service"])
-        atomic_json(status_path, {"state": "running", "phase": "launching", "target": version,
-                                  "updated_at": int(time.time())})
-        result = run(["systemd-run", "--unit", "mdd-sim-gateway-update", "--collect",
-                      "--description", "MDD Sim Gateway self-update",
-                      sys.executable, str(runner), "--repo", str(self.repo),
-                      "--data", str(self.data), "--version", version,
-                      "--repository", repository, "--network-config", str(network_path)])
-        if result.returncode != 0:
-            fail(f"systemd-run failed: {(result.stderr or result.stdout or '').strip()}")
-
     def process_service_restart_request(self):
         """Restart the gateway's own services, or the host, when the control plane asks.
 
@@ -1101,34 +952,6 @@ class Orchestrator:
         if status.get("state") == "running" and status.get("scope") in {"services", "host"}:
             atomic_json(status_path, {**status, "state": "success",
                                       "updated_at": int(time.time())})
-
-    def reap_abandoned_update(self):
-        """Retire a progress document whose updater no longer exists.
-
-        An updater killed mid-flight — the host rebooted or lost power, the transient unit was
-        stopped, the process was OOM-killed — cannot record its own death, so the document it
-        was publishing to stays "running" and the WebUI resumes into that dead progress view on
-        every visit until someone deletes the file over SSH.  systemd knows what the document
-        cannot say: with no request waiting to be launched and no updater unit left, the run is
-        over.  The failure keeps the stage and asset it died on, which is the useful part.
-        """
-        if self.dry_run:
-            return
-        status_path = self.root / "update-status.json"
-        status = read_json(status_path)
-        if status.get("state") != "running":
-            return
-        if (self.root / "update-request.json").is_file():
-            return  # queued for process_update_request(); no unit is expected yet
-        if time.time() - int(status.get("updated_at") or 0) < UPDATE_LAUNCH_GRACE_SECONDS:
-            return
-        if self.service_active("mdd-sim-gateway-update.service"):
-            return
-        # Only the code is published: the WebUI renders it in the operator's language, and an
-        # `error` string beside it would just repeat the same sentence in English.
-        atomic_json(status_path, {**status, "state": "failed", "updated_at": int(time.time()),
-                                  "error_code": "update.error.abandoned"})
-        self.log(f"retired an abandoned update at phase {status.get('phase') or 'unknown'}")
 
     def publish_device_status(self, desired_devices: dict, assignments: dict,
                               *, transitioning=False, error="", disruption=None,
@@ -3360,8 +3183,7 @@ class Orchestrator:
         # be completed by the process that comes back.
         self.settle_service_restart()
         while not self.stop:
-            self.process_update_request()
-            self.reap_abandoned_update()
+
             self.process_service_restart_request()
             self.process_bridge_restart_requests()
             self.retire_obsolete_services()

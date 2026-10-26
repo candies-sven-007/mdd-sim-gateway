@@ -76,20 +76,6 @@ class MigrationBackupTests(unittest.TestCase):
 
 
 class LocalBackupTests(unittest.TestCase):
-    def test_release_archives_being_downloaded_by_the_updater_are_left_out(self):
-        with tempfile.TemporaryDirectory() as temp:
-            live = Path(temp, "live")
-            with _Store(live), patch.object(config, "DATA_DIR", str(live)):
-                Path(live, "config.yaml").write_text("settings: {}\ninstances: {}\n")
-                staging = Path(live, "update", "container-update.abc123")
-                staging.mkdir(parents=True)
-                Path(staging, "mdd-sim-gateway-engine-v9-arm64.tar.gz").write_bytes(b"x" * 4096)
-                Path(live, "update", "compose.previous.yaml").write_text("services: {}\n")
-                result = operations.create_local_backup("Test Gateway")
-                with tarfile.open(Path(store.backup_dir()) / result["name"]) as archive:
-                    names = archive.getnames()
-        self.assertIn("update/compose.previous.yaml", names)
-        self.assertFalse([n for n in names if n.startswith("update/container-update.")])
 
     def test_a_full_backup_holds_a_consistent_history_and_its_attachments(self):
         with tempfile.TemporaryDirectory() as temp:

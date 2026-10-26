@@ -200,19 +200,7 @@ DEFAULTS = {
             "notification_history_days": 30,
             "support_bundle_log_lines": 500,
         },
-        # Software update traffic tries direct first, then definitions from the proxy library.
-        # Keeping only the library id avoids a second credential store for the updater.
-        "updates": {
-            "proxy_mode": "auto",
-            "proxy_profile_id": "",
-            "proxy_country": "",
-            # Automatic and notify-only are mutually exclusive. New installations track stable
-            # releases explicitly classified as main automatically; every automatic install
-            # still requires an exact
-            # promotion in update-policy.json.
-            "update_mode": "automatic",
-            "version_scope": "main",
-        },
+
         # Local lpac (eSIM LPA) integration. Binary is built by `./install.sh build-lpac` into
         # $MDD_DATA/lpac/ (STANDALONE layout). Empty lpac_bin → default path below.
         "esim": {
@@ -439,8 +427,7 @@ def load() -> dict:
             })
         esim_saved = data.get("settings", {}).get("esim", {}) or {}
         out["settings"]["esim"] = {**DEFAULTS["settings"]["esim"], **esim_saved}
-        for key in ("proxy", "hardware", "security", "maintenance", "device_defaults",
-                    "updates"):
+        for key in ("proxy", "hardware", "security", "maintenance", "device_defaults"):
             saved = data.get("settings", {}).get(key, {}) or {}
             out["settings"][key] = {**DEFAULTS["settings"][key], **saved}
         out["settings"]["hardware"]["modem_profiles"] = merged_modem_profiles(
@@ -508,63 +495,6 @@ def load() -> dict:
             country = subscription_country(telegram_profile_id)
             if country:
                 telegram.update(proxy_mode="country", proxy_profile_id="", proxy_country=country)
-        # Import legacy updater proxy definitions into the shared library without changing the
-        # route the operator selected. Manual SOCKS settings become a private library entry;
-        # an existing country selection remains pinned to that country.
-        updates = out["settings"].get("updates") or {}
-        update_mode = str(updates.get("proxy_mode") or "auto").lower()
-        update_profile_id = ""
-        update_country = ""
-        if update_mode == "country":
-            country = str(updates.get("proxy_country") or "").strip().lower()
-            if re.fullmatch(r"[a-z]{2}", country) and isinstance(exits.get(country), dict):
-                update_country = country
-        elif update_mode == "manual":
-            raw = str(updates.get("proxy_url") or "").strip()
-            parsed = urllib.parse.urlsplit(raw)
-            if parsed.scheme.lower() in {"socks5", "socks5h"} and parsed.hostname:
-                update_profile_id = "legacy-update-proxy"
-                profiles.setdefault(update_profile_id, {
-                    "name": "Software update proxy", "type": "socks5",
-                    "server": parsed.hostname, "port": parsed.port or 1080,
-                    "username": urllib.parse.unquote(parsed.username or ""),
-                    "password": urllib.parse.unquote(parsed.password or ""),
-                })
-        elif update_mode == "library" and str(updates.get("proxy_profile_id") or "") in profiles:
-            selected_profile_id = str(updates["proxy_profile_id"])
-            if (profiles.get(selected_profile_id) or {}).get("type") == "subscription":
-                update_country = subscription_country(selected_profile_id)
-                if update_country:
-                    update_mode = "country"
-            else:
-                update_profile_id = selected_profile_id
-        normalized_update_mode = "country" if update_mode == "country" and update_country \
-            else "library" if update_mode in {"library", "manual"} and update_profile_id \
-            else (update_mode if update_mode in {"auto", "direct"} else "auto")
-        raw_updates = data.get("settings", {}).get("updates", {}) or {}
-        update_mode = str(raw_updates.get("update_mode") or "").lower()
-        version_scope = str(raw_updates.get("version_scope") or "").lower()
-        if version_scope == "feature":
-            version_scope = "main"
-        if update_mode not in {"automatic", "notify"}:
-            legacy_auto_update = raw_updates.get("auto_update")
-            update_mode = "automatic" if legacy_auto_update is True else \
-                "notify" if legacy_auto_update is False else "automatic"
-            if not version_scope:
-                version_scope = str(raw_updates.get("notification_mode") or "all") \
-                    if update_mode == "notify" else "all" if legacy_auto_update is True \
-                    else "main"
-            if version_scope == "feature":
-                version_scope = "main"
-        if version_scope not in {"all", "main"}:
-            version_scope = "main" if update_mode == "automatic" else "all"
-        out["settings"]["updates"] = {
-            "proxy_mode": normalized_update_mode,
-            "proxy_profile_id": update_profile_id if normalized_update_mode == "library" else "",
-            "proxy_country": update_country if normalized_update_mode == "country" else "",
-            "update_mode": update_mode,
-            "version_scope": version_scope,
-        }
         # Asterisk debug includes complete SIP messages and IMS identities.  Older manual
         # provisioning forms accidentally enabled it by default, so normalize every loaded
         # line as well as new writes; this makes an upgrade safe before the operator next edits

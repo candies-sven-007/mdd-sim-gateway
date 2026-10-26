@@ -3,6 +3,7 @@ import React, { createContext, useContext, useEffect, useMemo, useState } from '
 const STORAGE_KEY = 'mdd-language'
 
 const zh = {
+  'Source code': '源代码', Backups: '备份',
   'Back to conversations': '返回会话列表',
   '{count} unread': '{count} 条未读', 'Mark all read': '全部标为已读',
   Contacts: '通讯录', 'Add contact': '添加联系人', 'Contact added': '联系人已添加', 'Contact removed': '联系人已删除',

@@ -33,11 +33,11 @@ from starlette import formparsers as starlette_formparsers
 
 from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, notify_push, lpa, auth,
-               estkme, usbreader, egress, device_state, operations, update_check, cellular_sms,
+               estkme, usbreader, egress, device_state, operations, cellular_sms,
                sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd, mms,
                mms_media, mms_staging, mms_transport, softphone_ws, modem_ims, vowifi_support,
                modem_voice, gate, line_offline, contacts, media, clients, authz)
-from .version import VERSION
+from .version import SOURCE_URL, VERSION
 from .ami import AmiClient
 from .runtime import RuntimeRegistry
 
@@ -86,7 +86,7 @@ LINE_HISTORY_PRUNE_INTERVAL_SECONDS = 3600
 # Comfortably below store.LINE_STATE_CONTINUITY_SECONDS, so throttled writes still read back
 # as one uninterrupted observation.
 LINE_STATE_WRITE_INTERVAL_SECONDS = 30
-UPDATE_CHECK_INTERVAL_SECONDS = float(os.environ.get("MDD_UPDATE_CHECK_INTERVAL", "21600"))
+
 _line_state_written: dict[str, tuple[str, float]] = {}
 _line_registered_written: dict[str, float] = {}   # per-line throttle for the durable
                                                  # "last registered" stamp
@@ -2967,25 +2967,6 @@ def apply_health(iid, inst, st, container_id: str | None = None):
     return st
 
 
-async def update_automation_poller():
-    """Check releases without requiring a browser login.
-
-    Notification delivery and the promotion-gated auto-update decision are blocking network/
-    filesystem work, so keep them off the API event loop. A short startup delay lets the host
-    finish restoring routes after boot; later checks use the same six-hour cadence as the UI.
-    """
-    await asyncio.sleep(30)
-    while True:
-        try:
-            result = await asyncio.to_thread(update_check.automation_cycle)
-            if (operations.container_stack_enabled() and isinstance(result, dict)
-                    and result.get("auto_update_requested")):
-                await asyncio.to_thread(operations.launch_container_update)
-        except Exception as exc:  # noqa: a failed poll must never take the control plane down
-            log.warning("background update check failed: %s", type(exc).__name__)
-        await asyncio.sleep(max(300, UPDATE_CHECK_INTERVAL_SECONDS))
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if operations.container_stack_enabled():
@@ -3035,7 +3016,7 @@ async def lifespan(app: FastAPI):
     host_poller = asyncio.create_task(host_health_poller())
     segment_reaper = asyncio.create_task(sms_segment_reaper())
     mms_runner = asyncio.create_task(mms_worker())
-    update_poller = asyncio.create_task(update_automation_poller())
+
     media_task = asyncio.create_task(media_supervisor())
     for iid in recovered_modem_lines:
         asyncio.create_task(_auto_start_hotplugged_line(iid))
@@ -3046,12 +3027,13 @@ async def lifespan(app: FastAPI):
     host_poller.cancel()
     segment_reaper.cancel()
     mms_runner.cancel()
-    update_poller.cancel()
+
     media_task.cancel()
     # Reap the cancelled tasks (the monitor may be parked in a to_thread wait for up to
     # its timeout; awaiting keeps shutdown deterministic instead of leaking the error).
     await asyncio.gather(poller, monitor, sms_poller, host_poller,
-                         segment_reaper, mms_runner, update_poller, media_task,
+                         segment_reaper, mms_runner, media_task,
+
                          return_exceptions=True)
     await hub.runtime.close()
     for c in hub.ami.values():
@@ -5344,25 +5326,6 @@ def api_put_settings(body: dict):
             notify_push.build_notification_message(sample, channel)
         except ValueError as exc:
             raise HTTPException(400, f"invalid Feishu configuration: {exc}") from exc
-    if "updates" in body:
-        try:
-            body["updates"] = update_check.validate_update_settings(body.get("updates"))
-        except update_check.UpdateNetworkError as exc:
-            raise HTTPException(400, str(exc)) from exc
-        if body["updates"]["proxy_mode"] == "library":
-            effective_proxy = (body.get("proxy") if isinstance(body.get("proxy"), dict)
-                               else cfg.get_settings().get("proxy")) or {}
-            update_profile = (effective_proxy.get("profiles") or {}).get(
-                body["updates"]["proxy_profile_id"]) or {}
-            if not update_profile:
-                raise HTTPException(400, "update proxy references an unknown proxy library entry")
-            if update_profile.get("type") == "subscription":
-                raise HTTPException(400, "updates cannot select a subscription; use a country exit")
-        elif body["updates"]["proxy_mode"] == "country":
-            effective_proxy = (body.get("proxy") if isinstance(body.get("proxy"), dict)
-                               else cfg.get_settings().get("proxy")) or {}
-            if body["updates"]["proxy_country"] not in (effective_proxy.get("exits") or {}):
-                raise HTTPException(400, "update proxy references an unknown country exit")
     hardware = body.get("hardware")
     if hardware is not None:
         if not isinstance(hardware, dict):
@@ -5569,7 +5532,7 @@ def api_system_status():
             "container_stack": operations.container_stack_enabled(),
             "host_restart_available": not operations.container_stack_enabled(),
         },
-        "repository_url": f"https://github.com/{update_check.repository()}",
+        "repository_url": SOURCE_URL,
         "backups": operations.list_local_backups(),
         "security": {
             "https": True,
@@ -5598,56 +5561,6 @@ def api_host_alerts_clear():
     hub.host_alerts = []
     _save_host_alert_state(hub.host_alert_state)
     return {"ok": True, "cleared": cleared}
-
-
-@app.get("/api/system/update/check")
-async def api_system_update_check(force: bool = False):
-    """Read-only release lookup. Requires an admin session (see gate.PUBLIC_PATHS).
-
-    The periodic UI poll uses the short in-process cache; only an explicit "Check for updates"
-    click passes force=true, so repeated logins/reloads cannot burn GitHub's unauthenticated
-    rate limit.
-    """
-    return await asyncio.to_thread(update_check.check, force)
-
-
-@app.get("/api/system/update/releases")
-async def api_system_update_releases(force: bool = False):
-    """Published stable/test versions available for an explicit manual channel switch."""
-    return await asyncio.to_thread(update_check.releases, force)
-
-
-@app.get("/api/system/repository/stars")
-async def api_system_repository_stars(force: bool = False):
-    """Repository metadata is retried independently of the slower release poll."""
-    return await asyncio.to_thread(update_check.repository_stars, force)
-
-
-@app.post("/api/system/update/apply")
-async def api_system_update_apply(body: dict):
-    """Start a detached update through the host orchestrator or container-stack helper.
-
-    The response remains immediate in both deployment modes; progress is polled separately.
-    """
-    version = body.get("version")
-    result = await asyncio.to_thread(update_check.request_apply, version=version)
-    if result.get("ok") and operations.container_stack_enabled():
-        launched = await asyncio.to_thread(operations.launch_container_update)
-        if not launched.get("ok"):
-            return launched
-    return result
-
-
-@app.get("/api/system/update/progress")
-def api_system_update_progress():
-    return update_check.apply_status()
-
-
-@app.post("/api/system/update/cancel")
-async def api_system_update_cancel():
-    """Clear a progress document left behind by an updater that never finished, so the dialog
-    can offer the update again instead of resuming into a dead progress view."""
-    return await asyncio.to_thread(update_check.cancel_apply)
 
 
 @app.post("/api/system/backups")

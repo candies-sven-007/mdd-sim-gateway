@@ -782,9 +782,7 @@ export function EgressPage({ showToast }) {
     const exits = { ...(proxy.exits || {}) }; delete exits[country]
     setS(current => ({ ...current, proxy: { ...current.proxy, exits },
       telegram: current.telegram?.proxy_mode === 'country' && current.telegram?.proxy_country === country
-        ? { ...current.telegram, proxy_mode: 'direct', proxy_country: '' } : current.telegram,
-      updates: current.updates?.proxy_mode === 'country' && current.updates?.proxy_country === country
-        ? { ...current.updates, proxy_mode: 'auto', proxy_country: '' } : current.updates }))
+        ? { ...current.telegram, proxy_mode: 'direct', proxy_country: '' } : current.telegram }))
   }
   const openAddProfile = () => setProfileDraft({ type: 'subscription', name: '', url: '', refresh_minutes: 30, value: '', server: '', port: 1080, username: '', password: '' })
   const confirmAddProfile = () => {
@@ -806,9 +804,7 @@ export function EgressPage({ showToast }) {
     const next = { ...profiles }; delete next[id]
     setS(current => ({ ...current, proxy: { ...current.proxy, profiles: next },
       telegram: current.telegram?.proxy_profile_id === id
-        ? { ...current.telegram, proxy_mode: 'direct', proxy_profile_id: '' } : current.telegram,
-      updates: current.updates?.proxy_profile_id === id
-        ? { ...current.updates, proxy_mode: 'auto', proxy_profile_id: '' } : current.updates }))
+        ? { ...current.telegram, proxy_mode: 'direct', proxy_profile_id: '' } : current.telegram }))
   }
   const testProfile = async id => {
     setProfileTests(x => ({ ...x, [id]: { busy: true } }))
@@ -1071,27 +1067,10 @@ export function NotificationsPage({ showToast, instances = [] }) {
   </div>
 }
 
-export function SystemPage({ showToast, openUpdateDialog }) {
-  const { t, language, setLanguage } = useI18n(); const [s, setS] = useState(null); const [loadError, setLoadError] = useState(false); const [tab, setTab] = useState('general'); const [status, setStatus] = useState(null); const [statusLoaded, setStatusLoaded] = useState(false); const [statusError, setStatusError] = useState(false); const [update,setUpdate]=useState(null); const [releaseChoices,setReleaseChoices]=useState([]); const [selectedRelease,setSelectedRelease]=useState(''); const [checking,setChecking]=useState(false); const [passwordForm,setPasswordForm]=useState({current:'',next:'',confirm:''}); const [restarting,setRestarting]=useState(null); const [maintenanceBusy,setMaintenanceBusy]=useState(''); const [authClients,setAuthClients]=useState(null); const [authClientsError,setAuthClientsError]=useState(false)
+export function SystemPage({ showToast }) {
+  const { t, language, setLanguage } = useI18n(); const [s, setS] = useState(null); const [loadError, setLoadError] = useState(false); const [tab, setTab] = useState('general'); const [status, setStatus] = useState(null); const [statusLoaded, setStatusLoaded] = useState(false); const [statusError, setStatusError] = useState(false); const [passwordForm,setPasswordForm]=useState({current:'',next:'',confirm:''}); const [restarting,setRestarting]=useState(null); const [maintenanceBusy,setMaintenanceBusy]=useState(''); const [authClients,setAuthClients]=useState(null); const [authClientsError,setAuthClientsError]=useState(false)
   const loadStatus = () => api.systemStatus().then(value => { setStatus(value); setStatusError(false) }).catch(() => setStatusError(true)).finally(() => setStatusLoaded(true))
   useEffect(() => { api.settings().then(value => { setS(value); setLoadError(false) }).catch(() => setLoadError(true)); loadStatus() }, [])
-  const loadReleases = async (force = false) => {
-    const result = await api.updateReleases(force)
-    if (!result.ok) throw new Error(t(result.error_code || result.error))
-    const choices = result.releases || []
-    setReleaseChoices(choices)
-    setSelectedRelease(current => choices.some(item => item.latest === current)
-      ? current : (choices.find(item => !item.prerelease)?.latest || choices[0]?.latest || ''))
-    return result
-  }
-  useEffect(() => {
-    if (tab !== 'backup') return
-    loadReleases().catch(() => {})
-    // App already checks once after login. This call normally reuses that cached result, so
-    // the settings page shows the last observed version/time instead of owning an unrelated
-    // empty state until the user presses the button again.
-    api.checkUpdate().then(setUpdate).catch(() => {})
-  }, [tab])
   useEffect(() => {
     if (!restarting) return
     let stop = false, wentDown = false
@@ -1115,7 +1094,7 @@ export function SystemPage({ showToast, openUpdateDialog }) {
   const loadAuthClients=()=>api.authClients().then(value=>{setAuthClients(value.clients||[]);setAuthClientsError(false)}).catch(()=>setAuthClientsError(true))
   useEffect(()=>{if(tab==='security')loadAuthClients()},[tab])
   if (!s || !statusLoaded) return <p className={loadError || statusError ? 'u-error' : ''}>{t(loadError || statusError ? 'Loading failed' : 'Loading')}{!loadError && !statusError && '…'}</p>
-  const tabs = [['general', t('General')], ['web', t('Web access')], ['voice', t('Calls & VoWiFi')], ['security', t('Security')], ['backup', t('Backup & updates')], ['maintenance', t('Maintenance')]]
+  const tabs = [['general', t('General')], ['web', t('Web access')], ['voice', t('Calls & VoWiFi')], ['security', t('Security')], ['backup', t('Backups')], ['maintenance', t('Maintenance')]]
   const buildCacheReclaimable = status?.host?.project_storage?.build_cache_reclaimable_bytes
   const oldImagesReclaimable = status?.host?.project_storage?.mdd_old_images_reclaimable_bytes
   const hostRestartAvailable = status?.deployment?.host_restart_available !== false
@@ -1148,9 +1127,6 @@ export function SystemPage({ showToast, openUpdateDialog }) {
       setRestarting(scope)
     } catch (e) { showToast(e.message) }
   }
-  const checkUpdate=async()=>{setChecking(true);try{const [result]=await Promise.all([api.checkUpdate(true),loadReleases(true)]);setUpdate(result);showToast(result.update_available?t('Update available'):(result.ok?t('Already up to date'):t(result.error_code||result.error)))}catch(e){showToast(e.message)}finally{setChecking(false)}}
-  const chosenRelease = releaseChoices.find(item => item.latest === selectedRelease)
-  const lastUpdateCheck = update?.last_check_at ? new Date(update.last_check_at * 1000).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US', { hour12: false }) : ''
   const changePassword=async()=>{if(passwordForm.next!==passwordForm.confirm){showToast(t('Passwords do not match'));return}try{await api.authPassword(passwordForm.current,passwordForm.next);window.location.reload()}catch(e){showToast(e.message)}}
   const revokeAuthClient=async(id)=>{if(!window.confirm(t('Sign this app out?')))return;try{await api.revokeAuthClient(id);loadAuthClients()}catch(e){showToast(e.message)}}
   return <div className="u-page"><div className="u-tabs">{tabs.map(([k, l]) => <button key={k} className={tab === k ? 'active' : ''} onClick={() => setTab(k)}>{l}</button>)}</div><div className={['backup', 'maintenance'].includes(tab) ? 'u-settings-shell' : 'card u-panel'}>
@@ -1177,38 +1153,7 @@ export function SystemPage({ showToast, openUpdateDialog }) {
           <div className="u-settings-card-head"><div><h2>{t('Local backups')}</h2><p>{t('Backups stay encrypted by host permissions and are not downloaded through the browser.')}</p></div><button className="btn btn-primary" onClick={() => action('backup')}>{t('Create local backup')}</button></div>
           <div className="u-settings-list">{(status?.backups || []).map(item => <div className="u-backup-item" key={item.name}><div><span>{item.name}</span><b>{formatBytes(item.size)} · {new Date(item.created_at * 1000).toLocaleString()}</b></div><button className="btn btn-danger-outline" onClick={() => deleteBackup(item.name)}>{t('Delete')}</button></div>)}</div>
         </section>
-        <section className="card u-panel u-settings-card">
-          <div className="u-settings-card-head"><div><h2>{t('Software updates')}</h2><p>{t('Check the latest release and review it before a manual update.')}</p></div><button className="btn btn-ghost" disabled={checking} onClick={checkUpdate}>{t(checking?'Checking…':'Check for updates')}</button></div>
-          <div className="u-settings-facts"><div><span>{t('Running version')}</span><b>v{status?.version || '—'}</b></div><div><span>{t('Latest version')}</span><b>{update?.latest ? `v${update.latest}` : t(update ? 'Update check failed' : 'Not checked')}</b>{lastUpdateCheck&&<small>{t('Last checked: {time}', { time: lastUpdateCheck })}</small>}</div></div>
-          <div className="u-release-picker">
-            <label>{t('Select update version')}</label>
-            <div>
-              <select value={selectedRelease} disabled={checking || !releaseChoices.length} onChange={e=>setSelectedRelease(e.target.value)}>
-                {!releaseChoices.length&&<option value="">{t(checking?'Checking…':'No published versions')}</option>}
-                {!!releaseChoices.some(item=>!item.prerelease)&&<optgroup label={t('Normal version')}>{releaseChoices.filter(item=>!item.prerelease).map(item=><option key={item.latest} value={item.latest}>v{item.latest}{item.latest===status?.version?` · ${t('Currently installed')}`:''}</option>)}</optgroup>}
-                {!!releaseChoices.some(item=>item.prerelease)&&<optgroup label={t('Test versions')}>{releaseChoices.filter(item=>item.prerelease).map(item=><option key={item.latest} value={item.latest}>v{item.latest}{item.latest===status?.version?` · ${t('Currently installed')}`:''}</option>)}</optgroup>}
-              </select>
-              <button className="btn btn-primary" disabled={!chosenRelease||chosenRelease.latest===status?.version} onClick={()=>openUpdateDialog(chosenRelease)}>{t(chosenRelease?.prerelease?'Install test version':'Switch to normal version')}</button>
-            </div>
-            <p className="u-hint">{t('Test versions are published prereleases. You can switch back to the latest normal version here at any time.')}</p>
-          </div>
-          {update?.update_available&&<div className="u-note u-update-note"><span>{t('A new version is available. Review the release notes before updating.')}</span><button className="btn btn-primary" onClick={()=>openUpdateDialog(update)}>{t('Review update')}</button></div>}
-          {update&&!update.ok&&<p className="u-error">{t(update.error_code||update.error)}</p>}
-        </section>
       </div>
-      <section className="card u-panel u-settings-card">
-        <div className="u-settings-card-head"><div><h2>{t('Update policy')}</h2><p>{t('Choose automatic installation or notify-only, then select which versions it applies to.')}</p></div></div>
-        <div className="u-form-grid">
-          <div className="u-update-network-row"><label>{t('Connection')}</label><select value={s.updates?.proxy_mode || 'auto'} onChange={e => { const mode = e.target.value; setS({ ...s, updates: { ...s.updates, proxy_mode: mode, proxy_profile_id: mode === 'library' ? (s.updates?.proxy_profile_id || '') : '', proxy_country: mode === 'country' ? (s.updates?.proxy_country || '') : '' } }) }}><option value="auto">{t('Automatic — direct, then proxy library')}</option><option value="direct">{t('Direct only')}</option><option value="library">{t('Proxy library')}</option><option value="country">{t('Country exit')}</option></select></div>
-          {s.updates?.proxy_mode === 'library' && <div className="u-update-network-row"><label>{t('Proxy')}</label><select value={s.updates?.proxy_profile_id || ''} onChange={e => setS({ ...s, updates: { ...s.updates, proxy_mode: 'library', proxy_profile_id: e.target.value } })}><option value="">{t('Select a proxy…')}</option>{selectableProxyProfiles(s).map(([id, profile]) => <option key={id} value={id}>{profile.name || t('Unnamed proxy')}</option>)}</select></div>}
-          {s.updates?.proxy_mode === 'country' && <div className="u-update-network-row"><label>{t('Country exit')}</label><select value={s.updates?.proxy_country || ''} onChange={e => setS({ ...s, updates: { ...s.updates, proxy_mode: 'country', proxy_country: e.target.value } })}><option value="">{t('Select a country/region…')}</option>{Object.keys(s.proxy?.exits || {}).map(country => <option key={country} value={country}>{country.toUpperCase()}</option>)}</select></div>}
-          <p className="u-note u-update-policy-note">{s.updates?.proxy_mode === 'library' ? t('SOCKS5 entries connect directly. Individual node entries reuse a ready country exit assigned to that proxy; subscriptions are selected through Country exit.') : s.updates?.proxy_mode === 'country' ? t('The selected country exit must be ready; update checks and downloads use its verified proxy route.') : s.updates?.proxy_mode === 'direct' ? t('Update checks and downloads connect directly without a proxy.') : t('Automatic tries a direct connection first, then the available proxy library entries. The route that passes the check is reused for the download.')}</p>
-          <div><label>{t('Update method')}</label><select value={s.updates?.update_mode || 'automatic'} onChange={e => { const updateMode = e.target.value; setS({ ...s, updates: { ...s.updates, update_mode: updateMode, version_scope: updateMode === 'automatic' ? 'main' : 'all' } }) }}><option value="automatic">{t('Automatic update')}</option><option value="notify">{t('Notify before updating')}</option></select></div>
-          <div><label>{t('Version range')}</label><select value={s.updates?.version_scope || (s.updates?.update_mode === 'notify' ? 'all' : 'main')} onChange={e => setS({ ...s, updates: { ...s.updates, version_scope: e.target.value } })}><option value="main">{t('Main versions only')}</option><option value="all">{t('All versions')}</option></select></div>
-          <p className="u-note u-update-policy-note">{s.updates?.update_mode !== 'notify' ? t('The All versions option follows the approved latest Release. Main versions only follows the independently configured stable main Release, even when newer patches exist.') : t('Matching releases only send one notice. Installation starts only after you review and confirm it manually.')}</p>
-        </div>
-        <div className="u-settings-actions"><button className="btn btn-primary" onClick={save}>{t('Save update settings')}</button></div>
-      </section>
     </div>}
     {tab === 'maintenance' && <div className="u-settings-grid u-maintenance-grid">
       <section className="card u-panel u-settings-card"><div className="u-settings-card-head"><div><h2>{t('Routine maintenance')}</h2><p>{t('Refresh runtime state without restarting the host.')}</p></div></div><div className="u-action-list"><button className="btn btn-ghost" onClick={() => action('restart_lines')}>{t('Restart all VoWiFi lines')}</button><button className="btn btn-ghost" onClick={() => action('refresh_egress')}>{t('Refresh country exits')}</button><button className="btn btn-ghost" onClick={() => action('clear_notification_history')}>{t('Clear notification history')}</button><button className="btn btn-ghost" disabled={!!maintenanceBusy} onClick={pruneOldImages}>{maintenanceBusy === 'prune_old_images' ? t('Cleaning old images…') : oldImagesReclaimable != null ? t('Clear old and rollback images · {size} reclaimable', { size: formatBytes(oldImagesReclaimable) }) : t('Clear old and rollback images')}</button><button className="btn btn-ghost" disabled={!!maintenanceBusy} onClick={pruneBuildCache}>{maintenanceBusy === 'prune_build_cache' ? t('Cleaning build cache…') : buildCacheReclaimable != null ? t('Clear build cache · {size} reclaimable', { size: formatBytes(buildCacheReclaimable) }) : t('Clear build cache')}</button></div><p className="u-hint">{t('Old-image cleanup keeps the current images, trusted Engine base and every image used by a container, but removes rollback images. Build-cache cleanup removes only dangling builder records; containers and volumes are always kept.')}</p></section>

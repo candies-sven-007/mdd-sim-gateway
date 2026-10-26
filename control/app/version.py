@@ -23,3 +23,6 @@ def current() -> str:
 
 
 VERSION = current()
+# Where the corresponding source of this build lives (GPL-3.0-only). Shown in the WebUI.
+SOURCE_URL = os.environ.get(
+    "MDD_SOURCE_URL", "https://github.com/candies-sven-007/mdd-sim-gateway").strip()

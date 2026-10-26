@@ -318,18 +318,6 @@ def asterisk_problem_lines(text: str) -> str:
     return redact_log("\n".join(out)) if out else ""
 
 
-def _update_download(relative: Path) -> bool:
-    """A release archive the container updater is downloading into <data>/update.
-
-    The updater takes its backup after downloading, while the four image archives (~500 MB)
-    still sit in its staging directory, so every backup carried them: a Raspberry Pi's SD card
-    lost 500 MB per update until the next update refused for lack of space. They are
-    re-downloadable Release assets, not gateway data.
-    """
-    parts = relative.parts
-    return len(parts) >= 2 and parts[0] == "update" and parts[1].startswith("container-update.")
-
-
 def create_local_backup(system_name: str = "gateway") -> dict:
     """Create a root-local recovery archive. It is intentionally not returned over HTTP.
 
@@ -365,8 +353,7 @@ def create_local_backup(system_name: str = "gateway") -> dict:
                         or staging_root in path.parents:
                     continue
                 relative = str(path.relative_to(root))
-                if _update_download(path.relative_to(root)):
-                    continue
+
                 if snapshot and (relative in skipped or mms_root in path.parents):
                     continue
                 archive.add(path, arcname=relative, recursive=False)
@@ -444,175 +431,6 @@ _CONTAINER_RESTART_SECONDS = 180
 def container_stack_enabled() -> bool:
     return os.environ.get("MDD_CONTAINER_STACK", "").strip().lower() in {
         "1", "true", "yes", "on"}
-
-
-def _container_download_routes(selections: list) -> list[dict]:
-    """Turn update network selections into routes the container helper can dial.
-
-    A host install hands the selections to the orchestrator, whose resolve_route() turns
-    "country US" into the local SOCKS listener. Nothing did that in the container
-    deployment: the helper received the bare selection, found no proxy URL in it, and
-    downloaded directly while reporting route "direct" — exactly where an operator had
-    picked a proxy because the direct path to GitHub is unusable. Resolve against the
-    Egress SOCKS status here, and refuse a route that is not ready instead of dropping it
-    to direct. As on the host, `auto` offers several candidates and only those that
-    resolve are kept.
-    """
-    from urllib.parse import quote
-    from . import egress
-    from .egress_contract import current_status, socks_endpoint
-
-    proxy = cfg.get_settings().get("proxy") or {}
-    state = egress.status() or {}
-    live = (state.get("exits") or {}) if current_status(state, proxy, time.time()) else {}
-    exits = proxy.get("exits") or {}
-
-    def exit_url(country: str) -> str:
-        exit_state = live.get(country)
-        if (not (exits.get(country) or {}).get("enabled") or not isinstance(exit_state, dict)
-                or exit_state.get("ready") is not True
-                or exit_state.get("transport") != "socks5"):
-            return ""
-        try:
-            # socks5h: GitHub's hostname is resolved by the exit, not by this NAS.
-            return "socks5h://" + socks_endpoint(exit_state).split("://", 1)[1]
-        except ValueError:
-            return ""
-
-    routes, errors = [], []
-    for selection in selections:
-        if not isinstance(selection, dict):
-            continue
-        mode = str(selection.get("proxy_mode") or "direct").strip().lower()
-        if mode == "direct":
-            routes.append({"proxy_url": "", "route": "direct", "route_name": ""})
-        elif mode == "country":
-            country = str(selection.get("proxy_country") or "").strip().lower()
-            url = exit_url(country) if re.fullmatch(r"[a-z]{2}", country) else ""
-            if url:
-                routes.append({"proxy_url": url, "route": "country",
-                               "route_name": country.upper()})
-            else:
-                errors.append(f"update country exit {country.upper() or '?'} is not ready")
-        elif mode == "library":
-            profile_id = str(selection.get("proxy_profile_id") or "").strip()
-            profile = (proxy.get("profiles") or {}).get(profile_id)
-            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", profile_id) \
-                    or not isinstance(profile, dict):
-                errors.append("selected update proxy is not in the proxy library")
-                continue
-            name = str(profile.get("name") or profile_id).strip()[:120]
-            if profile.get("type") == "socks5":
-                host = str(profile.get("server") or "").strip()
-                try:
-                    port = int(profile.get("port") or 1080)
-                except (TypeError, ValueError):
-                    port = 0
-                if not host or not 1 <= port <= 65535 or any(ch in host for ch in "\r\n/@"):
-                    errors.append("selected SOCKS5 update proxy is invalid")
-                    continue
-                user = quote(str(profile.get("username") or ""), safe="")
-                password = quote(str(profile.get("password") or ""), safe="")
-                auth = f"{user}:{password}@" if user or password else ""
-                url = f"socks5h://{auth}{host}:{port}"
-            else:
-                url = next((exit_url(country) for country, exit_cfg in exits.items()
-                            if isinstance(exit_cfg, dict)
-                            and exit_cfg.get("profile_id") == profile_id
-                            and exit_url(country)), "")
-                if not url:
-                    errors.append("selected update proxy has no ready country exit")
-                    continue
-            routes.append({"proxy_url": url, "route": "library", "route_name": name})
-        else:
-            errors.append("invalid update proxy mode")
-    if not routes:
-        raise ValueError(errors[-1] if errors else "no usable update download route")
-    return routes
-
-
-def launch_container_update() -> dict:
-    """Consume the WebUI update request in a detached sibling of the current Control image."""
-    root = Path(cfg.DATA_DIR)
-    request_path = root / "orchestrator" / "update-request.json"
-    status_path = root / "orchestrator" / "update-status.json"
-    request = _read_json(request_path)
-    version = str(request.get("version") or "")
-    repository = str(request.get("repository") or "")
-    if not re.fullmatch(r"\d+(?:\.\d+)*(?:-[0-9A-Za-z.]+)?", version) \
-            or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
-        result = {"state": "failed", "phase": "launch",
-                  "error": "invalid container update request", "updated_at": int(time.time())}
-        _write_private_json(status_path, result)
-        request_path.unlink(missing_ok=True)
-        return {"ok": False, **result}
-    host_data = os.environ.get("MDD_HOST_DATA", "").strip()
-    if not host_data.startswith("/") or ":" in host_data:
-        result = {"state": "failed", "phase": "launch",
-                  "error": "MDD_HOST_DATA must be an absolute host path",
-                  "updated_at": int(time.time())}
-        _write_private_json(status_path, result)
-        request_path.unlink(missing_ok=True)
-        return {"ok": False, **result}
-    network_path = root / "update" / "network.json"
-    selections = request.get("networks")
-    if not isinstance(selections, list) or not selections:
-        selections = [request.get("network") or {}]
-    try:
-        routes = _container_download_routes(selections)
-    except ValueError as exc:
-        result = {"state": "failed", "phase": "launch", "error": str(exc)[:400],
-                  "target": version, "updated_at": int(time.time())}
-        _write_private_json(status_path, result)
-        request_path.unlink(missing_ok=True)
-        return {"ok": False, **result}
-    _write_private_json(network_path, {"routes": routes,
-                                       "asset_sizes": request.get("asset_sizes") or {}})
-
-    client = None
-    try:
-        client = docker.from_env()
-        control_name = os.environ.get("MDD_CONTROL_CONTAINER", "mdd-sim-gateway-control")
-        control = client.containers.get(control_name)
-        labels = (control.attrs.get("Config") or {}).get("Labels") or {}
-        if labels.get("io.mdd-sim-gateway.managed") != "true" \
-                or labels.get("io.mdd-sim-gateway.component") != "control":
-            raise RuntimeError("refusing to launch an updater from an unowned Control container")
-        command = ["/app/host/mdd_container_update.py", "--data", "/data",
-                   "--version", version, "--repository", repository,
-                   "--network-config", "/data/update/network.json"]
-        helper = client.containers.create(
-            control.image.id, command=command, entrypoint=["python"], detach=True,
-            auto_remove=True, healthcheck={"test": ["NONE"]},
-            # The data directory also appears at its own host path, so Compose can be run
-            # from there and label the containers the way Container Manager does (see
-            # mdd_container_update.compose_location).
-            volumes=[f"{host_data}:/data:rw", f"{host_data}:{host_data}:rw",
-                     "/var/run/docker.sock:/var/run/docker.sock:rw"],
-            environment={"MDD_DATA": "/data", "MDD_HOST_DATA": host_data,
-                         "PYTHONDONTWRITEBYTECODE": "1"},
-            labels={"io.mdd-sim-gateway.managed": "true",
-                    "io.mdd-sim-gateway.component": "update-helper"},
-            name=f"mdd-sim-gateway-update-{time.time_ns()}",
-            network=os.environ.get("MDD_ENGINE_DIRECT_NETWORK", "mdd-sim-gateway-uplink"))
-        engine_network = client.networks.get(
-            os.environ.get("MDD_ENGINE_NETWORK", "mdd-sim-gateway-engine"))
-        engine_network.connect(helper)
-        helper.start()
-        request_path.unlink(missing_ok=True)
-        return {"ok": True, "version": version, "executor": "container"}
-    except Exception as exc:  # noqa: Docker backends expose several exception classes
-        result = {"state": "failed", "phase": "launch", "error": str(exc)[:1000],
-                  "updated_at": int(time.time())}
-        _write_private_json(status_path, result)
-        request_path.unlink(missing_ok=True)
-        return {"ok": False, **result}
-    finally:
-        if client is not None:
-            try:
-                client.close()
-            except Exception:  # noqa
-                pass
 
 
 def _service_restart_paths() -> tuple[Path, Path]:
