@@ -329,7 +329,7 @@ nft table inet mdd:
 
 - [x] 阶段 0：建分支 `slim-reader-vowifi`、写入已确认决定、记录基线（2015 测试通过、WebUI 构建成功）
 - [x] 阶段 1：删除短信/彩信/USSD（保留 D2 的最小 RP-ACK）、余额保号、通知推送、语音留言、联系人、自动更新，连同测试、UI、i18n
-- [ ] 阶段 2：删除蜂窝模块路径与全部容器部署文件（runtime/、Dockerfile、compose、drivers/、相关 tools 与 workflow）
+- [x] 阶段 2：删除蜂窝模块路径与全部容器部署文件（runtime/、Dockerfile、compose、drivers/、相关 tools 与 workflow）
 - [ ] 阶段 3：拆分 main.py 为 routers（每拆一块跑一次测试）
 - [ ] 阶段 4：systemd 替换 Docker 编排——引擎、netns 隔离、出口防泄漏、RTP DNAT，补测试
 - [ ] 阶段 5：重写 install.sh（install/status/logs/uninstall）与 systemd 单元
@@ -343,4 +343,8 @@ nft table inet mdd:
   - D2 实现：`[volte_ims_msg]` 保留一个只 `Hangup()` 的通配分机（sysmocom 只在消息有去处时才回 200 + RP-ACK）；`mt_rpack_routing.py` 整个保留（三处修正都是确认能送达所必需）；`mo_submit_report`/`mt_concat_udh`/`ussd_body_capture` 删除，已在 sysmocom 源码副本上验证剩余 6 个补丁能顺序打上。测试见 `tests/test_mt_sms_discard.py`。
   - 顺带：`cellular_call.py` 依赖 `cellular_sms`，提前在阶段 1 删除；`clients.py`（D4）在本阶段删除；SMSC 不再是建线路的必填项；store.py 重写为只含 calls 与 line_states（不做旧库迁移，D4）。
   - 待后续阶段处理：Asterisk 的 DEBUG 日志会打印 RP-DATA 十六进制（含短信正文），阶段 4/5 必须保证 Asterisk 默认不开 debug、`pjsip set logger` 关闭；`i18n` 中 "Responsible use notice" 仍写"最多十条线路"，阶段 4 改线路上限时一并修改；软电话页里的"模块通话"UI 和 `api.cellularCall*` 留到阶段 2 随蜂窝路径删除；`sim.py`/卡片信息里仍读取 SMSC（只读、无害）。
+- 2026-10-26 阶段 2 完成（提交 6928864 容器部署文件、b18256e 蜂窝模块路径）。全量测试 976 个通过，WebUI 构建通过。
+  - 删除：`host/vpcd_modem_bridge.py`、`host/modem_probe.py`、`control/app/modem_ims.py`、`control/app/modem_voice.py`，模块相关接口（cellular、ims、voice-audio、usb-candidates、modem-profiles），设置里的 `hardware`/`device_defaults`（config.load 会丢弃旧文件里的这两个键），WebUI 的 4G/飞行模式/模块 IMS/通话音频/模块拨号，以及对应测试与 92 条 i18n。
+  - orchestrator 只保留出口（sing-box/xray）、路由、时区与服务重启；阶段 4 再按 netns 方案改写。
+  - 留给后续阶段：设置页"维护/存储"里仍有 Docker 镜像与构建缓存相关的 UI 和后端字段（阶段 4/5 随 systemd 化删除）；`main.py` 里 `msisdn_source == "modemmanager"` 的旧记录兼容逻辑仍在（无害，读卡器不会产生该来源，阶段 3 拆分时再评估）；`test_operations` 中 host-diagnostics 的测试数据仍是模块字段（只测透传与脱敏），阶段 4 改写 host-diagnostics 时一起更新；MediaModePanel 的 relay 模式留到阶段 4。
 
