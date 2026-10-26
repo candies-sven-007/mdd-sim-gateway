@@ -10,9 +10,7 @@ import { useI18n } from '../i18n.jsx'
 // Config and it reappears when the reader returns).
 export default function SimSelector({ instances = [], cards = [], devices = [], selected, setSelected, label = 'Active SIM / line' }) {
   const { t, language } = useI18n()
-  // A modem can expose its physical SIM through ModemManager while its optional VoWiFi
-  // PC/SC bridge has no card. Treat either source as live so 4G-only calls/SMS history
-  // remains selectable.
+  // A line is live when the card monitor or the device list shows its SIM present.
   const readerFor = (i) => cards.find((c) => c.present &&
     (String(c.matched) === String(i.id) || (c.iccid && c.iccid === i.iccid)))
   const deviceFor = (i) => devices.find((d) => d.present &&
@@ -22,19 +20,14 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
   const deviceName = (c) => {
     if (!c) return t('Unknown device')
     if (/SCR Prime/i.test(c.name || '')) return language === 'zh' ? '三体电子 SCR Prime 读卡器' : '3T Electronics SCR Prime reader'
-    return c.display_name || c.modem_name || c.name || t('Unknown device')
+    return c.display_name || c.name || t('Unknown device')
   }
   const lineName = (i) => i.carrier || i.name || [i.mcc, i.mnc].filter(Boolean).join('-') || t('Unknown SIM')
-  // Calls and texts can go over 4G or VoWiFi, so a line's state is both paths. Showing only
-  // the VoWiFi line status called a SIM with working 4G "Stopped".
+  // The line's VoWiFi state, as the device page shows it.
   const statusParts = (i) => {
     const device = devices.find((d) => String(d.instance_id || '') === String(i.id))
     const caps = device?.capabilities || {}
     const parts = []
-    const cellular = caps.cellular?.actual
-    if (device && device.device_type !== 'reader' && cellular && cellular !== 'unsupported') {
-      parts.push(`4G ${t(`cap.${cellular}`)}`)
-    }
     const vowifi = caps.vowifi || {}
     if (vowifi.actual === 'off' && vowifi.support?.status === 'unsupported') parts.push(`VoWiFi ${t('cap.unsupported')}`)
     else if (i.status?.label) parts.push(`VoWiFi ${t(i.status.label)}`)

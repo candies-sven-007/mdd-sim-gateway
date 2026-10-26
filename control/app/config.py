@@ -72,7 +72,6 @@ DEFAULTS = {
     "internal": {},
     "settings": {
         "timezone": "Asia/Shanghai",
-        "device_defaults": {"cellular_enabled": False, "vowifi_enabled": True},
         "http_port": 8443,
         "bind": "0.0.0.0",
         "tls": {"self_signed": True, "domain": "", "cert_path": "", "key_path": ""},
@@ -105,25 +104,6 @@ DEFAULTS = {
             "existing_singbox_config": "",
             "refresh_minutes": 30,
             "exits": {},
-        },
-        # Host hardware orchestration: known modem profiles are turned into three internal VPCD
-        # logical slots; native PC/SC readers pass through untouched.
-        "hardware": {
-            "auto_detect": True,
-            # "auto": ModemManager runs whenever a modem is present (full feature set).
-            # "serial": ModemManager never runs; SIM bridges drive the AT port directly.
-            # VoWiFi keeps working, cellular data / flight mode / cellular SMS do not.
-            # For hosts (VMs, containers) where ModemManager's modem objects are unstable.
-            "modem_backend": "auto",
-            "vpcd_slots": 3,
-            "modem_profiles": [
-                {"name": "DJI/Quectel EC25", "vid": "2c7c", "pid": "0125",
-                 "at_interface": 2},
-                # The original EC20 enumerates under Qualcomm's vendor id with the same
-                # interface layout as the EC25 (0 DM, 1 NMEA, 2 AT, 3 PPP, 4 QMI).
-                {"name": "Quectel EC20", "vid": "05c6", "pid": "9215",
-                 "at_interface": 2},
-            ],
         },
         "security": {
             "https_only": True,
@@ -246,24 +226,6 @@ def _file_key() -> tuple:
     return (CONFIG_PATH, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
-def merged_modem_profiles(saved) -> list[dict]:
-    """The saved modem profiles plus every built-in model they do not already cover.
-
-    The first start writes the defaults to config.yaml, and the saved ``hardware`` block
-    then replaces the defaults wholesale, so a model added to the built-in list in a later
-    release never reached an existing install. A saved entry for the same vid/pid still
-    wins, which keeps an operator's own interface or name for that model.
-    """
-    profiles = [dict(item) for item in (saved if isinstance(saved, list) else [])
-                if isinstance(item, dict)]
-    known = {(str(item.get("vid", "")).lower(), str(item.get("pid", "")).lower())
-             for item in profiles}
-    for item in DEFAULTS["settings"]["hardware"]["modem_profiles"]:
-        if (item["vid"], item["pid"]) not in known:
-            profiles.append(dict(item))
-    return profiles
-
-
 def load() -> dict:
     """The merged configuration. Callers get their own copy and may mutate it freely."""
     global _loaded
@@ -289,11 +251,12 @@ def load() -> dict:
                                     **(data.get("settings", {}).get("debug", {}))}
         esim_saved = data.get("settings", {}).get("esim", {}) or {}
         out["settings"]["esim"] = {**DEFAULTS["settings"]["esim"], **esim_saved}
-        for key in ("proxy", "hardware", "security", "maintenance", "device_defaults"):
+        for key in ("proxy", "security", "maintenance"):
             saved = data.get("settings", {}).get(key, {}) or {}
             out["settings"][key] = {**DEFAULTS["settings"][key], **saved}
-        out["settings"]["hardware"]["modem_profiles"] = merged_modem_profiles(
-            out["settings"]["hardware"].get("modem_profiles"))
+        # Modem-era settings are not carried forward.
+        for retired in ("hardware", "device_defaults", "cellular_sms_storage"):
+            out["settings"].pop(retired, None)
         # Proxy profiles were introduced after the original single-subscription/country-form
         # layout.  Expose a lossless v2 view immediately, but do not rewrite config.yaml until
         # the operator next saves Settings.

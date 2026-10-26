@@ -960,27 +960,7 @@ class IdleBackoffTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             app = self._app(temp)
             # None of them exist yet on a fresh install.
-            self.assertEqual(len(app._input_mtimes()), 8)
-
-
-class HotplugResponsivenessTests(unittest.TestCase):
-    """Backing off must not make the hardware feel unresponsive: plugging a modem in is not a
-    document change, so the wait has to notice the USB tree as well."""
-
-    def test_the_usb_tree_is_part_of_the_change_detector(self):
-        with tempfile.TemporaryDirectory() as temp:
-            app = Orchestrator(Path(temp), Path.cwd(), interval=3.0, dry_run=True)
-            app.root.mkdir(parents=True, exist_ok=True)
-            with patch.object(Orchestrator, "_usb_fingerprint", staticmethod(
-                    lambda: (1000.0, 2))):
-                two_devices = app._input_mtimes()
-            with patch.object(Orchestrator, "_usb_fingerprint", staticmethod(
-                    lambda: (1001.0, 3))):
-                three_devices = app._input_mtimes()
-            self.assertNotEqual(two_devices, three_devices,
-                                "a newly plugged modem must end the backoff")
-            # A platform without a USB tree still returns a stable shape.
-            self.assertEqual(len(app._input_mtimes()), 8)
+            self.assertEqual(len(app._input_mtimes()), 4)
 
 
 class PastedNodeFidelityTests(unittest.TestCase):

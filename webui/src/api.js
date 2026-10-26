@@ -83,19 +83,12 @@ export const api = {
   // App.jsx then derives read-only device cards from /api/instances + /api/cards.
   devices: () => j('GET', '/api/devices'),
   patchDeviceCapabilities: (id, patch) => j('PATCH', `/api/devices/${encodeURIComponent(id)}/capabilities`, patch),
-  deviceCellular: (id) => j('GET', `/api/devices/${encodeURIComponent(id)}/cellular`),
   deviceDiagnostics: (id) => j('POST', `/api/devices/${encodeURIComponent(id)}/diagnostics`, {}),
   saveDeviceHardware: (id, patch) => j('PUT', `/api/devices/${encodeURIComponent(id)}/hardware`, patch),
   saveDeviceName: (id, display_name) => j('PUT', `/api/devices/${encodeURIComponent(id)}/name`, { display_name }),
   rereadDeviceSim: (id) => j('POST', `/api/devices/${encodeURIComponent(id)}/sim/reread`),
-  getDeviceIms: (id) => j('GET', `/api/devices/${encodeURIComponent(id)}/ims`),
-  getDeviceVoiceAudio: (id) => j('GET', `/api/devices/${encodeURIComponent(id)}/voice-audio`),
-  setDeviceIms: (id, enabled) => j('PUT', `/api/devices/${encodeURIComponent(id)}/ims`, { enabled }),
   deleteDevice: (id) => j('DELETE', `/api/devices/${encodeURIComponent(id)}`),
   // Modem-like USB devices no configured model matches, tested only when asked.
-  usbCandidates: () => j('GET', '/api/hardware/usb-candidates'),
-  probeUsbCandidate: (usbPath) => j('POST', `/api/hardware/usb-candidates/${encodeURIComponent(usbPath)}/probe`, {}),
-  deleteModemProfile: (vid, pid) => j('DELETE', `/api/hardware/modem-profiles/${encodeURIComponent(vid)}/${encodeURIComponent(pid)}`),
   readers: () => j('GET', '/api/readers'),
   detect: (i = 0) => j('GET', `/api/sim/detect?reader_index=${i}`),
   // `reader` (PC/SC reader NAME) lets the backend re-resolve the index at request time —
@@ -141,9 +134,6 @@ export const api = {
   deleteCalls: (id, sel) => j('POST', `/api/instances/${id}/calls/delete`, sel),
   call: (id, to, from_endpoint = 'webrtc') => j('POST', `/api/instances/${id}/call`, { to, from_endpoint }),
   hangup: (id) => j('POST', `/api/instances/${id}/hangup`),
-  cellularCall: (id, to) => j('POST', `/api/instances/${id}/cellular-call`, { to }),
-  cellularCallStatus: (id) => j('GET', `/api/instances/${id}/cellular-call/status`),
-  cellularCallHangup: (id) => j('POST', `/api/instances/${id}/cellular-call/hangup`, {}),
   softphone: (id) => j('GET', `/api/instances/${id}/softphone`),
   // Call media mode and the relay's state; read-only, switched by the installer.
   media: () => j('GET', '/api/media'),

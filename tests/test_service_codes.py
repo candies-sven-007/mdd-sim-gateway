@@ -68,9 +68,10 @@ class BrowserDiallerServiceCodeTests(unittest.TestCase):
         self.assertIn("export const LOCAL_MMI = { '*#06#': 'imei' }", self.view)
         self.assertIn("const localField = LOCAL_MMI[target]", self.view)
 
-    def test_service_codes_never_reach_the_cellular_voice_backend(self):
-        # The cellular path dials a voice call; a service code needs AT+CUSD instead.
-        self.assertIn("if (isServiceCode(target)) {", self.view)
+    def test_there_is_no_cellular_dial_path(self):
+        # This build has no modem: every call, service codes included, goes over VoWiFi.
+        self.assertNotIn("cellularCall", self.view)
+        self.assertNotIn("callTransport", self.view)
 
     def test_a_locally_rejected_code_is_not_blamed_on_the_carrier(self):
         # The dialplan records a call the moment its pattern matches, so an absent record
@@ -90,7 +91,7 @@ class BrowserDiallerServiceCodeTests(unittest.TestCase):
         # the call screen runs its full course before blaming the carrier for a request that
         # never left the browser. Detect it up front and say so.
         self.assertIn("const WEBRTC_AVAILABLE = typeof RTCPeerConnection === 'function'", self.view)
-        self.assertIn("callTransport === 'vowifi' && !WEBRTC_AVAILABLE", self.view)
+        self.assertIn("if (!WEBRTC_AVAILABLE) {", self.view)
         # Refused before dialling, not after: the check must precede the JsSIP call.
         self.assertLess(self.view.index("!WEBRTC_AVAILABLE"),
                         self.view.index("phone.current.call(target)"))

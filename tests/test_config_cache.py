@@ -91,36 +91,3 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class BuiltInModemProfileTests(unittest.TestCase):
-    """The first start writes the defaults to config.yaml and the saved hardware block then
-    replaced them wholesale, so a model added in a later release never reached an existing
-    install."""
-
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        paths = patch.multiple(config, DATA_DIR=self.temp.name,
-                               CONFIG_PATH=str(Path(self.temp.name) / "config.yaml"))
-        paths.start()
-        self.addCleanup(paths.stop)
-        config._loaded = None
-        self.addCleanup(setattr, config, "_loaded", None)
-
-    def profiles(self, saved):
-        config.save({"settings": {"hardware": {"auto_detect": True, "modem_profiles": saved}},
-                     "instances": {}})
-        return {(p["vid"], p["pid"]): p
-                for p in config.get_settings()["hardware"]["modem_profiles"]}
-
-    def test_an_install_saved_before_the_ec20_existed_still_recognises_it(self):
-        profiles = self.profiles([{"name": "DJI/Quectel EC25", "vid": "2c7c", "pid": "0125",
-                                   "at_interface": 2}])
-        self.assertEqual(profiles[("05c6", "9215")]["at_interface"], 2)
-        self.assertEqual(profiles[("05c6", "9215")]["name"], "Quectel EC20")
-
-    def test_an_operators_own_entry_for_a_built_in_model_wins(self):
-        profiles = self.profiles([{"name": "My EC20", "vid": "05C6", "pid": "9215",
-                                   "at_interface": 3}])
-        self.assertNotIn(("05c6", "9215"), profiles)
-        self.assertEqual(profiles[("05C6", "9215")]["at_interface"], 3)
-        self.assertIn(("2c7c", "0125"), profiles)

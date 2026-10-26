@@ -34,8 +34,8 @@ from starlette import formparsers as starlette_formparsers
 from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, lpa, auth,
                estkme, usbreader, egress, device_state, operations,
-               sysinfo, failover, carrier_id, softphone_ws, modem_ims, vowifi_support,
-               modem_voice, gate, media, authz)
+               sysinfo, failover, carrier_id, softphone_ws, vowifi_support,
+               gate, media, authz)
 
 from .version import SOURCE_URL, VERSION
 from .ami import AmiClient
@@ -44,8 +44,6 @@ from .runtime import RuntimeRegistry
 STATUS_OK_GRACE_SECONDS = 20
 STATUS_POLL_FAST_SECONDS = 4.0
 STATUS_POLL_HEALTHY_SECONDS = 15.0
-ESIM_BRIDGE_RESTART_TIMEOUT = float(
-    os.environ.get("MDD_ESIM_BRIDGE_RESTART_TIMEOUT", "100"))
 ESIM_CARD_REFRESH_ATTEMPTS = int(
     os.environ.get("MDD_ESIM_CARD_REFRESH_ATTEMPTS", "12"))
 ESIM_CARD_REFRESH_INTERVAL = float(
@@ -151,215 +149,16 @@ def _client_cards(values: list[dict] | None = None) -> list[dict]:
                                                     else hub.cards_list())]
 
 
-def _modem_identity_for_reader(reader_name: str | None) -> dict | None:
-    """Identify a modem only from its generated VPCD reader name, never from SIM ICCID."""
-    reader_name = str(reader_name or "")
-    hardware_id = device_state.vpcd_modem_hardware_id(reader_name)
-    if not hardware_id:
-        return None
-    for path in glob.glob(os.path.join(cfg.DATA_DIR, "modems", "*.json")):
-        try:
-            with open(path, encoding="utf-8") as handle:
-                identity = json.load(handle)
-            if str(identity.get("hardware_id") or "") == hardware_id:
-                # A modem that never reports a 15-digit AT IMEI is a supported state -- the
-                # bridge publishes the identity with an empty IMEI on purpose. Discarding the
-                # whole record over it dropped the bridge's ICCID (so the card never matched a
-                # line and the reader binding never migrated) and collapsed the modem to the
-                # one-slot fallback below, putting PIN/SWu/IMS on a single VPCD reader.
-                imei = cfg.normalize_imei(identity.get("imei", ""))
-                return {**identity, "imei": imei if len(imei) == 15 else ""}
-        except (OSError, ValueError, TypeError):
-            continue
-    # The generated reader can outlive bridge metadata across an unplug/restart.
-    # Its name still contains the stable physical id, which is sufficient to keep
-    # the empty virtual slots grouped under the original offline modem.
-    return {"hardware_id": hardware_id, "slots": 1}
-
-
-def _modem_reader_binding(reader_name: str | None) -> dict:
-    """Resolve the current PIN/SWu/IMS reader names for a modem VPCD group.
-
-    Reader names embed the host orchestrator's hardware id.  That id can change when a
-    serial-less modem is moved to another USB port, while a saved SIM line still carries the
-    names generated for its previous id.  Resolve all sibling names from the live PC/SC reader
-    list so an ICCID match can migrate the complete three-reader binding atomically.
-    """
-    identity = _modem_identity_for_reader(reader_name)
-    hardware_id = str((identity or {}).get("hardware_id") or "")
-    if not hardware_id:
-        return {}
-    try:
-        count = max(1, int((identity or {}).get("slots") or 1))
-        names = sim.list_readers()
-    except Exception:  # noqa - transient PC/SC enumeration failure; retry on the next scan
-        return {}
-    siblings = [
-        {"index": index, "name": name}
-        for index, name in enumerate(names)
-        if device_state.vpcd_modem_hardware_id(name) == hardware_id
-    ]
-    if not siblings:
-        return {}
-    virtual = siblings[:count]
-
-    def slot(position: int) -> dict:
-        return virtual[min(position, len(virtual) - 1)]
-
-    return {
-        "pin_reader": slot(0)["name"],
-        "swu_reader": slot(1)["name"],
-        "ami_reader": slot(2)["name"],
-        "reader_index": int(slot(1)["index"]),
-        "reader_port": "",
-        "imei_source_device_id": hardware_id,
-    }
-
-
-def _live_modem_binding_for_instance(inst: dict) -> dict:
-    """Return the live VPCD reader group whose bridge metadata matches this line's ICCID.
-
-    Metadata files for old USB paths may remain after a replug, so a match is accepted only
-    when that hardware id still has readers in the current PC/SC enumeration. This makes the
-    bridge-published ICCID authoritative over stale saved reader names without probing APDUs
-    that may race the running engine.
-    """
-    wanted = str(inst.get("iccid") or "").strip()
-    if not wanted:
-        return {}
-    for path in sorted(glob.glob(os.path.join(cfg.DATA_DIR, "modems", "*.json"))):
-        try:
-            with open(path, encoding="utf-8") as handle:
-                identity = json.load(handle)
-        except (OSError, ValueError, TypeError):
-            continue
-        if str(identity.get("iccid") or "").strip() != wanted:
-            continue
-        hardware_id = str(identity.get("hardware_id") or "").strip()
-        if not hardware_id:
-            continue
-        binding = _modem_reader_binding(f"VoWiFi Modem {hardware_id} 00 00")
-        if binding:
-            return binding
-    return {}
-
-
-def _bootstrap_saved_modem_cards() -> list[str]:
-    """Recover known modem-backed lines before the APDU card monitor starts.
-
-    The bridge metadata is written only after the modem answers its identity commands and
-    contains the current ICCID.  Combining that with passive PC/SC presence is sufficient to
-    restore a saved line's generated reader names after its USB hardware id changes.  Seeding
-    the monitor cache here also prevents its first scan from issuing a redundant discovery APDU
-    for a known SIM -- important on virtualised serial modems where that probe can block.
-    """
-    try:
-        states = card.reader_states()
-    except Exception:  # noqa - startup remains available and the normal monitor retries
-        return []
-    if not states:
-        return []
-    recovered: set[str] = set()
-    for state in states:
-        if not state.get("present"):
-            continue
-        name = str(state.get("name") or "")
-        identity = _modem_identity_for_reader(name)
-        iccid = str((identity or {}).get("iccid") or "")
-        inst = _match_instance_by_iccid(iccid)
-        if not identity or not iccid or inst is None:
-            continue
-        binding = _modem_reader_binding(name)
-        update = {"id": str(inst["id"]), **binding}
-        if binding and any(inst.get(key) != value
-                           for key, value in binding.items()):
-            inst = cfg.upsert_instance(update)
-        hub.cards[name] = {
-            **state,
-            "iccid": iccid,
-            "imsi": inst.get("imsi"),
-            "matched": inst["id"],
-            "smsc": inst.get("smsc"),
-            "mcc": inst.get("mcc"),
-            "mnc": inst.get("mnc"),
-            "mnc_len": inst.get("mnc_len"),
-            "carrier_identity": inst.get("carrier_identity") or {},
-            "pin_enabled": None,
-            "pin_tries": None,
-            "reader_port": None,
-        }
-        recovered.add(str(inst["id"]))
-    return sorted(recovered)
-
-
-def _modem_card_representative(siblings: list[dict]) -> dict:
-    """Pick the slot that carries the best current SIM identity for a modem group."""
-    return (next((item for item in siblings
-                  if item.get("present") and item.get("iccid")), None)
-            or next((item for item in siblings if item.get("present")), None)
-            or siblings[0])
-
-
 def _with_detected_imei(cards: list[dict]) -> list[dict]:
-    """Annotate native readers and collapse a modem's internal VPCD slots into one device."""
+    """Annotate each live card with its hardware kind and the country its MCC names.
+
+    Every SIM here sits in a USB PC/SC reader; the name is kept from the modem era, when a
+    modem's virtual reader slots were collapsed into one device here.
+    """
     enriched = []
-    consumed = set()
-    modem_identities = []
-    assignment_names = {}
-    try:
-        with open(os.path.join(cfg.DATA_DIR, "orchestrator", "hardware-state.json"),
-                  encoding="utf-8") as handle:
-            hardware_state = json.load(handle)
-        assignment_names = {
-            str(device_id): str(value.get("name") or "")
-            for device_id, value in (hardware_state.get("assignments") or {}).items()
-        }
-    except (OSError, ValueError, TypeError):
-        pass
-    for path in glob.glob(os.path.join(cfg.DATA_DIR, "modems", "*.json")):
-        try:
-            identity = json.load(open(path, encoding="utf-8"))
-            if identity.get("hardware_id"):
-                modem_identities.append(identity)
-        except (OSError, ValueError, TypeError):
-            pass
     for original in cards:
-        if original.get("name") in consumed:
-            continue
         card_info = dict(original)
-        # Generated VPCD reader names carry the stable hardware id. SIM ICCID is deliberately
-        # not considered: the same SIM may move to a native reader while an offline modem's
-        # metadata still contains that card's last identity.
-        hardware_id = device_state.vpcd_modem_hardware_id(card_info.get("name"))
-        identity = next((x for x in modem_identities
-                         if str(x.get("hardware_id")) == hardware_id), None)
-        if hardware_id and not identity:
-            identity = {"hardware_id": hardware_id, "slots": 1}
-        if identity:
-            imei = cfg.normalize_imei(identity.get("imei", ""))
-            if len(imei) == 15:
-                card_info["imei"] = imei
-                card_info["imei_source"] = "modem"
-            count = max(1, int(identity.get("slots") or 1))
-            hwid = str(identity.get("hardware_id") or "")
-            siblings = [dict(c) for c in cards if
-                        device_state.vpcd_modem_hardware_id(c.get("name")) == hwid]
-            siblings.sort(key=lambda c: (c.get("index") is None, c.get("index") or 0))
-            if len(siblings) > 1:
-                consumed.update(c.get("name") for c in siblings[1:])
-                # Slot 0 is reserved for pin_keeper and may be idle/empty until an engine
-                # starts, while the SWu/IMS slots already expose the SIM identity.  Treating
-                # the first slot as the whole modem made a known card disappear from the
-                # aggregated view and prevented the guarded hotplug auto-start from finding it.
-                card_info = dict(_modem_card_representative(siblings))
-                card_info["hardware_kind"] = "modem"
-                card_info["hardware_id"] = identity.get("hardware_id") or identity.get("modem")
-                card_info["display_name"] = (assignment_names.get(hwid)
-                                             or "Cellular modem")
-                card_info["virtual_slots"] = [
-                    {"index": c.get("index"), "name": c.get("name")} for c in siblings[:count]]
-        else:
-            card_info["hardware_kind"] = "reader"
+        card_info["hardware_kind"] = "reader"
         card_info["country"] = egress.country_for_mcc(card_info.get("mcc"))
         enriched.append(card_info)
     return enriched
@@ -386,7 +185,6 @@ def _ensure_card_draft(info: dict) -> dict | None:
     existing = _match_instance_by_iccid(iccid)
     if existing:
         return existing
-    identity = _modem_identity_for_reader(info.get("name")) or {}
     mcc, mnc = str(info.get("mcc") or ""), str(info.get("mnc") or "")
     try:
         inst = cfg.upsert_instance({
@@ -398,7 +196,7 @@ def _ensure_card_draft(info: dict) -> dict | None:
             "mcc": mcc,
             "mnc": mnc,
             **_carrier_identity_update(info),
-            "imei": identity.get("imei") or "",
+            "imei": "",
             "reader": f"imsi:{info['imsi']}" if info.get("imsi") else "",
             "reader_index": int(info.get("index") or 0),
             "reader_port": str(info.get("reader_port") or ""),
@@ -650,22 +448,11 @@ def _start_engine_checked(inst: dict, settings: dict, dev_mounts: bool = False,
                         "before starting this one."),
         })
     try:
-        # A modem-backed line must be rebound from the bridge's current ICCID metadata on
-        # EVERY start, including health-policy rebuilds. Merely finding the old generated
-        # reader name is not proof that it still carries this line's SIM: after two identical
-        # serial-less modems are moved/re-enumerated, that live name may now belong to the
-        # other card. Reusing it sends the carrier's AKA challenge to the wrong USIM
-        # (typically SW=9862) and creates an endless reg_rejected rebuild loop.
-        binding = _live_modem_binding_for_instance(inst)
-        if binding and any(inst.get(key) != value for key, value in binding.items()):
-            log.warning("instance %s: correcting modem reader binding before %s start",
-                        inst.get("id"), reason)
-            inst = cfg.upsert_instance({"id": str(inst["id"]), **binding})
-        # The same for a line on an ordinary reader: its saved USB port may be where the SIM
-        # sat the last time, e.g. an eSIM profile used before in another reader. The engine
-        # then finds no reader there, falls back to an index holding another line's card and
-        # refuses to authenticate -- a retry every minute until someone re-saves the line.
-        reader = {} if binding else _live_reader_binding_for_instance(inst)
+        # A line's saved USB port may be where the SIM sat the last time, e.g. an eSIM profile
+        # used before in another reader. The engine then finds no reader there, falls back to
+        # an index holding another line's card and refuses to authenticate -- a retry every
+        # minute until someone re-saves the line. Rebind to where the SIM is now.
+        reader = _live_reader_binding_for_instance(inst)
         if reader and any(inst.get(key) != value for key, value in reader.items()):
             log.warning("instance %s: SIM found in the reader at USB port %s, not %s; "
                         "rebinding before %s start", inst.get("id"), reader["reader_port"],
@@ -740,35 +527,6 @@ async def _on_card_insert(name, idx):
         info["reader_port"] = await asyncio.to_thread(usbreader.port_for_index, idx)
     except Exception as e:  # noqa
         log.debug("reader_port resolve failed for idx %s: %r", idx, e)
-    # The serial bridge publishes the modem's current ICCID before it exposes the VPCD
-    # readers.  Reuse that authoritative identity for an already-provisioned line instead of
-    # issuing a discovery APDU.  Some virtualised EC25/QDC507 stacks can leave an idle PC/SC
-    # probe blocked indefinitely; waiting for it here prevents the first monitor scan, reader
-    # binding migration and automatic engine start.  Unknown/new SIMs still take the normal
-    # APDU path below so their IMSI, carrier and PIN state can be provisioned.
-    modem_identity = _modem_identity_for_reader(name)
-    metadata_iccid = str((modem_identity or {}).get("iccid") or "")
-    metadata_inst = _match_instance_by_iccid(metadata_iccid)
-    if metadata_inst is not None:
-        info.update(
-            iccid=metadata_iccid,
-            imsi=metadata_inst.get("imsi"),
-            matched=metadata_inst["id"],
-            smsc=metadata_inst.get("smsc"),
-            mcc=metadata_inst.get("mcc"),
-            mnc=metadata_inst.get("mnc"),
-            mnc_len=metadata_inst.get("mnc_len"),
-            carrier_identity=metadata_inst.get("carrier_identity") or {},
-        )
-        update = {"id": str(metadata_inst["id"]), **_modem_reader_binding(name)}
-        if any(metadata_inst.get(key) != value
-               for key, value in update.items() if key != "id"):
-            metadata_inst = await asyncio.to_thread(cfg.upsert_instance, update)
-        hub.cards[name] = info
-        log.info("card inserted reader=%s (%s) identity=metadata matched=%s",
-                 idx, name, info["matched"])
-        asyncio.create_task(_auto_start_hotplugged_line(str(info["matched"])))
-        return
     # A running engine may already hold this card (manager restart, or pcscd flapped
     # while the engine kept running) — probing it could clash with the engine's card
     # access. Always map the reader to the running instance whose pin_keeper reports
@@ -820,19 +578,10 @@ async def _on_card_insert(name, idx):
             info["matched"] = inst["id"]
             info["imsi"] = info["imsi"] or inst.get("imsi")
             # A SIM line follows the card, not the reader it occupied previously. Refresh
-            # the live binding immediately on hotplug so a swap cannot leave a native USB
-            # port pinned on a line that has moved into a modem (or vice versa).
-            modem_identity = _modem_identity_for_reader(name)
-            update = {"id": str(inst["id"]), **_carrier_identity_update(info)}
-            if modem_identity:
-                # Refresh every field, not only reader_index.  A replugged serial-less modem
-                # receives a new hardware id, so all three generated reader names change.  The
-                # old names otherwise survive forever and the engine cannot open its PIN/SWu/IMS
-                # channels even though this ICCID was positively matched on the new group.
-                update.update(_modem_reader_binding(name))
-            else:
-                update.update(reader_index=idx,
-                              reader_port=str(info.get("reader_port") or ""))
+            # the live binding immediately on hotplug so a swap between two readers cannot
+            # leave the line pinned on the other one's USB port.
+            update = {"id": str(inst["id"]), **_carrier_identity_update(info),
+                      "reader_index": idx, "reader_port": str(info.get("reader_port") or "")}
             if any(inst.get(key) != value for key, value in update.items() if key != "id"):
                 inst = await asyncio.to_thread(cfg.upsert_instance, update)
         elif info.get("iccid") and cfg.card_auto_create_suppressed(info["iccid"]):
@@ -879,8 +628,7 @@ async def _auto_start_hotplugged_line(iid: str) -> None:
             return
 
         # Completing a newly discovered line describes the SIM and its hardware; it does not
-        # start VoWiFi. Do this before consulting the device switch so a deliberately disabled
-        # modem still gets a usable line record whose switch can be enabled later in the UI.
+        # start VoWiFi by itself.
         if inst.get("provisioning_state") == "draft":
             inst = await asyncio.to_thread(_auto_promote_card_draft, inst, card_info, cards)
             if inst.get("provisioning_state") == "draft":
@@ -888,12 +636,6 @@ async def _auto_start_hotplugged_line(iid: str) -> None:
                          ", ".join(inst.get("auto_provision_missing") or []))
                 return
 
-        device_id, device_type = _device_for_card(card_info, cards)
-        desired = device_state.desired()
-        wanted = ((desired.get("devices") or {}).get(device_id)
-                  or desired.get("defaults") or {})
-        if not wanted.get("vowifi_enabled", True):
-            return
         if not inst.get("enabled", True):
             return
         await asyncio.to_thread(_start_engine_checked, inst, cfg.get_settings(),
@@ -914,6 +656,7 @@ def _line_auto_start_allowed(inst: dict) -> tuple[bool, str]:
     config so their history and settings survive.  Every non-interactive start/recovery must
     therefore re-check the live card monitor and the physical device's VoWiFi desired state.
     Explicit user starts keep their existing PIN/card preflight and actionable API errors.
+    A reader's VoWiFi switch is the line's ``enabled`` flag.
     """
     if not inst.get("enabled", True):
         return False, "line_disabled"
@@ -925,18 +668,6 @@ def _line_auto_start_allowed(inst: dict) -> tuple[bool, str]:
         or str(item.get("matched") or "") == iid)), None)
     if card_info is None:
         return False, "no_card"
-    device_id, device_type = _device_for_card(card_info, cards)
-    # A native reader has no entry in device-desired.json: its VoWiFi switch is the line's
-    # ``enabled`` flag checked above. Falling through to the global device default here made
-    # "VoWiFi off for newly detected devices" cancel recovery for every already-enabled
-    # reader line, even though the device page correctly still showed those lines as enabled.
-    if device_type == "reader":
-        return True, ""
-    desired = device_state.desired()
-    wanted = ((desired.get("devices") or {}).get(device_id)
-              or desired.get("defaults") or {})
-    if not wanted.get("vowifi_enabled", True):
-        return False, "vowifi_disabled"
     return True, ""
 
 
@@ -1094,26 +825,13 @@ def _auto_promote_card_draft(inst: dict, card_info: dict, cards: list[dict]) -> 
         # Production logs must not expose IMS-AKA material through Asterisk debug output.
         "debug": {**(inst.get("debug") or {}), "asterisk": False},
     }
-    virtual = card_info.get("virtual_slots") or []
-    if virtual:
-        def slot(pos: int) -> dict:
-            return virtual[min(pos, len(virtual) - 1)]
-
-        update.update({
-            "pin_reader": slot(0).get("name") or str(slot(0).get("index", 0)),
-            "swu_reader": slot(1).get("name") or str(slot(1).get("index", 0)),
-            "ami_reader": slot(2).get("name") or str(slot(2).get("index", 0)),
-            "reader_index": int(slot(1).get("index") or card_info.get("index") or 0),
-            "reader_port": "",
-        })
-    else:
-        update.update({
-            "reader_index": int(card_info.get("index") or inst.get("reader_index") or 0),
-            "reader_port": str(card_info.get("reader_port") or inst.get("reader_port") or ""),
-        })
+    update.update({
+        "reader_index": int(card_info.get("index") or inst.get("reader_index") or 0),
+        "reader_port": str(card_info.get("reader_port") or inst.get("reader_port") or ""),
+    })
     # A phone hides the Wi-Fi Calling switch for a carrier that does not offer it. Doing the
-    # same here keeps cellular working without a line that can only fail; the device page
-    # says why and the switch still lets the user try.
+    # same here avoids a line that can only fail; the device page says why and the switch
+    # still lets the user try.
     support = vowifi_support.for_instance({"mcc": mcc, "mnc": mnc, "epdg": inst.get("epdg")},
                                           probe_now=True)
     if support["status"] == vowifi_support.UNSUPPORTED:
@@ -1446,34 +1164,6 @@ async def learn_msisdn(iid):
         hub._learning.discard(iid)
 
 
-async def sync_modem_msisdns():
-    """Fill empty line numbers from ModemManager, gated by the current SIM ICCID.
-
-    OwnNumbers can lag behind a physical SIM swap on some modems. Requiring both a
-    non-empty current SIM ICCID and an exact configured-line match prevents a stale
-    modem value from being assigned to whichever line happens to use the device.
-    """
-    observed = device_state.status().get("devices") or {}
-    for device in observed.values():
-        cellular = (device or {}).get("cellular") or {}
-        msisdn = str(cellular.get("msisdn") or "").strip()
-        sim_iccid = str(cellular.get("sim_iccid") or "").strip()
-        if not msisdn or not sim_iccid:
-            continue
-        inst = _match_instance_by_iccid(sim_iccid)
-        if not inst or inst.get("msisdn"):
-            continue
-        iid = str(inst["id"])
-        cfg.upsert_instance({"id": iid, "msisdn": msisdn,
-                             "msisdn_source": "modemmanager"})
-        client = hub.ami.get(iid)
-        if client:
-            client.msisdn = msisdn
-        log.info("learned line number from modem for instance %s", iid)
-        await hub.broadcast({"type": "engine", "instance": iid,
-                             "event": "msisdn_updated", "args": []})
-
-
 def _line_state_kind(st: dict) -> str | None:
     """Map the status machine onto the states the connectivity timeline records.
 
@@ -1706,7 +1396,6 @@ async def status_poller():
         instances = []
         try:
             instances = cfg.list_instances()
-            await sync_modem_msisdns()
             await asyncio.gather(*(_poll_instance_status(inst)
                                    for inst in instances))
 
@@ -2504,20 +2193,14 @@ async def lifespan(app: FastAPI):
                 log.warning("stopped line %s because it exceeds the SIM line limit", iid)
             except Exception as exc:  # noqa: BLE001 - startup must continue to surface status
                 log.error("could not stop over-limit line %s: %s", iid, exc)
-    # Restore known serial-modem lines from passive bridge metadata before card_monitor can
-    # block on a discovery APDU.  Each recovered line is then handed to the same guarded
-    # hotplug auto-start path used for a physical insertion.
-    recovered_modem_lines = await asyncio.to_thread(_bootstrap_saved_modem_cards)
-    # Re-publish after every manager restart so the host orchestrator can reconstruct routes and
-    # modem services from persistent config without waiting for a settings edit/line restart.
+    # Re-publish after every manager restart so the host orchestrator can reconstruct routes
+    # from persistent config without waiting for a settings edit/line restart.
     egress.publish()
     await hub.runtime.start(hub.runtime_changed)
     poller = asyncio.create_task(status_poller())
     monitor = asyncio.create_task(card_monitor())
     host_poller = asyncio.create_task(host_health_poller())
     media_task = asyncio.create_task(media_supervisor())
-    for iid in recovered_modem_lines:
-        asyncio.create_task(_auto_start_hotplugged_line(iid))
     yield
     poller.cancel()
     monitor.cancel()
@@ -2947,70 +2630,10 @@ async def _esim_refresh_card(
     return info
 
 
-def _esim_switch_identity(name: str) -> tuple[str, str]:
-    identity = _modem_identity_for_reader(name) or {}
-    hardware_id = str(identity.get("hardware_id") or "")
-    return (hardware_id or f"reader:{name}", hardware_id)
-
-
-def _esim_modem_reader_names(name: str, hardware_id: str) -> list[str]:
-    """All generated VPCD readers for one physical modem, in current PC/SC order."""
-    if not hardware_id:
-        return [name]
-    names = []
-    try:
-        names = [reader for reader in sim.list_readers()
-                 if device_state.vpcd_modem_hardware_id(reader) == hardware_id]
-    except Exception:  # noqa
-        pass
-    for reader in hub.cards:
-        if (device_state.vpcd_modem_hardware_id(reader) == hardware_id
-                and reader not in names):
-            names.append(reader)
-    return names or [name]
-
-
-def _esim_instance_uses_modem(inst: dict, hardware_id: str) -> bool:
-    if not hardware_id:
-        return False
-    if str(inst.get("imei_source_device_id") or "") == hardware_id:
-        return True
-    iid = str(inst.get("id") or "")
-    if iid and any(str(card_info.get("matched") or "") == iid
-                   and device_state.vpcd_modem_hardware_id(card_info.get("name")) == hardware_id
-                   for card_info in hub.cards.values()):
-        return True
-    return any(device_state.vpcd_modem_hardware_id(inst.get(key)) == hardware_id
-               for key in ("pin_reader", "swu_reader", "ami_reader"))
-
-
-async def _esim_prepare_profile_switch(hardware_id: str) -> dict[str, dict]:
-    """Persist a fail-closed line state and return enough information for LPA rollback."""
-    previous: dict[str, dict] = {}
-    if not hardware_id:
-        return previous
-    for inst in cfg.list_instances():
-        if not _esim_instance_uses_modem(inst, hardware_id):
-            continue
-        iid = str(inst["id"])
-        running = await asyncio.to_thread(engine.is_running, iid)
-        previous[iid] = {"enabled": bool(inst.get("enabled", True)), "running": running}
-        if inst.get("enabled", True):
-            await asyncio.to_thread(cfg.upsert_instance, {"id": iid, "enabled": False})
-        hub.reset_health(iid, "esim_profile_switch")
-        if running:
-            await asyncio.to_thread(engine.stop, iid)
-            await hub.drop_ami(iid)
-    if previous:
-        egress.publish()
-    return previous
-
-
 async def _esim_prepare_reader_profile_switch(name: str) -> dict[str, dict]:
     """Fail-close the line whose profile a native reader is switching away from.
 
-    The modem path disables every affected line before touching the eUICC; without the
-    same step here the old profile's line keeps `enabled` after a successful switch, so
+    Without this step the old profile's line keeps `enabled` after a successful switch, so
     the UI shows the old and new SIM as active at the same time and auto-start can try
     to revive a line whose profile no longer answers. Only the saved intent flag is
     touched — a running engine is still rejected by the LPA guard, and a failure path
@@ -3053,133 +2676,6 @@ async def _esim_restore_profile_switch(previous: dict[str, dict]):
                 log.warning("could not restore line %s after failed eSIM switch: %s", iid, exc)
     if changed:
         egress.publish()
-
-
-def _esim_write_bridge_restart_request(hardware_id: str, iccid: str) -> tuple[str, str]:
-    request_id = f"esim-{int(time.time() * 1000)}-{random.randrange(1_000_000):06d}"
-    root = os.path.join(cfg.DATA_DIR, "orchestrator")
-    request_dir = os.path.join(root, "bridge-restart-requests")
-    status_path = os.path.join(root, "bridge-restart-status", f"{request_id}.json")
-    os.makedirs(request_dir, mode=0o700, exist_ok=True)
-    path = os.path.join(request_dir, f"{request_id}.json")
-    temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump({"request_id": request_id, "device_id": hardware_id,
-                   "expected_iccid_sha256": hashlib.sha256(iccid.encode()).hexdigest(),
-                   "require_cellular_identity": True,
-                   "requested_at": time.time()}, handle)
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
-    return request_id, status_path
-
-
-async def _esim_restart_modem_bridge(
-    hardware_id: str,
-    iccid: str,
-    timeout: float = ESIM_BRIDGE_RESTART_TIMEOUT,
-) -> dict:
-    request_id, status_path = await asyncio.to_thread(
-        _esim_write_bridge_restart_request, hardware_id, iccid)
-    deadline = time.monotonic() + timeout
-    last_state = "requested"
-    while time.monotonic() < deadline:
-        status = _read_json_file(status_path)
-        if status.get("request_id") == request_id:
-            last_state = str(status.get("state") or last_state)
-            if last_state == "channels_ready":
-                if status.get("cellular_identity") not in {"matched", "not_applicable"}:
-                    raise HTTPException(
-                        503, "host orchestrator did not verify the cellular SIM identity; "
-                        "update the host orchestrator before retrying")
-                return status
-            if last_state == "failed":
-                raise HTTPException(
-                    503, status.get("error") or "VPCD bridge rebuild failed")
-        await asyncio.sleep(.25)
-    raise HTTPException(
-        503, f"timed out waiting for VPCD bridge rebuild (last stage: {last_state})")
-
-
-def _modem_active_slot_capacity(hardware_id: str, sibling_count: int) -> int:
-    """How many VPCD readers must carry the active profile for this modem.
-
-    Bridges may enumerate more pcscd reader names than logical channels they
-    allocated (ML307X exposes 00..03 while only 3 channels are ready).  Empty
-    trailing slots must not fail profile-switch recovery.
-    """
-    identity = (_device_identities().get(hardware_id)
-                or _modem_identity_for_reader(f"VoWiFi Modem {hardware_id} 00 00")
-                or {})
-    # A card with too few channels still serves every slot on a shared one.
-    raw = (identity.get("slots_served")
-           or identity.get("channel_allocated")
-           or identity.get("channel_capacity")
-           or identity.get("slots")
-           or sibling_count)
-    try:
-        capacity = int(raw)
-    except (TypeError, ValueError):
-        capacity = sibling_count
-    return max(1, min(sibling_count, capacity))
-
-
-async def _esim_refresh_modem_readers(
-    name: str,
-    hardware_id: str,
-    iccid: str,
-) -> tuple[dict, list[str]]:
-    """Prove that every allocated slot now belongs to the requested active profile."""
-    last_error = ""
-    for _attempt in range(max(1, ESIM_CARD_REFRESH_ATTEMPTS)):
-        try:
-            readers = await asyncio.to_thread(sim.list_readers)
-            siblings = [reader for reader in readers
-                        if device_state.vpcd_modem_hardware_id(reader) == hardware_id]
-            if not siblings:
-                raise RuntimeError("replacement VPCD readers are not enumerated")
-            active = siblings[:_modem_active_slot_capacity(hardware_id, len(siblings))]
-            refreshed = []
-            primary = None
-            for sibling in active:
-                idx = readers.index(sibling)
-                card_data = await asyncio.to_thread(sim.read_card, idx)
-                actual = str(card_data.iccid or "")
-                if actual != str(iccid):
-                    raise RuntimeError(
-                        f"{sibling} reports ICCID {actual or 'unknown'}, expected {iccid}")
-                info = await _esim_refresh_card(
-                    sibling, idx, card_data=card_data, auto_start=False, broadcast=False)
-                refreshed.append(sibling)
-                if sibling == name or primary is None:
-                    primary = info
-            _refresh_card_matches()
-            await hub.broadcast({"type": "cards", "cards": _client_cards()})
-            return primary or {}, refreshed
-        except Exception as exc:  # noqa
-            last_error = str(exc)
-        await asyncio.sleep(ESIM_CARD_REFRESH_INTERVAL)
-    raise HTTPException(503, f"eSIM profile did not become active on every VPCD slot: {last_error}")
-
-
-async def _esim_recover_profile_switch(name: str, hardware_id: str, iccid: str) -> dict:
-    bridge = await _esim_restart_modem_bridge(hardware_id, iccid)
-    info, readers = await _esim_refresh_modem_readers(name, hardware_id, iccid)
-    target = _match_instance_by_iccid(iccid)
-    if not target:
-        raise HTTPException(409, "the active eSIM profile could not be provisioned as a line")
-    if target.get("provisioning_state") == "draft":
-        target = await asyncio.to_thread(
-            _auto_promote_card_draft, target, info, hub.cards_list())
-    if target.get("provisioning_state") == "draft":
-        missing = ", ".join(target.get("auto_provision_missing") or [])
-        raise HTTPException(
-            409, f"the active eSIM profile still needs line configuration: {missing}")
-    target = await asyncio.to_thread(
-        cfg.upsert_instance, {"id": str(target["id"]), "enabled": True})
-    egress.publish()
-    await api_instance_start(str(target["id"]))
-    return {"card": info, "readers": readers, "instance_id": str(target["id"]),
-            "bridge": bridge}
 
 
 async def _esim_run(
@@ -3344,30 +2840,6 @@ def _card_identity_mismatch(inst: dict) -> dict | None:
     want = (inst.get("iccid") or "").strip()
     if not want:
         return None
-    # A generated modem reader name can remain live while ownership has changed to the other
-    # physical card. Check the bridge's authoritative identity before treating that name as a
-    # successful match.
-    modem_identity = _modem_identity_for_reader(
-        inst.get("swu_reader") or inst.get("pin_reader") or inst.get("ami_reader"))
-    modem_iccid = str((modem_identity or {}).get("iccid") or "").strip()
-    if modem_iccid and modem_iccid != want:
-        return {
-            "reader": (inst.get("swu_reader") or inst.get("pin_reader")
-                       or inst.get("ami_reader")),
-            "iccid": modem_iccid,
-        }
-    # The bridge identity is authoritative but not always published (no bridge, or a card
-    # read that has not landed yet). Fall back to the live reader list: a modem exposes the
-    # same UICC through several logical slots, and an ICCID match on the pin slot must not
-    # hide a stale, explicitly configured SWu slot.
-    swu_name = str(inst.get("swu_reader") or "").strip()
-    if swu_name:
-        for c in hub.cards.values():
-            if c.get("name") != swu_name or not c.get("present"):
-                continue
-            got = str(c.get("iccid") or "").strip()
-            if got and got != want:
-                return {"reader": swu_name, "iccid": got}
     if _reader_index_for_instance(inst) is not None:
         return None      # this line's SIM/profile is present somewhere — all good
     # Prefer the stable USB port binding when present; fall back to stored index.
@@ -3600,17 +3072,6 @@ async def api_provision(body: dict):
         # identity Asterisk announces for its own registrations.
         "debug": {**(body.get("debug") or {}), "asterisk": False},
     }
-    # A modem is represented as one UI device but has three internal logical channels so PIN
-    # keeping, SWu authentication and Asterisk/SMS can operate independently. Native readers
-    # omit virtual_slots and keep the legacy single-reader behaviour.
-    virtual = body.get("virtual_slots") or []
-    if virtual:
-        def slot(pos):
-            return virtual[min(pos, len(virtual) - 1)]
-        inst["pin_reader"] = slot(0).get("name") or str(slot(0).get("index", 0))
-        inst["swu_reader"] = slot(1).get("name") or str(slot(1).get("index", idx))
-        inst["ami_reader"] = slot(2).get("name") or str(slot(2).get("index", idx))
-        inst["reader_index"] = int(slot(1).get("index", idx))
     # Port mapping: 'manual' pins the SIP UDP port the user chose (the rest of the block
     # derives from it, validated for range + host/instance conflicts). 'auto' (default)
     # allocates a conflict-free block now — and when re-provisioning an existing line it
@@ -3646,65 +3107,14 @@ async def api_provision(body: dict):
     return {"ok": True, "instance": safe}
 
 
-# ----------------------------- unified physical devices -----------------------------
-def _read_json_file(path: str) -> dict:
-    try:
-        with open(path, encoding="utf-8") as handle:
-            value = json.load(handle)
-        return value if isinstance(value, dict) else {}
-    except (OSError, ValueError, TypeError):
-        return {}
-
-
-def _device_sources() -> tuple[dict, dict, dict]:
-    """Return desired, observed and hardware assignment state from the host orchestrator."""
-    desired = device_state.desired()
-    observed = device_state.status()
-    hardware = _read_json_file(os.path.join(cfg.DATA_DIR, "orchestrator", "hardware-state.json"))
-    return desired, observed, hardware.get("assignments") or {}
-
-
-def _device_identities() -> dict[str, dict]:
-    identities = {}
-    for path in glob.glob(os.path.join(cfg.DATA_DIR, "modems", "*.json")):
-        value = _read_json_file(path)
-        device_id = str(value.get("hardware_id") or "")
-        if device_id:
-            identities[device_id] = value
-    return identities
-
-
-def _instance_for_device(device_id: str, identity: dict, cards: list[dict],
-                         observed: dict | None = None) -> dict | None:
-    """Match a line only from the SIM that is live in this device right now.
-
-    Bridge identity files survive unplugging and intentionally retain hardware facts.
-    Their last ICCID must never make an offline modem appear permanently attached to
-    the last SIM it happened to contain.
-    """
-    # ModemManager owns the physical modem while 4G is active and remains the
-    # authoritative source for the inserted SIM.  In that state the optional
-    # PC/SC VoWiFi bridge can legitimately expose no card at all.
-    live_iccid = str((((observed or {}).get("cellular") or {}).get("sim_iccid")) or "")
-    if live_iccid:
-        return _match_instance_by_iccid(live_iccid)
-    card_info = next((item for item in cards
-                      if item.get("hardware_id") == device_id and item.get("present")), None)
-    if card_info and card_info.get("iccid"):
-        return _match_instance_by_iccid(card_info["iccid"])
-    return None
-
-
+# ----------------------------- physical devices (smart-card readers) -----------------------------
+# This build talks to SIMs only through USB PC/SC readers. A "device" is one physical reader,
+# keyed by its USB port (device_state.native_reader_devices), with the operator's saved record
+# (display name, the IMEI the line presents) in device_state.hardware().
 def _device_for_card(card_info: dict, cards: list[dict] | None = None) -> tuple[str, str]:
-    """Return (device_id, device_type) for a live card-monitor entry."""
+    """Return (device_id, "reader") for a live card-monitor entry, or ("", "")."""
     cards = cards or hub.cards_list()
-    hardware_id = str(card_info.get("hardware_id") or "")
-    if card_info.get("hardware_kind") == "modem" and hardware_id:
-        return hardware_id, "modem"
     name = str(card_info.get("name") or "")
-    hardware_id = hardware_id or device_state.vpcd_modem_hardware_id(name)
-    if hardware_id:
-        return hardware_id, "modem"
     port = str(card_info.get("reader_port") or "")
     for device_id, candidate in device_state.native_reader_devices(cards).items():
         if ((name and candidate.get("name") == name)
@@ -3718,16 +3128,6 @@ def _hardware_imei_for_card(card_info: dict, cards: list[dict] | None = None,
     """Resolve device IMEI for the hardware currently holding a SIM."""
     cards = cards or hub.cards_list()
     device_id, device_type = _device_for_card(card_info, cards)
-    if device_type == "modem":
-        identity = _device_identities().get(device_id) or {}
-        imei = cfg.normalize_imei(identity.get("imei", ""))
-        if len(imei) == 15:
-            return imei, device_id, device_type
-        # A modem without a USB serial uses its port path as device_id.  A different module
-        # plugged into that same port therefore has the same id, so a per-line snapshot is not
-        # proof of physical identity and must never be borrowed.  The bridge itself retains a
-        # verified IMEI across transient refresh failures while it owns the same open device.
-        return "", device_id, device_type
     if device_type == "reader":
         record = device_state.hardware().get(device_id) or {}
         imei = cfg.normalize_imei(record.get("imei", ""))
@@ -3763,14 +3163,6 @@ def _apply_current_hardware_imei(inst: dict) -> dict:
         return inst
     imei, _device_id, _device_type = _hardware_imei_for_card(card_info, cards)
     if len(imei) != 15:
-        existing = cfg.normalize_imei(inst.get("imei", ""))
-        # Some USB modems (CORIG ML307X) never expose a 15-digit AT IMEI. Keep a
-        # previously configured line IMEI so hotplug/profile-switch auto-start can
-        # proceed; still fail closed when nothing usable is configured.
-        if _device_type == "modem" and len(existing) == 15:
-            log.warning("modem %s has no live IMEI; keeping configured line IMEI for %s",
-                        _device_id, inst.get("id"))
-            return inst
         raise HTTPException(409, {
             "code": "hardware_imei_required",
             "message": "configure a 15-digit IMEI in Device > Hardware before starting VoWiFi",
@@ -3788,35 +3180,6 @@ def _apply_current_hardware_imei(inst: dict) -> dict:
 def _masked_identifier(value) -> str:
     text = str(value or "")
     return ("*" * max(0, len(text) - 4) + text[-4:]) if text else ""
-
-
-def _vowifi_capability(desired: bool, observed: dict, running: bool,
-                       line_status: dict | None) -> dict:
-    transitioning = bool(observed.get("transitioning"))
-    bridge = bool((observed.get("actual") or {}).get("vowifi_bridge_active"))
-    error = str(observed.get("error") or "")
-    if error:
-        actual = "error"
-    elif transitioning:
-        actual = "starting" if desired else "stopping"
-    elif not desired:
-        # The bridge stays up for every present modem so the card remains readable, so it
-        # says nothing about VoWiFi here — only a still-running line means "stopping".
-        actual = "stopping" if running else "off"
-    elif not bridge:
-        actual = "starting"
-    elif not running:
-        actual, error = "degraded", "VoWiFi is enabled but no configured line is running"
-    else:
-        raw = str((line_status or {}).get("state") or (line_status or {}).get("label") or "").lower()
-        if raw in {"ok", "working", "registered"}:
-            actual = "on"
-        elif raw in {"error", "failed", "stopped"}:
-            actual = "error"
-            error = str((line_status or {}).get("reason") or (line_status or {}).get("detail") or "")
-        else:
-            actual = "starting"
-    return {"desired": desired, "actual": actual, "reason": error}
 
 
 def _follow_imei_source(old_id: str, new_id: str) -> list[str]:
@@ -3838,10 +3201,6 @@ def _follow_imei_source(old_id: str, new_id: str) -> list[str]:
 
 
 async def _unified_devices() -> list[dict]:
-    desired_doc, observed_doc, assignments = _device_sources()
-    desired_devices = desired_doc.get("devices") or {}
-    observed_devices = observed_doc.get("devices") or {}
-    identities = _device_identities()
     cards = hub.cards_list()
     native_readers = device_state.native_reader_devices(cards)
     # A reader that moved to a different USB port derives a new id and strands its saved
@@ -3862,63 +3221,28 @@ async def _unified_devices() -> list[dict]:
     hardware_records = device_state.hardware()
     saved_reader_ids = {device_id for device_id, record in hardware_records.items()
                         if record.get("device_type") == "reader"}
-    saved_modem_ids = set(hardware_records) - saved_reader_ids
-    modem_ids = (set(assignments) | set(desired_devices) | set(observed_devices)
-                 | set(identities) | saved_modem_ids)
-    device_ids = sorted(modem_ids | set(native_readers) | saved_reader_ids)
-    # A saved assignment says where a modem belongs, not that it is physically connected.
-    # Presence must come from the live orchestrator observation; otherwise an unplugged modem
-    # retains its desired toggles and is misleadingly rendered as "starting/stopping" forever.
-    present_ids = sorted(device_id for device_id in modem_ids
-                         if bool((observed_devices.get(device_id) or {}).get("present", False)))
-    shared = observed_doc.get("shared") or {}
+    device_ids = sorted(set(native_readers) | saved_reader_ids)
 
     settings = cfg.get_settings()
     configured_exits = settings.get("proxy", {}).get("exits", {}) or {}
     available_countries = sorted(country for country, value in configured_exits.items()
                                  if isinstance(value, dict) and value.get("enabled", False))
-    # Host routing publishes per-line state, while the container SOCKS transport publishes
-    # one shared listener/state per country.  Device presentation must understand both
-    # contracts: a working container exit otherwise appears as "Not connected" even while
-    # the Engine is actively sending IKE through it.
     egress_state = egress.status()
     egress_lines = egress_state.get("lines") or {}
     egress_exits = egress_state.get("exits") or {}
+    rekey = settings.get("rekey") or {}
     result = []
     for device_id in device_ids:
         native_card = native_readers.get(device_id)
         hardware_record = hardware_records.get(device_id) or {}
-        is_native_reader = native_card is not None or hardware_record.get("device_type") == "reader"
-        assignment = assignments.get(device_id) or {}
-        observed = observed_devices.get(device_id) or {}
-        identity = identities.get(device_id) or {}
-        device_present = (bool(native_card is not None) if is_native_reader
-                          else bool(observed.get("present", False)))
-        host_cell = observed.get("cellular") or {}
+        device_present = native_card is not None
         inst = (_match_instance_by_iccid(native_card.get("iccid"))
                 if native_card and native_card.get("present") and native_card.get("iccid")
-                else _instance_for_device(device_id, identity, cards, observed)
-                if device_present else None)
-        wanted = ({"cellular_enabled": False,
-                   "vowifi_enabled": bool((inst or {}).get("enabled", bool(inst))),
-                   "flight_mode": False}
-                  if is_native_reader else desired_devices.get(device_id)
-                  or desired_doc.get("defaults") or {
-                      "cellular_enabled": False, "vowifi_enabled": True,
-                      "flight_mode": False})
-        cell_desired = bool(wanted.get("cellular_enabled"))
-        vowifi_desired = bool(wanted.get("vowifi_enabled"))
-        if inst and not is_native_reader:
-            # A modem's switch is device-wide, but the line it would start can be disabled on
-            # its own (a carrier without VoWiFi is provisioned that way). Showing the switch on
-            # over a disabled line read as "enabled but no line is running" forever.
-            vowifi_desired = vowifi_desired and bool(inst.get("enabled", True))
-        flight_desired = bool(wanted.get("flight_mode"))
+                else None)
+        vowifi_desired = bool((inst or {}).get("enabled", bool(inst)))
         line_status = _cached_line_status(inst) if inst else None
         running = bool(inst) and (line_status or {}).get("state") != "STOPPED"
-        vowifi = (device_state.native_vowifi_capability(vowifi_desired, running, line_status)
-                  if is_native_reader else
-                  _vowifi_capability(vowifi_desired, observed, running, line_status))
+        vowifi = device_state.native_vowifi_capability(vowifi_desired, running, line_status)
         is_draft = bool(inst) and inst.get("provisioning_state") == "draft"
         if not device_present:
             vowifi.update(actual="off", available=False, reason="Device not connected")
@@ -3934,92 +3258,8 @@ async def _unified_devices() -> list[dict]:
                 and vowifi.get("actual") == "off" and not vowifi.get("reason")):
             vowifi["reason"] = vowifi["support"]["reason"]
 
-        actual_state = observed.get("actual") or {}
-        # Published by the orchestrator when this gateway is configured VoWiFi-only
-        # (hardware.modem_backend = serial): ModemManager never runs, so cellular is a
-        # capability this host does not have — not a fault to keep retrying.
-        serial_only = actual_state.get("cellular_supported") is False
-        is_cellular_target = (not is_native_reader and not serial_only
-                              and device_id in present_ids)
-        cell_reason = ""
-        cell_actual = "unsupported" if (is_native_reader or serial_only) else "off"
-        radio_on = bool(actual_state.get("cellular_radio_enabled"))
-        if is_native_reader:
-            cell_reason = "A smart-card reader supports VoWiFi only"
-        elif serial_only:
-            cell_reason = "This gateway is configured for VoWiFi only (ModemManager disabled)"
-        cellular_view = None
-        if is_cellular_target:
-            if host_cell.get("available"):
-                registration = str(host_cell.get("registration") or "unknown").lower()
-                radio_on = bool(actual_state.get("cellular_radio_enabled",
-                                                 host_cell.get("radio_enabled",
-                                                               host_cell.get("powered"))))
-                registered = registration in {"home", "roaming", "registered"}
-                if not cell_desired and host_cell.get("data_active"):
-                    cell_actual = "stopping"
-                elif not cell_desired:
-                    cell_actual = "off"
-                elif flight_desired:
-                    cell_actual, cell_reason = "off", "Flight mode is enabled"
-                elif host_cell.get("state") == "failed":
-                    # ModemManager gave up on the modem; the orchestrator reboots it when
-                    # that can help. VoWiFi runs through the bridge regardless.
-                    failure = host_cell.get("failure") or {}
-                    cell_actual = "error"
-                    cell_reason = (
-                        "ModemManager could not start this modem. Check the SIM."
-                        if not failure.get("resettable", True) else
-                        "ModemManager could not start this modem, and it could not be "
-                        "rebooted. Reconnect the modem or restart the host."
-                        if failure.get("exhausted") and not failure.get("rebooted", 1) else
-                        "ModemManager could not start this modem, and rebooting it did not "
-                        "help. Reconnect the modem or restart the host."
-                        if failure.get("exhausted") else
-                        "ModemManager could not start this modem. It is being rebooted.")
-                elif radio_on and registered and host_cell.get("data_active"):
-                    cell_actual = "on"
-                elif radio_on:
-                    cell_actual = "starting"
-                else:
-                    cell_actual, cell_reason = "error", "Cellular radio is not enabled"
-                cellular_view = {
-                    "registration": registration, "operator": host_cell.get("operator") or "",
-                    "signal": host_cell.get("signal"), "apn": host_cell.get("apn") or "",
-                    "ip": host_cell.get("ip") or "",
-                    "data_active": bool(host_cell.get("data_active")),
-                    "roaming": registration == "roaming",
-                    "rx_bytes": int(host_cell.get("rx_bytes") or 0),
-                    "tx_bytes": int(host_cell.get("tx_bytes") or 0),
-                    "profile": host_cell.get("profile") or "",
-                    "interface": host_cell.get("network_interface") or "",
-                }
-            elif cell_desired:
-                if shared.get("error"):
-                    cell_actual = "error"
-                    cell_reason = str(shared.get("error"))
-                else:
-                    cell_actual = "starting"
-        card_info = native_card or next((item for item in cards
-                                         if item.get("hardware_id") == device_id
-                                         and item.get("present")), {})
-        # Keep physical SIM state independent from the optional VoWiFi PC/SC
-        # bridge.  A connected cellular modem can have a readable SIM even when
-        # every virtual reader slot is empty or VoWiFi is disabled.
-        live_modem_iccid = (str(host_cell.get("sim_iccid") or "")
-                            if device_present and not is_native_reader else "")
-        if live_modem_iccid and not card_info:
-            card_info = {
-                "present": True, "iccid": live_modem_iccid,
-                "hardware_id": device_id, "hardware_kind": "modem",
-                "mcc": (inst or {}).get("mcc", ""),
-                "mnc": (inst or {}).get("mnc", ""),
-                "imsi": (inst or {}).get("imsi", ""),
-                "smsc": (inst or {}).get("smsc", ""),
-                "mnc_len": (inst or {}).get("mnc_len"),
-                "carrier_identity": (inst or {}).get("carrier_identity") or {},
-            }
-        carrier = _carrier_description(inst, card_info, cellular_view)
+        card_info = native_card or {}
+        carrier = _carrier_description(inst, card_info, None)
         exit_country = egress.line_country(inst or card_info)
         line_exit = egress_lines.get(str(inst["id"]) if inst else "", {}) or {}
         country_exit = egress_exits.get(exit_country, {}) or {}
@@ -4029,7 +3269,7 @@ async def _unified_devices() -> list[dict]:
                 native_card, cards)
             hardware_record = device_state.hardware().get(device_id) or hardware_record
         else:
-            hardware_imei = cfg.normalize_imei(identity.get("imei", ""))
+            hardware_imei = cfg.normalize_imei(hardware_record.get("imei", ""))
         draft_missing = None
         if is_draft and card_info.get("present"):
             # Exactly the rule that decides promotion, so the page cannot name one field
@@ -4044,64 +3284,36 @@ async def _unified_devices() -> list[dict]:
             elif missing:
                 vowifi.update(available=False, reason=(
                     "Complete the SIM details; the line will then start automatically"))
-        masked_imei = _masked_identifier(hardware_imei)
-        bridge_active = bool(actual_state.get("vowifi_bridge_active"))
-        logical_channels = (None if is_native_reader else
-                            device_state.logical_channel_view(identity, bridge_active))
-        if not device_present:
-            cell_actual, cell_reason = "off", "Device not connected"
-            flight_actual, flight_available = "off", False
-        else:
-            flight_actual = ("unsupported" if is_native_reader or serial_only else
-                             "on" if flight_desired and not radio_on else
-                             "off" if not flight_desired and radio_on else
-                             "starting" if flight_desired else "stopping")
-            flight_available = not is_native_reader and not serial_only
         result.append({
-            "id": device_id, "device_type": "reader" if is_native_reader else "modem",
-            "name": (hardware_record.get("display_name") or
-                     card_info.get("display_name") or card_info.get("name")
-                     or hardware_record.get("name") or "Smart-card reader"
-                     if is_native_reader else
-                     hardware_record.get("display_name") or assignment.get("name") or observed.get("name")
-                     or hardware_record.get("name") or "Cellular modem"),
+            "id": device_id, "device_type": "reader",
+            "name": (hardware_record.get("display_name") or card_info.get("display_name")
+                     or card_info.get("name") or hardware_record.get("name")
+                     or "Smart-card reader"),
             "display_name": hardware_record.get("display_name") or "",
-            "hardware_name": ((card_info.get("name") or hardware_record.get("name") or "Smart-card reader")
-                              if is_native_reader else
-                              (assignment.get("name") or observed.get("name")
-                               or hardware_record.get("name") or "Cellular modem")),
+            "hardware_name": (card_info.get("name") or hardware_record.get("name")
+                              or "Smart-card reader"),
             "present": device_present,
-            "model": identity.get("model") or observed.get("model") or "",
-            "firmware": identity.get("firmware") or observed.get("firmware") or "",
             "imei": hardware_imei,
-            "imei_masked": masked_imei,
-            "stable_path": ((card_info.get("reader_port") or hardware_record.get("stable_path") or "")
-                            if is_native_reader else
-                            assignment.get("usb_path") or identity.get("usb_path")
-                            or hardware_record.get("stable_path") or ""),
+            "imei_masked": _masked_identifier(hardware_imei),
+            "stable_path": card_info.get("reader_port") or hardware_record.get("stable_path") or "",
             "reader": card_info.get("name") or "", "instance_id": str(inst["id"]) if inst else None,
             "status": line_status,
-            "logical_channels": logical_channels,
-            "custom_model": (None if is_native_reader
-                             else _custom_model_view(assignment, identity)),
-            "sim": {"name": (((inst or {}).get("name")
-                             or (cellular_view or {}).get("operator") or "SIM") if inst else ""),
+            "sim": {"name": ((inst or {}).get("name") or "SIM") if inst else "",
                     "number": (inst or {}).get("msisdn") or "",
                     "present": bool(card_info.get("present")),
                     "carrier": carrier},
-            "cellular": cellular_view,
             "vowifi": {"epdg": (line_status or {}).get("detail") or "",
                        "ims": (line_status or {}).get("label") or "",
                        "rekey_minutes": (inst or {}).get("rekey_minutes",
-                           (cfg.get_settings().get("rekey") or {}).get("minutes", 30)),
+                                                         rekey.get("minutes", 30)),
                        "ike_rekey_minutes": (inst or {}).get("ike_rekey_minutes",
-                           (cfg.get_settings().get("rekey") or {}).get("ike_minutes", 150)),
+                                                             rekey.get("ike_minutes", 150)),
                        # With the data-channel rekey at 0, whether the line accepts the ePDG's
                        # own rekey decides what 0 means: the carrier renews the keys, or nobody
                        # does and the first ePDG rekey rebuilds the tunnel. Same default as the
                        # engine config (config.py).
                        "accept_epdg_rekey": bool((inst or {}).get("accept_epdg_esp_rekey",
-                           (cfg.get_settings().get("rekey") or {}).get("accept_epdg", False)))},
+                                                                  rekey.get("accept_epdg", False)))},
             "egress": {"node": active_exit.get("node") or "",
                 # The picker lives on the settings page, so without these the device page shows
                 # a node that silently disagrees with what the operator chose.
@@ -4120,19 +3332,8 @@ async def _unified_devices() -> list[dict]:
                             if draft_missing is not None else
                             [key for key, value in (
                                 ("imsi", (inst or card_info).get("imsi")),
-                                ("imei", hardware_imei),
-                                ("smsc", (inst or card_info).get("smsc"))) if not value])},
-            "capabilities": {"cellular": {"desired": cell_desired, "actual": cell_actual,
-                                             "reason": cell_reason},
-                             "flight": {"desired": flight_desired,
-                                        "actual": flight_actual,
-                                        "available": flight_available,
-                                        "reason": ("Device not connected" if not device_present
-                                                   else "This gateway is configured for VoWiFi "
-                                                        "only (ModemManager disabled)"
-                                                   if serial_only else "")},
-                             "vowifi": vowifi},
-            "shared": shared,
+                                ("imei", hardware_imei)) if not value])},
+            "capabilities": {"vowifi": vowifi},
         })
     return result
 
@@ -4142,128 +3343,7 @@ async def api_devices():
     # Sessions are memory-only, so a sign-in usually follows a control-plane restart — right
     # when the card monitor is still completing its first scan and smart-card readers are not
     # in the list yet. `discovering` lets the UI say so instead of reporting a confident zero.
-    return {"devices": await _unified_devices(), "discovering": not hub.scanned,
-            "shared": device_state.status().get("shared") or {}}
-
-
-# ------------------------------------------------------------ unrecognised USB modems
-# The host side (orchestrator or Hardware container) lists modem-like USB devices that match
-# no model and tests one on request; Control cannot see /sys and only relays.
-MODEM_PROBE_TIMEOUT = 60.0
-USB_CANDIDATES_MAX_AGE = 120.0
-
-
-def _orchestrator_path(*parts: str) -> str:
-    return os.path.join(cfg.DATA_DIR, "orchestrator", *parts)
-
-
-def _usb_candidates() -> list[dict]:
-    document = _read_json_file(_orchestrator_path("usb-candidates.json"))
-    try:
-        fresh = time.time() - float(document.get("updated_at") or 0) < USB_CANDIDATES_MAX_AGE
-    except (TypeError, ValueError):
-        fresh = False
-    candidates = document.get("candidates") if fresh else []
-    return [item for item in candidates or [] if isinstance(item, dict)]
-
-
-def _modem_profile_key(profile: dict) -> tuple[str, str]:
-    return (str(profile.get("vid") or "").lower(), str(profile.get("pid") or "").lower())
-
-
-def _custom_model_view(assignment: dict, identity: dict) -> dict | None:
-    """How the device page describes a model added through a probe, or None."""
-    key = _modem_profile_key(assignment)
-    profile = next((item for item in (cfg.get_settings().get("hardware") or {})
-                    .get("modem_profiles") or []
-                    if isinstance(item, dict) and item.get("source") == "probe"
-                    and _modem_profile_key(item) == key), None)
-    if not profile:
-        return None
-    # Saved without a SIM to test on: proven by the bridge opening its channels since.
-    verified = bool(profile.get("verified")) or identity.get("channel_status") == "ready"
-    return {"vid": key[0], "pid": key[1], "name": str(profile.get("name") or ""),
-            "verified": verified}
-
-
-def _write_modem_probe_request(candidate: dict) -> tuple[str, str]:
-    request_id = f"probe-{int(time.time() * 1000)}-{random.randrange(1_000_000):06d}"
-    request_dir = _orchestrator_path("modem-probe-requests")
-    os.makedirs(request_dir, mode=0o700, exist_ok=True)
-    path = os.path.join(request_dir, f"{request_id}.json")
-    temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump({"request_id": request_id, "usb_path": candidate["usb_path"],
-                   "vid": candidate["vid"], "pid": candidate["pid"],
-                   "requested_at": time.time()}, handle)
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
-    return request_id, _orchestrator_path("modem-probe-status", f"{request_id}.json")
-
-
-def _save_probed_modem_profile(status: dict) -> dict:
-    hardware = dict(cfg.get_settings().get("hardware") or {})
-    key = (str(status["vid"]).lower(), str(status["pid"]).lower())
-    profiles = [item for item in hardware.get("modem_profiles") or []
-                if isinstance(item, dict) and _modem_profile_key(item) != key]
-    profile = {"name": str(status.get("name") or f"USB modem {key[0]}:{key[1]}")[:80],
-               "vid": key[0], "pid": key[1], "at_interface": int(status["at_interface"]),
-               "source": "probe", "verified": status.get("result") == "usable"}
-    hardware["modem_profiles"] = profiles + [profile]
-    cfg.update_settings({"hardware": hardware})
-    return profile
-
-
-@app.get("/api/hardware/usb-candidates")
-async def api_usb_candidates():
-    return {"candidates": [
-        {key: item.get(key) for key in ("usb_path", "vid", "pid", "manufacturer", "product")}
-        | {"serial_ports": len(item.get("interfaces") or {}),
-           "claimed_by_modemmanager": bool(item.get("mm_object"))}
-        for item in _usb_candidates()]}
-
-
-@app.post("/api/hardware/usb-candidates/{usb_path}/probe")
-async def api_probe_usb_candidate(usb_path: str):
-    """Test one unrecognised device and, if it can reach a SIM, add it as a model."""
-    candidate = next((item for item in _usb_candidates() if item.get("usb_path") == usb_path),
-                     None)
-    if candidate is None:
-        raise HTTPException(404, "this USB device is no longer listed")
-    request_id, status_path = await asyncio.to_thread(_write_modem_probe_request, candidate)
-    deadline = time.monotonic() + MODEM_PROBE_TIMEOUT
-    status: dict = {}
-    while time.monotonic() < deadline:
-        status = _read_json_file(status_path)
-        if status.get("request_id") == request_id and status.get("state") == "done":
-            break
-        await asyncio.sleep(.5)
-    else:
-        raise HTTPException(504, "the hardware service did not finish the test in time")
-    result = str(status.get("result") or "")
-    saved = None
-    if result in {"usable", "unverified"} and status.get("at_interface") is not None:
-        saved = await asyncio.to_thread(_save_probed_modem_profile, status)
-        egress.publish(settings=cfg.get_settings())
-    return {"result": result, "detail": status.get("detail") or "",
-            "steps": status.get("steps") or [], "saved": saved}
-
-
-@app.delete("/api/hardware/modem-profiles/{vid}/{pid}")
-async def api_delete_modem_profile(vid: str, pid: str):
-    """Remove a model added through a probe. Built-in models cannot be removed."""
-    key = (vid.lower(), pid.lower())
-    hardware = dict(cfg.get_settings().get("hardware") or {})
-    profiles = [item for item in hardware.get("modem_profiles") or [] if isinstance(item, dict)]
-    target = next((item for item in profiles if _modem_profile_key(item) == key), None)
-    if target is None:
-        raise HTTPException(404, "no such modem model")
-    if target.get("source") != "probe":
-        raise HTTPException(400, "built-in modem models cannot be removed")
-    hardware["modem_profiles"] = [item for item in profiles if item is not target]
-    cfg.update_settings({"hardware": hardware})
-    egress.publish(settings=cfg.get_settings())
-    return {"removed": {"vid": key[0], "pid": key[1]}}
+    return {"devices": await _unified_devices(), "discovering": not hub.scanned}
 
 
 @app.post("/api/devices/{device_id}/sim/reread")
@@ -4317,8 +3397,6 @@ async def api_device_hardware(device_id: str, body: dict):
     device = next((item for item in await _unified_devices() if item["id"] == device_id), None)
     if not device:
         raise HTTPException(404, "no such physical device")
-    if device.get("device_type") != "reader":
-        raise HTTPException(400, "a modem reports its hardware IMEI automatically")
     raw = str((body or {}).get("imei") or "").strip()
     imei = cfg.normalize_imei(raw)
     if len(imei) != 15:
@@ -4373,21 +3451,6 @@ async def api_device_hardware(device_id: str, body: dict):
             "applied": applied, "started": started, "missing": still_missing}
 
 
-def _remove_device_from_document(path: str, device_id: str, mapping_key: str) -> None:
-    document = _read_json_file(path)
-    mapping = document.get(mapping_key)
-    if not isinstance(mapping, dict) or device_id not in mapping:
-        return
-    mapping.pop(device_id, None)
-    document["updated_at"] = int(time.time())
-    temporary = path + ".tmp"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(document, handle, ensure_ascii=False, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.replace(temporary, path)
-
-
 @app.delete("/api/devices/{device_id}")
 async def api_device_delete(device_id: str):
     """Forget an offline physical device without deleting any SIM/line configuration."""
@@ -4396,78 +3459,9 @@ async def api_device_delete(device_id: str):
         raise HTTPException(404, "no such physical device")
     if device.get("present"):
         raise HTTPException(409, "disconnect the physical device before forgetting it")
-    device_state.remove_desired(device_id)
     device_state.remove_hardware(device_id)
-    orchestrator_root = os.path.join(cfg.DATA_DIR, "orchestrator")
-    _remove_device_from_document(os.path.join(orchestrator_root, "hardware-state.json"),
-                                 device_id, "assignments")
-    _remove_device_from_document(os.path.join(orchestrator_root, "devices-status.json"),
-                                 device_id, "devices")
-    for path in glob.glob(os.path.join(cfg.DATA_DIR, "modems", "*.json")):
-        identity = _read_json_file(path)
-        if str(identity.get("hardware_id") or "") == device_id:
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
     await hub.broadcast({"type": "hardware", "device": device_id, "event": "forgotten"})
     return {"ok": True, "device_id": device_id, "lines_preserved": True}
-
-
-@app.get("/api/devices/{device_id}/cellular")
-async def api_device_cellular(device_id: str):
-    device = next((item for item in await _unified_devices() if item["id"] == device_id), None)
-    if not device:
-        raise HTTPException(404, "no such physical device")
-    return {"device_id": device_id, "capability": device["capabilities"]["cellular"],
-            "cellular": device.get("cellular")}
-
-
-def _device_modem_path(device_id: str) -> str:
-    """The live ModemManager object of a present modem, or ""."""
-    _desired, observed, _assignments = _device_sources()
-    item = (observed.get("devices") or {}).get(device_id) or {}
-    if not item.get("present"):
-        return ""
-    return str((item.get("cellular") or {}).get("mm_object") or item.get("mm_object") or "")
-
-
-@app.get("/api/devices/{device_id}/ims")
-async def api_device_ims(device_id: str):
-    path = _device_modem_path(device_id)
-    if not path:
-        return {"supported": False, "reason": "The modem is not available."}
-    return await asyncio.to_thread(modem_ims.status, path)
-
-
-@app.get("/api/devices/{device_id}/voice-audio")
-async def api_device_voice_audio(device_id: str):
-    """Read-only: can this modem hand cellular call audio to the gateway?"""
-    path = _device_modem_path(device_id)
-    if not path:
-        return {"status": modem_voice.UNKNOWN, "reason": "The modem is not available."}
-    return await asyncio.to_thread(modem_voice.status, path)
-
-
-@app.put("/api/devices/{device_id}/ims")
-async def api_device_ims_set(device_id: str, body: dict):
-    enabled = (body or {}).get("enabled")
-    if not isinstance(enabled, bool):
-        raise HTTPException(400, "enabled must be boolean")
-    async with capability_lock:
-        path = _device_modem_path(device_id)
-        if not path:
-            raise HTTPException(409, "The modem is not available.")
-        current = await asyncio.to_thread(modem_ims.status, path)
-        if not current.get("supported"):
-            raise HTTPException(409, current.get("reason") or "IMS is not supported")
-        result = await asyncio.to_thread(modem_ims.set_enabled, path, enabled)
-    if not result.get("ok"):
-        raise HTTPException(502, result.get("error") or "the modem rejected the change")
-    log.info("modem %s: VoLTE/IMS %s; modem restarting", device_id,
-             "enabled" if enabled else "disabled")
-    await hub.broadcast({"type": "capability", "device": device_id, "ims": enabled})
-    return result
 
 
 @app.post("/api/devices/{device_id}/diagnostics")
@@ -4478,8 +3472,6 @@ async def api_device_diagnostics(device_id: str):
     checks = [
         {"name": "hardware", "ok": bool(device.get("present")),
          "detail": "detected" if device.get("present") else "not detected"},
-        {"name": "cellular", "ok": device["capabilities"]["cellular"]["actual"] in {"on", "off", "unsupported"},
-         "detail": device["capabilities"]["cellular"]["actual"]},
         {"name": "vowifi", "ok": device["capabilities"]["vowifi"]["actual"] in {"on", "off"},
          "detail": device["capabilities"]["vowifi"]["actual"]},
         {"name": "country_egress", "ok": (not device["capabilities"]["vowifi"]["desired"]
@@ -4490,50 +3482,12 @@ async def api_device_diagnostics(device_id: str):
             "checked_at": int(time.time()), "checks": checks}
 
 
-async def _wait_for_device_request(device_id: str, wanted: dict, timeout: float = 120) -> dict:
-    deadline = time.monotonic() + timeout
-    latest = {}
-    while time.monotonic() < deadline:
-        latest = device_state.status()
-        current = (latest.get("devices") or {}).get(device_id) or {}
-        observed_wanted = current.get("desired") or {}
-        if (all(observed_wanted.get(key) == value for key, value in wanted.items())
-                and not current.get("transitioning")
-                and not (latest.get("shared") or {}).get("transitioning")):
-            # A shared MM shutdown resets the USB modem. The orchestrator can publish one
-            # intermediate "not connected" sample after the desired state is applied; wait for
-            # re-enumeration instead of reporting a failed toggle that actually succeeded.
-            if not current.get("present", True) or current.get("error") == "device is not connected":
-                await asyncio.sleep(.5)
-                continue
-            if current.get("error") or (latest.get("shared") or {}).get("error"):
-                raise RuntimeError(current.get("error") or latest["shared"]["error"])
-            return latest
-        await asyncio.sleep(.5)
-    raise TimeoutError("device capability transition timed out")
-
-
-async def _resume_instances(instance_ids: set[str], skip: set[str] | None = None) -> dict:
-    failed = {}
-    for iid in sorted(instance_ids - (skip or set())):
-        inst = cfg.get_instance(iid)
-        if not inst:
-            continue
-        try:
-            # Use the full manual-start path so a retry clears frozen health, refreshes the
-            # current reader binding, checks PIN/card identity and drops a stale AMI client.
-            await api_instance_start(iid)
-        except Exception as exc:
-            failed[iid] = str(getattr(exc, "detail", exc))
-    return failed
-
-
 @app.patch("/api/devices/{device_id}/capabilities")
 async def api_device_capabilities(device_id: str, body: dict):
-    allowed = {"cellular_enabled", "vowifi_enabled", "flight_mode"}
-    if not body or not set(body).issubset(allowed):
-        raise HTTPException(400, "provide cellular_enabled, vowifi_enabled and/or flight_mode only")
-    if any(not isinstance(value, bool) for value in body.values()):
+    """Switch VoWiFi on or off for the line whose SIM is in this reader."""
+    if not body or set(body) != {"vowifi_enabled"}:
+        raise HTTPException(400, "provide vowifi_enabled only")
+    if not isinstance(body["vowifi_enabled"], bool):
         raise HTTPException(400, "capability values must be boolean")
 
     async with capability_lock:
@@ -4541,111 +3495,26 @@ async def api_device_capabilities(device_id: str, body: dict):
         device = next((item for item in unified if item["id"] == device_id), None)
         if not device:
             raise HTTPException(404, "no such physical device")
-        if device.get("device_type") == "reader":
-            if "cellular_enabled" in body or "flight_mode" in body:
-                raise HTTPException(400, "a smart-card reader has no cellular radio")
-            iid = str(device.get("instance_id") or "")
-            if not iid:
-                if body.get("vowifi_enabled"):
-                    raise HTTPException(409, "configure the SIM before enabling VoWiFi")
-                return device
-            inst = cfg.get_instance(iid)
-            previous = bool((inst or {}).get("enabled", True))
-            wanted = bool(body.get("vowifi_enabled", previous))
-            retry = bool(wanted and not await asyncio.to_thread(engine.is_running, iid))
-            if wanted == previous and not retry:
-                return device
-            if wanted:
-                cfg.upsert_instance({"id": iid, "enabled": True})
-                await api_instance_start(iid)
-            else:
-                cfg.upsert_instance({"id": iid, "enabled": False})
-                _record_lifecycle(iid, "vowifi_disabled", "user_requested")
-                await _stop_instance(iid, "device_vowifi_disabled")
-            refreshed = await _unified_devices()
-            return next(item for item in refreshed if item["id"] == device_id)
-
-        desired_doc, observed_doc, assignments = _device_sources()
-        known = set(assignments) | set(desired_doc.get("devices") or {}) | set(observed_doc.get("devices") or {})
-        if device_id not in known:
-            raise HTTPException(404, "no such physical device")
-        present = sorted(key for key in known if (observed_doc.get("devices") or {}).get(
-            key, {}).get("present", key in assignments))
-        previous = (desired_doc.get("devices") or {}).get(device_id) or desired_doc.get("defaults") or {
-            "cellular_enabled": False, "vowifi_enabled": True, "flight_mode": False}
-        wanted = {**previous, **body}
-        cellular_changed = wanted["cellular_enabled"] != bool(previous.get("cellular_enabled"))
-        vowifi_changed = wanted["vowifi_enabled"] != bool(previous.get("vowifi_enabled"))
-        flight_changed = bool(wanted.get("flight_mode")) != bool(previous.get("flight_mode"))
-
-        identities = _device_identities()
-        cards = hub.cards_list()
-        target_observed = (observed_doc.get("devices") or {}).get(device_id) or {}
-        target_instance = _instance_for_device(
-            device_id, identities.get(device_id) or {}, cards, target_observed)
-        target_iid = str(target_instance["id"]) if target_instance else ""
-        # Repeating an ON request is an explicit retry when the device-level intent says ON
-        # but the line is disabled or its engine has stopped. Do not discard it as a no-op.
-        vowifi_retry = bool(
-            body.get("vowifi_enabled") is True and target_instance
-            and (not target_instance.get("enabled", True)
-                 or not await asyncio.to_thread(engine.is_running, target_iid)))
-        if not cellular_changed and not vowifi_changed and not flight_changed and not vowifi_retry:
-            devices = await _unified_devices()
-            return next(item for item in devices if item["id"] == device_id)
-        vowifi_action = vowifi_changed or vowifi_retry
-        if vowifi_action and target_iid and not wanted["vowifi_enabled"]:
-            _record_lifecycle(target_iid, "vowifi_disabled", "user_requested")
-            hub.reset_health(target_iid, "device_vowifi_disabled")
-        # Data bearer and flight-mode changes are reconciled underneath the existing line.
-        # Only a VoWiFi toggle intentionally stops/starts that line.
-        affected_instances = [target_instance] if vowifi_action and target_instance else []
-        running_ids = []
-        for inst in affected_instances:
-            if inst and await asyncio.to_thread(engine.is_running, str(inst["id"])):
-                running_ids.append(str(inst["id"]))
-                await asyncio.to_thread(engine.stop, str(inst["id"]))
-                await hub.drop_ami(str(inst["id"]))
-                if not wanted["vowifi_enabled"]:
-                    # Record the stop the way an explicit line stop does. Otherwise the last
-                    # observation of the running line — NO_CARD, REGISTERING, whatever it was
-                    # — stays authoritative until the next poll and the UI reports a problem
-                    # with a line the operator just switched off.
-                    hub.status_cache[str(inst["id"])] = _with_status_activity(
-                        str(inst["id"]),
-                        {"state": "STOPPED", "label": status_mod.LABELS["STOPPED"],
-                         "reason_code": "stopped", "reason": "Stopped.", "detail": {}})
-                    hub.status_sampled_at[str(inst["id"])] = time.monotonic()
-
-        device_state.set_desired(device_id,
-                                 cellular_enabled=wanted["cellular_enabled"],
-                                 vowifi_enabled=wanted["vowifi_enabled"],
-                                 flight_mode=bool(wanted.get("flight_mode")))
-        if target_iid and vowifi_action:
-            target_instance = cfg.upsert_instance({
-                "id": target_iid, "enabled": bool(wanted["vowifi_enabled"])})
-        egress.publish()
-        skip_resume = {target_iid} if target_iid and not wanted["vowifi_enabled"] else set()
-        try:
-            await _wait_for_device_request(device_id, wanted)
-        except TimeoutError as exc:
-            await _resume_instances(set(running_ids), skip_resume)
-            raise HTTPException(504, str(exc)) from exc
-        except RuntimeError as exc:
-            await _resume_instances(set(running_ids), skip_resume)
-            raise HTTPException(503, str(exc)) from exc
-
-        resume_ids = set(running_ids)
-        if vowifi_action and wanted["vowifi_enabled"] and target_instance:
-            resume_ids.add(str(target_instance["id"]))
-        failed = await _resume_instances(resume_ids, skip_resume)
-        await hub.broadcast({"type": "capability", "device": device_id, "desired": wanted,
-                             "resume_failed": failed})
-        devices = await _unified_devices()
-        response = next(item for item in devices if item["id"] == device_id)
-        if failed:
-            response["resume_failed"] = failed
-        return response
+        iid = str(device.get("instance_id") or "")
+        if not iid:
+            if body["vowifi_enabled"]:
+                raise HTTPException(409, "configure the SIM before enabling VoWiFi")
+            return device
+        inst = cfg.get_instance(iid)
+        previous = bool((inst or {}).get("enabled", True))
+        wanted = body["vowifi_enabled"]
+        retry = bool(wanted and not await asyncio.to_thread(engine.is_running, iid))
+        if wanted == previous and not retry:
+            return device
+        if wanted:
+            cfg.upsert_instance({"id": iid, "enabled": True})
+            await api_instance_start(iid)
+        else:
+            cfg.upsert_instance({"id": iid, "enabled": False})
+            _record_lifecycle(iid, "vowifi_disabled", "user_requested")
+            await _stop_instance(iid, "device_vowifi_disabled")
+        refreshed = await _unified_devices()
+        return next(item for item in refreshed if item["id"] == device_id)
 
 
 # ----------------------------- settings -----------------------------
@@ -4685,28 +3554,10 @@ def api_put_settings(body: dict):
             ZoneInfo(str(body.get("timezone") or ""))
         except (ZoneInfoNotFoundError, ValueError) as exc:
             raise HTTPException(400, "unknown timezone") from exc
-    defaults = body.get("device_defaults")
-    if defaults is not None:
-        if not isinstance(defaults, dict) or any(
-                key not in {"cellular_enabled", "vowifi_enabled", "flight_mode"}
-                for key in defaults):
-            raise HTTPException(400, "invalid new-device defaults")
-        if any(not isinstance(value, bool) for value in defaults.values()):
-            raise HTTPException(400, "new-device defaults must be boolean")
-    hardware = body.get("hardware")
-    if hardware is not None:
-        if not isinstance(hardware, dict):
-            raise HTTPException(400, "invalid hardware settings")
-        backend = str(hardware.get("modem_backend", "auto") or "auto")
-        if backend not in {"auto", "serial"}:
-            raise HTTPException(400, "modem_backend must be auto or serial")
-        # Settings updates replace top-level keys wholesale; a client sending only the
-        # backend switch must not wipe the modem profiles beside it.
-        body["hardware"] = {**cfg.get_settings().get("hardware", {}), **hardware,
-                            "modem_backend": backend}
+    # Settings that belonged to modem hardware are not accepted any more.
+    body.pop("device_defaults", None)
+    body.pop("hardware", None)
     saved = cfg.update_settings(body)
-    if defaults is not None:
-        device_state.set_defaults(**defaults)
     egress.publish(settings=saved)
     return {key: value for key, value in saved.items() if key != "system_name"}
 
@@ -4982,7 +3833,7 @@ def _line_diagnostics(inst: dict) -> dict:
 @app.get("/api/diagnostics/support-bundle")
 async def api_support_bundle():
     settings = cfg.get_settings()
-    documents = {"devices": device_state.status(), "egress": egress.status(),
+    documents = {"devices": device_state.hardware(), "egress": egress.status(),
                  # What pcscd is actually exposing right now — the one fact every card-path
                  # report needed and the bundle never carried. Passive: monitor state only.
                  "readers": [{"name": item.get("name"), "present": item.get("present"),
@@ -5739,6 +4590,15 @@ async def api_esim_status():
 _ESIM_CACHE_PATH = os.path.join(cfg.DATA_DIR, "esim-chip-cache.json")
 
 
+def _read_json_file(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
 def _esim_cache_load() -> dict:
     doc = _read_json_file(_ESIM_CACHE_PATH)
     return doc if isinstance(doc, dict) else {}
@@ -5866,66 +4726,21 @@ async def api_esim_enable(iccid: str, body: dict | None = None):
     body = body or {}
     name, idx = await asyncio.to_thread(
         _esim_resolve_reader, body.get("reader_index", 0), body.get("reader"))
-    switch_key, hardware_id = _esim_switch_identity(name)
-    async with hub.esim_switch_lock(switch_key):
-        # Native readers have no host bridge to recycle and retain the established path.
-        if not hardware_id:
-            se = await asyncio.to_thread(
-                _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"),
-                body.get("aid"), require=True)
-            previous = await _esim_prepare_reader_profile_switch(name)
-            try:
-                await _esim_run(
-                    name, idx, lpa.profile_enable(name, iccid, aid=se.get("aid")),
-                    refresh=True, refresh_expect_iccid=iccid)
-            except Exception:
-                await _esim_restore_profile_switch(previous)
-                raise
-            await asyncio.to_thread(_esim_cache_update_profile, iccid, state="enabled")
-            return {"ok": True, "iccid": iccid, "se_id": se["id"],
-                    "card": hub.cards.get(name)}
-
-        previous = await _esim_prepare_profile_switch(hardware_id)
-        busy_readers = _esim_modem_reader_names(name, hardware_id)
-        for reader in busy_readers:
-            hub.lpa_busy[reader] = True
-        lpa_succeeded = False
+    async with hub.esim_switch_lock(f"reader:{name}"):
+        se = await asyncio.to_thread(
+            _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"),
+            body.get("aid"), require=True)
+        previous = await _esim_prepare_reader_profile_switch(name)
         try:
-            se = await asyncio.to_thread(
-                _esim_resolve_se, name, idx, body.get("se_id") or body.get("seId"),
-                body.get("aid"), require=True)
             await _esim_run(
                 name, idx, lpa.profile_enable(name, iccid, aid=se.get("aid")),
-                keep_busy=True)
-            lpa_succeeded = True
-            await asyncio.to_thread(_esim_cache_update_profile, iccid, state="enabled")
-            try:
-                recovery = await _esim_recover_profile_switch(name, hardware_id, iccid)
-            except Exception as exc:  # noqa
-                # The eUICC already switched — reporting plain failure here made the UI
-                # keep the old profile marked active while the card ran the new one, the
-                # exact "switched but nothing happened" report in issue #26. Lines stay
-                # fail-closed (the new profile's keys are not the old line's), so answer
-                # with the truth: switched, but recovery still needs attention.
-                detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-                log.warning("eSIM profile switched but line recovery failed "
-                            "reader=%s hardware=%s: %s", name, hardware_id, detail)
-                return {"ok": True, "iccid": iccid, "se_id": se["id"],
-                        "card": hub.cards.get(name),
-                        "recovery_error": str(detail) or "line recovery failed"}
-            return {"ok": True, "iccid": iccid, "se_id": se["id"],
-                    "card": recovery["card"], "recovery": {
-                        "instance_id": recovery["instance_id"],
-                        "readers": recovery["readers"],
-                        "bridge_state": recovery["bridge"].get("state"),
-                    }}
+                refresh=True, refresh_expect_iccid=iccid)
         except Exception:
-            if not lpa_succeeded:
-                await _esim_restore_profile_switch(previous)
+            await _esim_restore_profile_switch(previous)
             raise
-        finally:
-            for reader in set(busy_readers) | set(_esim_modem_reader_names(name, hardware_id)):
-                hub.lpa_busy.pop(reader, None)
+        await asyncio.to_thread(_esim_cache_update_profile, iccid, state="enabled")
+        return {"ok": True, "iccid": iccid, "se_id": se["id"],
+                "card": hub.cards.get(name)}
 
 
 @app.post("/api/esim/profiles/{iccid}/disable")

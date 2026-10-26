@@ -361,8 +361,7 @@ def _config_error(summary: str, completed) -> str:
 
 def _orchestrator_module():
     path = Path(__file__).resolve().parents[2] / "host" / "mdd_orchestrator.py"
-    # The control container runs from /app/control, with host/ mounted separately.
-    # The loaded module imports host.modem_probe, so make its package root importable.
+    # Make the repository root importable for the orchestrator's own imports.
     package_root = str(path.parent.parent)
     if package_root not in sys.path:
         sys.path.insert(0, package_root)
@@ -590,8 +589,7 @@ def desired_document(instances: list[dict], settings: dict) -> dict:
             "country": line_country(inst),
             "epdg": epdg_for(inst),
         })
-    return {"version": 1, "updated_at": int(time.time()), "proxy": proxy,
-            "hardware": deepcopy(settings.get("hardware") or {}), "lines": lines}
+    return {"version": 1, "updated_at": int(time.time()), "proxy": proxy, "lines": lines}
 
 
 def publish(instances: list[dict] | None = None, settings: dict | None = None) -> dict:

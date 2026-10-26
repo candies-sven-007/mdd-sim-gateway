@@ -42,10 +42,8 @@ class LiveReaderBindingTests(unittest.TestCase):
 class StartRebindsTests(unittest.TestCase):
     @patch.object(main.engine, "start", return_value="container-id")
     @patch.object(main, "_apply_current_hardware_imei", side_effect=lambda inst: inst)
-    @patch.object(main, "_live_modem_binding_for_instance", return_value={})
     @patch.object(main.cfg, "line_allowed", return_value=True)
-    def test_a_stale_port_is_corrected_before_the_engine_starts(self, _allowed, _modem, _imei,
-                                                                 start):
+    def test_a_stale_port_is_corrected_before_the_engine_starts(self, _allowed, _imei, start):
         stale = {"id": "4", "iccid": ICCID, "reader_port": "1-3.2", "reader_index": 1}
         corrected = {**stale, "reader_port": "1-2.2", "reader_index": 5}
         with patch.object(main.hub, "cards", {SCR["name"]: SCR}), \
@@ -56,9 +54,8 @@ class StartRebindsTests(unittest.TestCase):
 
     @patch.object(main.engine, "start", return_value="container-id")
     @patch.object(main, "_apply_current_hardware_imei", side_effect=lambda inst: inst)
-    @patch.object(main, "_live_modem_binding_for_instance", return_value={})
     @patch.object(main.cfg, "line_allowed", return_value=True)
-    def test_a_correct_binding_is_not_rewritten(self, _allowed, _modem, _imei, start):
+    def test_a_correct_binding_is_not_rewritten(self, _allowed, _imei, start):
         current = {"id": "4", "iccid": ICCID, "reader_port": "1-2.2", "reader_index": 5}
         with patch.object(main.hub, "cards", {SCR["name"]: SCR}), \
                 patch.object(main.cfg, "upsert_instance") as upsert:

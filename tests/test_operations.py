@@ -62,7 +62,7 @@ class OperationsTests(unittest.TestCase):
         sources = "\n".join(
             (root / name).read_text(errors="replace")
             for name in ("engine/swu_ike.py", "engine/ami_usim.py",
-                         "host/vpcd_modem_bridge.py", "control/app/lpa.py")
+                         "control/app/lpa.py")
         )
         forbidden = (
             "print('CK'", "print('IK'", "print('MSK'", "print('EMSK'",

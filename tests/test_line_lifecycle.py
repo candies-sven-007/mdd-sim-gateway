@@ -181,27 +181,6 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main.hub, "cards_list", return_value=[]):
             self.assertEqual(main._line_auto_start_allowed(inst), (False, "no_card"))
 
-    def test_device_vowifi_switch_blocks_background_start(self):
-        inst = {"id": "offline", "iccid": "saved-card", "enabled": True}
-        card = {"present": True, "iccid": "saved-card", "hardware_id": "device-1",
-                "hardware_kind": "modem"}
-        desired = {"defaults": {"vowifi_enabled": True},
-                   "devices": {"device-1": {"vowifi_enabled": False}}}
-        with patch.object(main.hub, "cards_list", return_value=[card]), \
-                patch.object(main.device_state, "desired", return_value=desired):
-            self.assertEqual(
-                main._line_auto_start_allowed(inst), (False, "vowifi_disabled"))
-
-    def test_new_device_default_does_not_disable_an_enabled_native_reader_line(self):
-        inst = {"id": "offline", "iccid": "saved-card", "enabled": True}
-        card = {"present": True, "iccid": "saved-card", "name": "USB reader",
-                "reader_port": "usb:1-2", "hardware_kind": "reader"}
-        desired = {"defaults": {"vowifi_enabled": False}, "devices": {}}
-        with patch.object(main.hub, "cards_list", return_value=[card]), \
-                patch.object(main, "_device_for_card", return_value=("reader-1", "reader")), \
-                patch.object(main.device_state, "desired", return_value=desired) as read_desired:
-            self.assertEqual(main._line_auto_start_allowed(inst), (True, ""))
-        read_desired.assert_not_called()
 
     async def test_auto_recovery_rechecks_a_transiently_absent_card(self):
         inst = {"id": "offline", "iccid": "saved-card", "enabled": True}
@@ -526,31 +505,6 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         main.hub.exit_ledgers.pop("3", None)
         main.hub.health.pop("3", None)
 
-    async def test_repeated_vowifi_on_request_restarts_stopped_modem_line(self):
-        line = {"id": "3", "name": "Giff", "enabled": False}
-        device = {"id": "modem-a", "device_type": "modem", "instance_id": "3"}
-        desired = {"devices": {"modem-a": {
-            "cellular_enabled": True, "vowifi_enabled": True, "flight_mode": False}}}
-        observed = {"devices": {"modem-a": {"present": True}}}
-        with patch.object(main, "_unified_devices", new=AsyncMock(return_value=[device])), \
-                patch.object(main, "_device_sources", return_value=(desired, observed, {})), \
-                patch.object(main, "_device_identities", return_value={}), \
-                patch.object(main.hub, "cards_list", return_value=[]), \
-                patch.object(main, "_instance_for_device", return_value=line), \
-                patch.object(main.engine, "is_running", return_value=False), \
-                patch.object(main.cfg, "upsert_instance", return_value={**line, "enabled": True}) as save, \
-                patch.object(main.device_state, "set_desired") as set_desired, \
-                patch.object(main.egress, "publish"), \
-                patch.object(main, "_wait_for_device_request", new=AsyncMock()), \
-                patch.object(main, "_resume_instances", new=AsyncMock(return_value={})) as resume, \
-                patch.object(main.hub, "broadcast", new=AsyncMock()):
-            result = await main.api_device_capabilities(
-                "modem-a", {"vowifi_enabled": True})
-
-        self.assertEqual(result["id"], "modem-a")
-        save.assert_called_once_with({"id": "3", "enabled": True})
-        set_desired.assert_called_once()
-        resume.assert_awaited_once_with({"3"}, set())
 
     async def test_disabled_line_stops_stale_container_without_auto_recovery(self):
         inst = {"id": "3", "enabled": False}
@@ -660,107 +614,6 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(main.hub.status_cache[iid]["state"], "REGISTERING")
         main.hub.reset_health(iid)
-
-    async def test_live_modem_sim_is_present_without_vowifi_bridge_card(self):
-        desired = {"devices": {"modem-a": {
-            "cellular_enabled": True, "vowifi_enabled": False, "flight_mode": False}}}
-        observed = {"devices": {"modem-a": {
-            "present": True,
-            "actual": {"cellular_radio_enabled": True, "vowifi_bridge_active": False},
-            "cellular": {"available": True, "sim_iccid": "live-card",
-                         "registration": "roaming", "operator": "Visited Network",
-                         "radio_enabled": True, "data_active": True}}}}
-        line = {"id": "3", "name": "Home SIM", "iccid": "live-card",
-                "mcc": "234", "mnc": "10", "enabled": False}
-        with patch.object(main, "_device_sources", return_value=(desired, observed, {})), \
-                patch.object(main, "_device_identities", return_value={}), \
-                patch.object(main.hub, "cards_list", return_value=[]), \
-                patch.object(main.cfg, "list_instances", return_value=[line]), \
-                patch.object(main.device_state, "native_reader_devices", return_value={}), \
-                patch.object(main.device_state, "hardware", return_value={}), \
-                patch.object(main.cfg, "get_settings", return_value={
-                    "proxy": {"exits": {}}, "rekey": {"minutes": 30}}), \
-                patch.object(main, "_cached_line_status", return_value=None), \
-                patch.object(main.egress, "status", return_value={
-                    "exits": {"gb": {"ready": True, "node": "London container exit"}}}), \
-                patch.object(main.egress, "line_country", return_value="gb"), \
-                patch.object(main.egress, "country_for_mcc", return_value="GB"):
-            devices = await main._unified_devices()
-
-        self.assertEqual(len(devices), 1)
-        device = devices[0]
-        self.assertTrue(device["sim"]["present"])
-        self.assertEqual(device["sim"]["name"], "Home SIM")
-        self.assertEqual(device["sim"]["carrier"]["name"], "O2")
-        self.assertEqual(device["sim"]["carrier"]["plmn"], "234-10")
-        self.assertEqual(device["instance_id"], "3")
-        self.assertEqual(device["capabilities"]["cellular"]["actual"], "on")
-        self.assertEqual(device["egress"]["node"], "London container exit")
-
-    async def test_modem_with_working_4g_and_a_carrier_without_vowifi(self):
-        """The device-wide VoWiFi switch stayed on over a line provisioned disabled, so a
-        China Telecom SIM with working 4G read "enabled but no configured line is running"."""
-        desired = {"devices": {"modem-a": {
-            "cellular_enabled": True, "vowifi_enabled": True, "flight_mode": False}}}
-        observed = {"devices": {"modem-a": {
-            "present": True,
-            "actual": {"cellular_radio_enabled": True, "vowifi_bridge_active": True},
-            "cellular": {"available": True, "sim_iccid": "ct-card",
-                         "registration": "home", "operator": "CHN-CT",
-                         "radio_enabled": True, "data_active": True}}}}
-        line = {"id": "6", "name": "460-11-2964", "iccid": "ct-card",
-                "mcc": "460", "mnc": "11", "enabled": False}
-        with patch.object(main, "_device_sources", return_value=(desired, observed, {})), \
-                patch.object(main, "_device_identities", return_value={}), \
-                patch.object(main.hub, "cards_list", return_value=[]), \
-                patch.object(main.cfg, "list_instances", return_value=[line]), \
-                patch.object(main.device_state, "native_reader_devices", return_value={}), \
-                patch.object(main.device_state, "hardware", return_value={}), \
-                patch.object(main.cfg, "get_settings", return_value={
-                    "proxy": {"exits": {}}, "rekey": {"minutes": 30}}), \
-                patch.object(main, "_cached_line_status", return_value={"state": "STOPPED"}), \
-                patch.object(main.egress, "status", return_value={"exits": {}}), \
-                patch.object(main.egress, "line_country", return_value="cn"), \
-                patch.object(main.egress, "country_for_mcc", return_value="CN"):
-            devices = await main._unified_devices()
-
-        caps = devices[0]["capabilities"]
-        self.assertEqual(caps["cellular"]["actual"], "on")
-        self.assertFalse(caps["vowifi"]["desired"])
-        self.assertEqual(caps["vowifi"]["actual"], "off")
-        self.assertEqual(caps["vowifi"]["support"]["status"], "unsupported")
-        self.assertIn("Mainland China", caps["vowifi"]["reason"])
-
-    async def test_saved_unplugged_modem_never_looks_like_it_is_transitioning(self):
-        desired = {"devices": {"modem-a": {
-            "cellular_enabled": False, "vowifi_enabled": True, "flight_mode": False}}}
-        observed = {"devices": {"modem-a": {
-            "present": False, "transitioning": True,
-            "actual": {"cellular_radio_enabled": False, "vowifi_bridge_active": False}}}}
-        assignments = {"modem-a": {"name": "Saved modem"}}
-        with patch.object(main, "_device_sources", return_value=(desired, observed, assignments)), \
-                patch.object(main, "_device_identities", return_value={}), \
-                patch.object(main.hub, "cards_list", return_value=[]), \
-                patch.object(main.device_state, "native_reader_devices", return_value={}), \
-                patch.object(main.device_state, "hardware", return_value={
-                    "modem-a": {"device_type": "modem", "name": "Saved modem",
-                                "display_name": "Desk modem"}}), \
-                patch.object(main.cfg, "get_settings", return_value={
-                    "proxy": {"exits": {}}, "rekey": {"minutes": 30}}), \
-                patch.object(main.egress, "status", return_value={"lines": {}}), \
-                patch.object(main.egress, "line_country", return_value=""), \
-                patch.object(main.egress, "country_for_mcc", return_value=""):
-            devices = await main._unified_devices()
-
-        self.assertEqual(len(devices), 1)
-        device = devices[0]
-        self.assertEqual(device["name"], "Desk modem")
-        self.assertEqual(device["hardware_name"], "Saved modem")
-        self.assertFalse(device["present"])
-        self.assertEqual(device["capabilities"]["cellular"]["actual"], "off")
-        self.assertEqual(device["capabilities"]["flight"]["actual"], "off")
-        self.assertEqual(device["capabilities"]["vowifi"]["actual"], "off")
-        self.assertFalse(device["capabilities"]["vowifi"]["available"])
 
 
 if __name__ == "__main__":
@@ -1040,15 +893,6 @@ class HardwareImeiRecoveryTests(unittest.TestCase):
                 patch.object(main, "_match_instance_by_iccid", return_value=inst):
             return main._hardware_imei_for_card(self.CARD, [self.CARD])
 
-    def test_rebuild_does_not_reuse_a_modem_imei_from_a_port_based_id(self):
-        resolved = self._resolve({
-            "imei": "123456789012345", "imei_source_device_id": "modem-a"})
-        self.assertEqual(resolved, ("", "modem-a", "modem"))
-
-    def test_rebuild_never_borrows_an_imei_from_another_modem(self):
-        resolved = self._resolve({
-            "imei": "123456789012345", "imei_source_device_id": "modem-b"})
-        self.assertEqual(resolved, ("", "modem-a", "modem"))
 
     def test_reader_rebuild_also_reuses_its_verified_line_snapshot(self):
         inst = {"imei": "123456789012345", "imei_source_device_id": "reader-a"}

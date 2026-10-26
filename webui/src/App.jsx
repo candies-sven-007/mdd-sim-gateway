@@ -68,20 +68,18 @@ function legacyDevices(instances, cards) {
       id: inst.device_id || inst.id,
       name: inst.name || inst.id,
       reader,
-      model: inst.modem_name || inst.modem,
       sim: { name: inst.carrier || inst.name, number: inst.number || inst.msisdn },
       status: inst.status,
       compatibilityOnly: true,
       capabilities: {
-        cellular: { desired: false, actual: 'unsupported', reason: 'Unified cellular status has not been exposed by this backend.' },
         vowifi: { desired: running, actual: running ? 'on' : (state === 'ERROR' ? 'error' : 'off'), reason: inst.status?.reason || '' },
       },
     }
   })
   const readers = cards.filter(c => !used.has(c.reader || c.name)).map((c, i) => ({
-    id: `reader:${c.reader || c.name || i}`, name: c.modem_name || c.reader || c.name || `Reader ${i + 1}`,
+    id: `reader:${c.reader || c.name || i}`, name: c.reader || c.name || `Reader ${i + 1}`,
     reader: c.reader || c.name, present: c.present !== false, sim: { name: c.carrier || 'SIM' }, compatibilityOnly: true,
-    capabilities: { cellular: { desired: false, actual: 'unsupported' }, vowifi: { desired: false, actual: 'off' } },
+    capabilities: { vowifi: { desired: false, actual: 'off' } },
   }))
   return [...fromInstances, ...readers]
 }
@@ -189,7 +187,7 @@ export default function App() {
       const name=msg.args?.[0]
       showToast({card_removed:t('SIM removed — line stopped'),reader_lost:t('Reader unplugged — line stopped'),reader_added:`${t('Card reader connected')}${name?`: ${name}`:''}`,reader_removed:`${t('Card reader disconnected')}${name?`: ${name}`:''}`}[msg.event])
     }
-    if(['device','capability','cellular','engine'].includes(msg.type)) refresh()
+    if(['device','capability','engine'].includes(msg.type)) refresh()
     wsEvents.current.handlers.forEach(h=>h(msg))
     if(msg.type==='call'&&msg.call?.direction==='in')showToast(t('Incoming call from {peer}',{peer:msg.call.peer}))
   },expireAuth,()=>setOriginRefused(true))},[refresh,showToast,t,authState?.authenticated,expireAuth])
