@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api.js'
 import { Softphone as Phone, microphoneMessage, RELAY_UNAVAILABLE, RELAY_UNREACHABLE } from './softphone.js'
 import { useI18n } from './i18n.jsx'
-import { useContactNames } from './contactNames.js'
 
 const GREEN = '#22c55e'
 const RED = '#ef4444'
@@ -105,7 +104,7 @@ export default function GlobalSoftphone({ instances, excludedId, showToast }) {
 
   // Asked for before the hook can early-return, and with the number it is ringing from: a
   // caller who is in the address book should be named on the very first frame of the overlay.
-  const callerName = useContactNames(call?.number ? [call.number] : [], call?.id)[call?.number] || ''
+  const callerName = ''
 
   useEffect(() => {
     if (call?.state !== 'active' || !call.startedAt) { setDuration(0); return }

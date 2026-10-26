@@ -66,13 +66,6 @@ class AuthorizationTableTests(unittest.TestCase):
             ("POST", "/api/instances/sim1/mms/attachments/fit"),
             ("GET", "/api/instances/sim1/mms/attachments/0123456789abcdef/preview"),
             ("DELETE", "/api/instances/sim1/mms/attachments/0123456789abcdef"),
-            ("GET", "/api/contacts"),
-            ("GET", "/api/contacts/export"),
-            ("POST", "/api/contacts"),
-            ("POST", "/api/contacts/resolve"),
-            ("POST", "/api/contacts/import"),
-            ("PUT", "/api/contacts/12"),
-            ("DELETE", "/api/contacts/12"),
         ):
             with self.subTest(method=method, path=path):
                 self.assertTrue(authz.allowed(CLIENT, method, path))

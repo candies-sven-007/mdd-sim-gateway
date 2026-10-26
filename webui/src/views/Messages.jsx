@@ -5,7 +5,6 @@ import MmsSettings from './MmsSettings.jsx'
 import { FALLBACK_FORMATS, acceptAttribute, isAttachable } from '../mmsFormats.js'
 import { formatBytes } from '../mmsAttachments.js'
 import { useI18n } from '../i18n.jsx'
-import { useContactNames } from '../contactNames.js'
 
 // application/smil is the MMS presentation part (layout/timing for the other parts); it is
 // never itself content, so it is never rendered as an attachment.
@@ -25,7 +24,7 @@ export default function Messages({ selected, subscribe, showToast, instances, ca
   const [threadsLoading, setThreadsLoading] = useState(false)
   const [peer, setPeer] = useState(null)
   // One request for the whole conversation list, not one per row.
-  const contactNames = useContactNames(threads.map((thread) => thread.peer).concat(peer || []), id)
+  const contactNames = {}
   const [msgs, setMsgs] = useState([])
   const [messagesLoading, setMessagesLoading] = useState(false)
   const [text, setText] = useState('')

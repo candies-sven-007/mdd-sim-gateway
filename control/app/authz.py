@@ -64,9 +64,6 @@ CLIENT_GLOBAL_RULES = _rules(
     ("GET", r"^/api/messages/unread$"),
     # The address book is the administrator's, and a client acts for the administrator: the
     # names a phone shows are the ones the WebUI shows.
-    ("GET", r"^/api/contacts(/export)?$"),
-    ("POST", r"^/api/contacts(/resolve|/import)?$"),
-    ("PUT DELETE", r"^/api/contacts/[0-9]+$"),
     ("WEBSOCKET", r"^/ws$"),
 )
 

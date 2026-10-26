@@ -103,17 +103,6 @@ class ClientSignInTests(unittest.TestCase):
         self.assertEqual(set(line), {"id", "name", "msisdn", "enabled", "status"})
         self.assertNotIn("detail", line["status"])
 
-    def test_a_client_keeps_the_administrators_address_book_and_read_marks(self):
-        token = self.sign_in()[1]["token"]
-        status, body = self.call("POST", "/api/contacts",
-                                 {"name": "Alice", "numbers": ["+61491570006"]}, token=token)
-        self.assertEqual(status, 200, body)
-        status, body = self.call("GET", "/api/contacts", browser=True)
-        self.assertEqual([c["name"] for c in body["contacts"]], ["Alice"])
-        status, body = self.call("POST", "/api/instances/sim1/messages/read", {"all": True},
-                                 token=token)
-        self.assertEqual((status, body["ok"]), (200, True))
-        self.assertEqual(self.call("GET", "/api/messages/unread", token=token)[0], 200)
 
     def test_a_client_is_told_whether_a_line_works_not_why(self):
         token = self.sign_in()[1]["token"]

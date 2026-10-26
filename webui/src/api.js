@@ -82,13 +82,6 @@ export const api = {
   unreadMessages: (id) => j('GET', `/api/instances/${encodeURIComponent(id)}/messages/unread`),
   markThreadRead: (id, body) => j('POST', `/api/instances/${encodeURIComponent(id)}/messages/read`, body),
   unreadTotal: () => j('GET', '/api/messages/unread'),
-  contacts: (query = '') => j('GET', `/api/contacts${query ? `?query=${encodeURIComponent(query)}` : ''}`),
-  createContact: (body) => j('POST', '/api/contacts', body),
-  updateContact: (id, body) => j('PUT', `/api/contacts/${encodeURIComponent(id)}`, body),
-  deleteContact: (id) => j('DELETE', `/api/contacts/${encodeURIComponent(id)}`),
-  resolveContacts: (numbers, line) => j('POST', '/api/contacts/resolve', { numbers, line }),
-  importContacts: (file) => { const fd = new FormData(); fd.append('file', file, file.name); return form('POST', '/api/contacts/import', fd) },
-  contactsExportUrl: (format) => `/api/contacts/export?format=${encodeURIComponent(format)}`,
   authClients: () => j('GET', '/api/auth/clients'),
   revokeAuthClient: (id) => j('DELETE', `/api/auth/clients/${encodeURIComponent(id)}`),
   // Unified physical-device control plane. Older deployments may return 404;
