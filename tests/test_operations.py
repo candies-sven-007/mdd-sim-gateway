@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 from control.app import config, operations
 from control.app import state as app_state
+from control.app.routers import logs as logs_routes
 
 try:
     from control.app import main
@@ -673,7 +674,7 @@ class LineDiagnosticsTests(unittest.TestCase):
         }
         app_state.hub.health["1"] = {"fail_start": time.monotonic() - 61.0, "frozen_code": None}
 
-        entry = main._line_diagnostics({"id": "1", "name": "T-MOBILE"})
+        entry = logs_routes._line_diagnostics({"id": "1", "name": "T-MOBILE"})
 
         self.assertEqual(entry["reason_code"], "reg_unanswered")
         self.assertEqual(entry["registration"], "unregistered")
@@ -690,14 +691,14 @@ class LineDiagnosticsTests(unittest.TestCase):
                        "imsi": "001010123456789"},
         }
 
-        entry = operations.redact(main._line_diagnostics({"id": "1", "name": "T-MOBILE"}))
+        entry = operations.redact(logs_routes._line_diagnostics({"id": "1", "name": "T-MOBILE"}))
 
         self.assertNotIn("+12025550123", json.dumps(entry))
         self.assertNotIn("001010123456789", json.dumps(entry))
         self.assertEqual(entry["registration"], "registered")
 
     def test_a_line_the_sampler_has_not_reached_says_so(self):
-        entry = main._line_diagnostics({"id": "9", "name": "NEW"})
+        entry = logs_routes._line_diagnostics({"id": "9", "name": "NEW"})
         # An absent verdict must not read as a healthy one.
         self.assertNotIn("state", entry)
         self.assertIn("no status sampled", entry["note"])
