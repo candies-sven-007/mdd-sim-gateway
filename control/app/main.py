@@ -34,7 +34,8 @@ from starlette import formparsers as starlette_formparsers
 from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, notify_push, lpa, auth,
                estkme, usbreader, egress, device_state, operations, cellular_sms,
-               sysinfo, failover, carrier_id, allowance, cellular_call, sms_pdu, ussd, mms,
+               sysinfo, failover, carrier_id, cellular_call, sms_pdu, ussd, mms,
+
                mms_media, mms_staging, mms_transport, softphone_ws, modem_ims, vowifi_support,
                modem_voice, gate, line_offline, contacts, media, clients, authz)
 from .version import SOURCE_URL, VERSION
@@ -88,10 +89,9 @@ LINE_HISTORY_PRUNE_INTERVAL_SECONDS = 3600
 LINE_STATE_WRITE_INTERVAL_SECONDS = 30
 
 _line_state_written: dict[str, tuple[str, float]] = {}
-_line_registered_written: dict[str, float] = {}   # per-line throttle for the durable
-                                                 # "last registered" stamp
+
 _background_tasks: set[asyncio.Task] = set()
-LINE_REGISTERED_WRITE_INTERVAL_SECONDS = 3600
+
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -473,9 +473,7 @@ class Hub:
         # the first INVITE) and a missed_call (when it ends unanswered), so they cannot share
         # a dedupe set. Keyed by call-record id because call_result retries and can re-enter.
         self._pushed_missed: set[int] = set()
-        # Lines with a number-keeping run in flight. The claim ledger stops a *restart* from
-        # repeating a run; this stops two pollers in one process from overlapping on one.
-        self._keepalive_running: set[str] = set()
+
         # Per-reader serialization for PC/SC APDU access (sim.read_card / PIN / lpac).
         # lpac opens SCARD_SHARE_EXCLUSIVE; concurrent connect/APDU on the same reader
         # fails with sharing violations or corrupts eUICC sessions.
@@ -1601,19 +1599,6 @@ async def _record_line_state(iid: str, st: dict) -> None:
         # History is diagnostic only; never let it interrupt status sampling.
         _line_state_written.pop(iid, None)
         log.debug("line state record failed instance=%s: %r", iid, exc)
-    if kind == "up":
-        # The timeline is pruned after three days, so it cannot answer "when was this number
-        # last on a network" for a SIM kept for number-keeping. Keep one durable timestamp,
-        # refreshed at most hourly: this is a number-keeping fact, not a diagnostic sample,
-        # and the SD card should not pay per status poll for it.
-        last = _line_registered_written.get(iid, 0.0)
-        if time.monotonic() - last >= LINE_REGISTERED_WRITE_INTERVAL_SECONDS:
-            _line_registered_written[iid] = time.monotonic()
-            try:
-                await asyncio.to_thread(store.touch_line_registered, iid)
-            except Exception as exc:  # noqa
-                _line_registered_written.pop(iid, None)
-                log.debug("registered stamp failed instance=%s: %r", iid, exc)
 
 
 def _status_poll_delay(instances: list[dict]) -> float:
@@ -1983,7 +1968,6 @@ async def _publish_completed_sms(rec: dict) -> None:
     state: the message stays where the reader saw it, marked completed.
     """
     iid = str(rec["instance"])
-    await asyncio.to_thread(_harvest_allowance_reply, iid, rec["peer"])
     _dispatch_push(notify_push.EV_INCOMING_SMS, iid, rec["peer"],
                    SMS_COMPLETED_MARK + rec["body"])
 
@@ -1997,7 +1981,6 @@ async def _publish_incoming_sms(rec: dict) -> None:
         # will not be; a push now could only say "an MMS is on its way".
         hub.mms_wakeup.set()
         return
-    await asyncio.to_thread(_harvest_allowance_reply, iid, rec["peer"])
     _dispatch_push(notify_push.EV_INCOMING_SMS, iid, rec["peer"], rec["body"])
 
 
@@ -2577,8 +2560,7 @@ async def _poll_instance_status(inst: dict) -> None:
             asyncio.create_task(learn_msisdn(iid))
         elif st["state"] == "OK":
             asyncio.create_task(_verify_ims_msisdn(iid, inst))
-        if st["state"] == "OK":
-            asyncio.create_task(_maybe_run_keepalive(iid, inst))
+
         st = _with_status_activity(
             iid, apply_health(iid, inst, st, runtime.get("container_id")))
         hub.status_cache[iid] = st
@@ -5885,9 +5867,9 @@ async def api_instance_delete(iid: str, delete_history: bool = True, confirm_id:
     # Line ids are reused by the next created line, so its connectivity timeline always goes
     # with the line it describes — a new SIM must never inherit another SIM's outages.
     _line_state_written.pop(str(iid), None)
-    _line_registered_written.pop(str(iid), None)
+
     await asyncio.to_thread(store.clear_line_states, iid)
-    await asyncio.to_thread(store.clear_allowance_data, iid)
+
     _refresh_card_matches()
     if inserted and replacements:
         replacement = next((item for item in replacements if item.get("enabled", True)), None)
@@ -6995,479 +6977,12 @@ async def api_sms_send(iid: str, body: dict):
     return result
 
 
-# ----------------------------- Allowance / balance -----------------------------
-def _allowance_instance(iid: str) -> dict:
-    inst = cfg.get_instance(str(iid))
-    if not inst:
-        raise HTTPException(404, "instance not found")
-    return {**inst, "id": str(iid)}
-
-
-def _allowance_rule(inst: dict) -> dict:
-    return allowance.query_rule(inst, carrier_id.lookup(inst))
-
-
-@app.get("/api/instances/{iid}/allowance")
-def api_allowance(iid: str):
-    _allowance_instance(iid)
-    return {"allowance": allowance.reconcile(str(iid))}
-
-
-@app.put("/api/instances/{iid}/allowance")
-def api_allowance_save(iid: str, body: dict):
-    _allowance_instance(iid)
-    try:
-        values = allowance.clean_allowance(body or {})
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
-    return {"allowance": store.save_allowance(str(iid), values, source="manual")}
-
-
-@app.get("/api/instances/{iid}/allowance/query-rule")
-def api_allowance_query_rule(iid: str):
-    return {"rule": _allowance_rule(_allowance_instance(iid))}
-
-
-@app.put("/api/instances/{iid}/allowance/query-rule")
-def api_allowance_query_rule_save(iid: str, body: dict):
-    inst = _allowance_instance(iid)
-    try:
-        recipient, text = allowance.validate_rule((body or {}).get("recipient"),
-                                                   (body or {}).get("body"))
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
-    store.save_allowance_query_rule(str(iid), recipient, text)
-    return {"rule": _allowance_rule(inst)}
-
-
-@app.delete("/api/instances/{iid}/allowance/query-rule")
-def api_allowance_query_rule_reset(iid: str):
-    inst = _allowance_instance(iid)
-    store.delete_allowance_query_rule(str(iid))
-    return {"rule": _allowance_rule(inst)}
-
-
-@app.post("/api/instances/{iid}/allowance/query")
-async def api_allowance_query(iid: str, body: dict):
-    inst = _allowance_instance(iid)
-    rule = _allowance_rule(inst)
-    effective = rule.get("effective")
-    if not effective:
-        raise HTTPException(409, "allowance query method is unknown; configure it in the allowance panel")
-    transport = str((body or {}).get("transport") or "auto").lower()
-    if transport not in {"auto", "vowifi", "cellular"}:
-        raise HTTPException(422, "transport must be auto, vowifi, or cellular")
-    query = store.start_allowance_query(
-        str(iid), effective["recipient"], effective["body"],
-        rule.get("carrier_key") or "", transport)
-    result = await send_sms_on_line(str(iid), effective["recipient"],
-                                    effective["body"], transport)
-    if result.get("unavailable"):
-        store.set_allowance_query_status(query["id"], "failed")
-        raise HTTPException(409, result.get("error") or "SMS transport unavailable")
-    store.set_allowance_query_status(
-        query["id"], "sent" if result.get("ok") else
-        "unknown" if result.get("uncertain") else "failed")
-    return {"ok": bool(result.get("ok")), "query": query, "rule": rule,
-            "send": result}
-
-
-# ----------------------------- Number keeping -----------------------------
-KEEPALIVE_ACTIONS = {"sms", "balance_watch"}
-KEEPALIVE_MAX_INTERVAL_DAYS = 365
-
-
 def _local_tz() -> ZoneInfo:
-    """The user's configured zone, because "days remaining" is a calendar question."""
+    """The user's configured zone, for timestamps shown in local time."""
     try:
         return ZoneInfo(str(cfg.get_settings().get("timezone") or "Asia/Shanghai"))
     except (ZoneInfoNotFoundError, ValueError):
         return ZoneInfo("UTC")
-
-
-def _keepalive_next_due(record: dict, now: int) -> int:
-    """When the next run is owed. Anchored on the last SUCCESSFUL run, not on the last
-    attempt: a line that was offline (or whose send failed) must not have its schedule
-    silently pushed a whole interval into the future."""
-    if not record.get("enabled"):
-        return 0
-    interval = max(1, int(record.get("interval_days") or 30)) * 86400
-    anchor = int(record.get("next_due_ts") or 0)
-    if anchor:
-        return anchor
-    # Never run: first one is owed from the moment it was switched on, which the config save
-    # records by seeding next_due_ts. Fall back to "now" for a record predating that.
-    return now
-
-
-def _keepalive_view(iid: str, record: dict, now: int) -> dict:
-    out = {k: v for k, v in record.items() if k != "instance"}
-    out["enabled"] = bool(record.get("enabled"))
-    out["verify_charge"] = bool(record.get("verify_charge"))
-    due = _keepalive_next_due(record, now)
-    out["next_due_ts"] = due
-    # The same instant as a local calendar date, so the date field round-trips exactly instead
-    # of shifting a day whenever the browser's zone differs from the gateway's.
-    out["next_run_date"] = (datetime.fromtimestamp(due, _local_tz()).date().isoformat()
-                            if due else "")
-    return out
-
-
-def _clean_keepalive(body: dict) -> dict:
-    """Validate a keepalive config. The action costs the user real money on a real SIM, so
-    every field is checked here rather than trusted from the browser."""
-    body = body or {}
-    action = str(body.get("action") or "sms").lower()
-    if action not in KEEPALIVE_ACTIONS:
-        raise HTTPException(422, "action must be sms or balance_watch")
-    raw_interval = body.get("interval_days")
-    try:
-        # `or 30` would turn an explicit 0 into the default and silently schedule a run the
-        # user never asked for. Absent means default; present means it has to be valid.
-        interval = 30 if raw_interval in (None, "") else int(raw_interval)
-    except (TypeError, ValueError):
-        raise HTTPException(422, "interval_days must be a number") from None
-    if not 1 <= interval <= KEEPALIVE_MAX_INTERVAL_DAYS:
-        raise HTTPException(
-            422, f"interval_days must be between 1 and {KEEPALIVE_MAX_INTERVAL_DAYS}")
-    enabled = 1 if body.get("enabled") else 0
-    sms_to = str(body.get("sms_to") or "").strip()
-    sms_body = str(body.get("sms_body") or "").strip()
-    threshold = str(body.get("threshold") or "").strip()
-    if enabled and action == "sms":
-        if not re.fullmatch(r"\+?[0-9 ()-]{3,32}", sms_to or ""):
-            raise HTTPException(422, "a chargeable SMS needs a valid recipient number")
-        if not sms_body:
-            raise HTTPException(422, "a chargeable SMS needs a body")
-    if len(sms_body) > 160:
-        raise HTTPException(422, "keepalive SMS body must be 160 characters or fewer")
-    clean = {"enabled": enabled, "action": action, "sms_to": sms_to, "sms_body": sms_body,
-             "verify_charge": 1 if body.get("verify_charge", True) else 0,
-             "threshold": threshold, "interval_days": interval}
-    # "When does it first run" and "how often after that" are two different questions, so the
-    # first run is a date the user picks rather than something inferred from the interval.
-    raw_date = str(body.get("next_run_date") or "").strip()
-    if raw_date:
-        try:
-            day = datetime.strptime(raw_date, "%Y-%m-%d").date()
-        except ValueError:
-            raise HTTPException(422, "next_run_date must be YYYY-MM-DD") from None
-        # Anchor at the start of the execution window on that local date: the run still waits
-        # for the window, and this way the stored time is the one the user will see back.
-        clean["next_due_ts"] = int(datetime(
-            day.year, day.month, day.day, KEEPALIVE_WINDOW[0], 0,
-            tzinfo=_local_tz()).timestamp())
-    return clean
-
-
-KEEPALIVE_WINDOW = (10, 22)          # local hours; never message a carrier at 3am
-KEEPALIVE_BALANCE_REPEAT_SECONDS = 3 * 86400
-KEEPALIVE_FAILURE_RETRY_SECONDS = 3600
-KEEPALIVE_RECONCILE_ATTEMPTS = 6     # ~2 minutes, matching allowance.QUERY_WINDOW_SECONDS
-KEEPALIVE_RECONCILE_INTERVAL = 20
-
-
-def _parse_money(value: object) -> float | None:
-    """Pull a comparable number out of a carrier's own wording ("£4.20", "4.20 GBP", "$12").
-
-    Balances are stored as display strings on purpose, so this is best-effort: when it cannot
-    be read the balance is shown and never judged, rather than guessed at.
-    """
-    text = str(value or "").strip()
-    if not text:
-        return None
-    match = re.search(r"-?\d+(?:[.,]\d+)?", text.replace(",", ""))
-    if not match:
-        return None
-    try:
-        return float(match.group(0))
-    except ValueError:
-        return None
-
-
-def _keepalive_in_window(now_local: datetime) -> bool:
-    return KEEPALIVE_WINDOW[0] <= now_local.hour < KEEPALIVE_WINDOW[1]
-
-
-def _keepalive_slot(due_ts: int) -> str:
-    """Identity of one scheduled run: its due timestamp.
-
-    Not the due DATE. The claim has to survive a restart mid-run — that is the double-charge
-    it exists to prevent — while still letting a failed run be retried by the backoff, which
-    lands on the same day. Keying on the timestamp gives both: a retry has a new due time and
-    therefore a new slot, whereas a restart re-reads the same one and is refused.
-    """
-    return str(int(due_ts))
-
-
-async def _keepalive_reconcile_reply(iid: str) -> dict:
-    """Harvest the carrier's reply to a query WE started.
-
-    allowance.reconcile() is pull-only — the browser polling GET /allowance is what normally
-    drives it. A scheduled run has no browser, so without this the reply would sit in the
-    message log until it fell outside the two-minute window and the query expired unread.
-    """
-    snapshot = await asyncio.to_thread(allowance.reconcile, iid)
-    for _ in range(KEEPALIVE_RECONCILE_ATTEMPTS):
-        query = await asyncio.to_thread(store.latest_allowance_query, iid)
-        if (query or {}).get("status") == "parsed":
-            break
-        await asyncio.sleep(KEEPALIVE_RECONCILE_INTERVAL)
-        snapshot = await asyncio.to_thread(allowance.reconcile, iid)
-    return snapshot
-
-
-async def _keepalive_send_sms(iid: str, inst: dict, record: dict) -> tuple[str, str]:
-    """Produce one chargeable event on the SIM. Returns (status, detail)."""
-    to, text = record.get("sms_to") or "", record.get("sms_body") or ""
-    if not to or not text:
-        return "failed", "保号短信未配置收件号码或内容"
-    result = await send_sms_on_line(iid, to, text, "auto")
-    if result.get("unavailable") or not result.get("ok"):
-        error = result.get("error") or "发送失败"
-        if result.get("uncertain"):
-            # Submitted but unacknowledged: the charge may well have happened, so this is not
-            # reported as a failure the user should act on.
-            return "sent_unconfirmed", f"已提交但未收到确认：{error}"
-        return "failed", str(error)
-    detail = f"计费短信已发往 {to}"
-    if record.get("verify_charge"):
-        before = _parse_money((await asyncio.to_thread(store.get_allowance, iid)).get("balance"))
-        rule = allowance.query_rule(inst, carrier_id.lookup(inst))
-        effective = (rule or {}).get("effective")
-        if effective:
-            try:
-                query = await asyncio.to_thread(
-                    store.start_allowance_query, iid, effective["recipient"],
-                    effective["body"], rule.get("carrier_key") or "", "auto")
-                probe = await send_sms_on_line(iid, effective["recipient"],
-                                               effective["body"], "auto")
-                await asyncio.to_thread(
-                    store.set_allowance_query_status, query["id"],
-                    "sent" if probe.get("ok") else "failed")
-                if probe.get("ok"):
-                    after = _parse_money((await _keepalive_reconcile_reply(iid)).get("balance"))
-                    if before is not None and after is not None and after < before:
-                        detail += f"，余额 {before:g}→{after:g}"
-                    elif after is not None:
-                        # An unchanged balance is NOT a failure: a plan with bundled texts
-                        # bills the usage without moving the wallet.
-                        detail += "，余额未变（套餐内短信）"
-            except Exception as exc:  # noqa
-                log.debug("keepalive charge verification failed instance=%s: %r", iid, exc)
-    return "ok", detail
-
-
-async def _keepalive_watch_balance(iid: str, inst: dict, record: dict) -> tuple[str, str]:
-    """A plan SIM renews itself; what needs watching is whether it can pay the next cycle."""
-    rule = allowance.query_rule(inst, carrier_id.lookup(inst))
-    effective = (rule or {}).get("effective")
-    if not effective:
-        return "failed", "该线路没有余额查询规则"
-    query = await asyncio.to_thread(
-        store.start_allowance_query, iid, effective["recipient"], effective["body"],
-        rule.get("carrier_key") or "", "auto")
-    result = await send_sms_on_line(iid, effective["recipient"], effective["body"], "auto")
-    await asyncio.to_thread(store.set_allowance_query_status, query["id"],
-                            "sent" if result.get("ok") else "failed")
-    if not result.get("ok"):
-        return "failed", str(result.get("error") or "余额查询发送失败")
-    snapshot = await _keepalive_reconcile_reply(iid)
-    balance_text = snapshot.get("balance") or ""
-    balance = _parse_money(balance_text)
-    threshold = _parse_money(record.get("threshold"))
-    if balance is None or threshold is None:
-        # Shown, never judged: guessing at an unparseable balance would raise false alarms.
-        return "ok", (f"余额 {balance_text}（未设阈值或无法解析，仅展示）" if balance_text
-                      else "已查询，但未能解析余额")
-    if balance < threshold:
-        return "balance_low", f"余额 {balance_text} 低于阈值 {record.get('threshold')}"
-    return "ok", f"余额 {balance_text} 高于阈值 {record.get('threshold')}"
-
-
-async def _run_keepalive(iid: str, inst: dict, record: dict, *, manual: bool = False) -> dict:
-    """Execute one scheduled action. Never raises: this runs from the status poller."""
-    now = int(time.time())
-    action = str(record.get("action") or "sms")
-    try:
-        if action == "balance_watch":
-            status, detail = await _keepalive_watch_balance(iid, inst, record)
-        else:
-            status, detail = await _keepalive_send_sms(iid, inst, record)
-    except Exception as exc:  # noqa
-        log.warning("keepalive run failed instance=%s: %r", iid, exc)
-        status, detail = "failed", f"执行异常：{exc}"
-
-    state = {"last_run_ts": now, "last_status": status, "last_detail": detail}
-    interval = max(1, int(record.get("interval_days") or 30)) * 86400
-    if status in {"ok", "sent_unconfirmed", "balance_low"}:
-        state["next_due_ts"] = now + interval
-    else:
-        # A failure did not produce the chargeable event the number needs, so it is retried
-        # rather than left for another full interval. Backed off an hour: the poller runs
-        # every few seconds and the failure is usually something slow to fix (no registration,
-        # no route), not something the next poll will resolve.
-        state["next_due_ts"] = now + KEEPALIVE_FAILURE_RETRY_SECONDS
-    settings = cfg.get_settings()
-    if status == "balance_low":
-        low_since = int(record.get("balance_low_since") or 0) or now
-        last_notified = int(record.get("balance_low_last_notified") or 0)
-        state["balance_low_since"] = low_since
-        if now - last_notified >= KEEPALIVE_BALANCE_REPEAT_SECONDS:
-            state["balance_low_last_notified"] = now
-            await asyncio.to_thread(
-                notify_push.dispatch, settings, notify_push.EV_BALANCE_LOW, inst,
-                inst.get("msisdn") or "", f"{detail}。请及时充值，否则套餐可能无法续费。")
-    else:
-        # Recovered: forget the episode so the next dip notifies immediately.
-        state["balance_low_since"] = 0
-        state["balance_low_last_notified"] = 0
-    # A successful chargeable run is announced because it spent the user's money on their SIM.
-    # A failure is announced when it STARTS failing: it now retries hourly, and repeating the
-    # same bad news every hour is how a notification channel gets muted.
-    announce = (status != "failed" and action == "sms") or (
-        status == "failed" and str(record.get("last_status") or "") != "failed")
-    if announce:
-        verb = {"ok": "成功", "sent_unconfirmed": "已提交未确认"}.get(status, "失败")
-        text = f"保号{verb}：{detail}"
-        if state.get("next_due_ts"):
-            text += f"。下次执行 {datetime.fromtimestamp(state['next_due_ts'], _local_tz()):%Y-%m-%d %H:%M}"
-        await asyncio.to_thread(
-            notify_push.dispatch, settings, notify_push.EV_KEEPALIVE_RESULT, inst,
-            inst.get("msisdn") or "", text)
-    updated = await asyncio.to_thread(store.save_keepalive_state, iid, state)
-    log.info("keepalive %s instance=%s status=%s: %s",
-             "manual run" if manual else "run", iid, status, detail)
-    return updated
-
-
-async def _maybe_run_keepalive(iid: str, inst: dict) -> None:
-    """Called from the status poller when the line is registered.
-
-    Parasitic on the poller rather than a task of its own, exactly like _verify_ims_msisdn:
-    it inherits "only ever act on a line that is actually up" for free, and an offline line
-    simply never reaches this point.
-    """
-    try:
-        record = await asyncio.to_thread(store.get_keepalive, iid)
-        if not record.get("enabled"):
-            return
-        now = int(time.time())
-        due = int(record.get("next_due_ts") or 0)
-        if not due or now < due:
-            return
-        if not _keepalive_in_window(datetime.now(_local_tz())):
-            return
-        if iid in hub._keepalive_running:
-            return
-        claimed = await asyncio.to_thread(store.claim_keepalive_run, iid,
-                                          _keepalive_slot(due), now)
-        if not claimed:
-            return
-        hub._keepalive_running.add(iid)
-        try:
-            await _run_keepalive(iid, inst, record)
-        finally:
-            hub._keepalive_running.discard(iid)
-    except Exception as exc:  # noqa
-        log.debug("keepalive scheduling failed instance=%s: %r", iid, exc)
-
-
-@app.post("/api/instances/{iid}/keepalive/run")
-async def api_keepalive_run(iid: str):
-    """Run it now, ignoring the schedule but not the safety rules."""
-    inst = _allowance_instance(iid)
-    record = await asyncio.to_thread(store.get_keepalive, str(iid))
-    if str(iid) in hub._keepalive_running:
-        raise HTTPException(409, "a number-keeping run is already in progress")
-    hub._keepalive_running.add(str(iid))
-    try:
-        updated = await _run_keepalive(str(iid), inst, record, manual=True)
-    finally:
-        hub._keepalive_running.discard(str(iid))
-    return {"keepalive": _keepalive_view(str(iid), updated, int(time.time()))}
-
-
-@app.get("/api/instances/{iid}/keepalive")
-def api_keepalive(iid: str):
-    _allowance_instance(iid)
-    return {"keepalive": _keepalive_view(str(iid), store.get_keepalive(str(iid)),
-                                         int(time.time()))}
-
-
-@app.put("/api/instances/{iid}/keepalive")
-def api_keepalive_save(iid: str, body: dict):
-    """Deliberately NOT routed through POST /api/instances: that restarts a running engine on
-    any save, and the engine has no use for this setting."""
-    _allowance_instance(iid)
-    values = _clean_keepalive(body)
-    now = int(time.time())
-    previous = store.get_keepalive(str(iid))
-    chosen_due = values.pop("next_due_ts", None)
-    if not values["enabled"]:
-        store.save_keepalive_state(str(iid), {"next_due_ts": 0})
-    elif chosen_due is not None:
-        store.save_keepalive_state(str(iid), {"next_due_ts": chosen_due})
-    elif not previous.get("enabled"):
-        # Switched on without naming a date: run at the next opportunity rather than making
-        # the user wait a whole interval to find out whether it works.
-        store.save_keepalive_state(str(iid), {"next_due_ts": now})
-    record = store.save_keepalive_config(str(iid), values)
-    return {"keepalive": _keepalive_view(str(iid), record, now)}
-
-
-@app.get("/api/keepalive/summary")
-async def api_keepalive_summary():
-    """One aggregate for the whole page: at most ten lines, so a per-line fan-out of four
-    requests each would be pure overhead."""
-    now = int(time.time())
-    rows = []
-    for inst in cfg.list_instances():
-        iid = str(inst["id"])
-        status = _cached_line_status(inst)
-        record = await asyncio.to_thread(store.get_keepalive, iid)
-        snapshot = await asyncio.to_thread(store.get_allowance, iid)
-        recorded_since = await asyncio.to_thread(store.line_state_recorded_since, iid)
-        span = _availability_window(now, recorded_since)
-        segments = await asyncio.to_thread(store.line_state_timeline, iid, now - span, now)
-        summary = store.line_state_summary(segments)
-        rule = allowance.query_rule(inst, carrier_id.lookup(inst))
-        expiry = allowance.parse_expiry_date(snapshot.get("valid_until"))
-        carrier = carrier_id.lookup(inst) or {}
-        # Whether this SIM is physically in the gateway right now. There are always more
-        # configured lines than card slots, and a SIM that is out of the box cannot be sent
-        # anything — offering it a keepalive switch would promise something undeliverable.
-        # Its expiry still matters, though: an unused SIM is the one a carrier reclaims.
-        # A running engine is holding the SIM by definition, and unlike the card table it
-        # survives a control-plane restart: hub.cards is rebuilt by the PC/SC monitor, so for
-        # the first seconds after a restart it is empty and every line would otherwise report
-        # itself as out of the gateway.
-        in_gateway = bool(await asyncio.to_thread(engine.is_running, iid)) or any(
-            card.get("present") and (
-                str(card.get("matched") or "") == iid
-                or (inst.get("iccid") and str(card.get("iccid") or "") == str(inst["iccid"])))
-            for card in hub.cards_list())
-        rows.append({
-            "instance": iid,
-            "name": inst.get("name") or iid,
-            "msisdn": inst.get("msisdn") or "",
-            "country": inst.get("country") or "",
-            "carrier": carrier.get("carrier_label") or carrier.get("name") or "",
-            "enabled": bool(inst.get("enabled", True)),
-            "in_gateway": in_gateway,
-            "state": status.get("state"),
-            "label": status.get("label"),
-            "reason_code": status.get("reason_code"),
-            "last_registered_ts": int(record.get("last_registered_ts") or 0),
-            "uptime_ratio": summary.get("uptime_ratio"),
-            "uptime_span_seconds": span,
-            "allowance": snapshot,
-            "days_to_expiry": ((expiry - datetime.now(_local_tz()).date()).days
-                               if expiry else None),
-            "has_query_rule": bool((rule or {}).get("effective")),
-            "keepalive": _keepalive_view(iid, record, now),
-        })
-    return {"lines": rows, "now": now}
 
 
 # ----------------------------- Calls -----------------------------
@@ -8014,27 +7529,6 @@ async def _push_missed_call(iid: str, call_id: int, peer: str) -> None:
 
     except Exception as exc:  # noqa
         log.debug("missed-call push failed instance=%s: %r", iid, exc)
-
-
-def _harvest_allowance_reply(iid: str, sender: str) -> None:
-    """Let an inbound SMS settle an allowance query that is still waiting for its answer.
-
-    allowance.reconcile() is otherwise only reached from GET /allowance, i.e. it needs a
-    browser polling the page. A query started with no page open — by the scheduler, or by a
-    user who navigated away — would never be read, and would expire two minutes later as if
-    the carrier had never replied.
-    """
-    try:
-        query = store.latest_allowance_query(str(iid))
-        if not query or query.get("status") not in {"pending", "sent", "unknown"}:
-            return
-        if str(query.get("recipient") or "") != str(sender or ""):
-            return
-        if int(time.time()) - int(query["started_ts"]) > allowance.QUERY_WINDOW_SECONDS:
-            return
-        allowance.reconcile(str(iid))
-    except Exception as exc:  # noqa
-        log.debug("allowance harvest failed instance=%s: %r", iid, exc)
 
 
 def _dispatch_push(event: str, iid: str, source: str, text: str | None = None):

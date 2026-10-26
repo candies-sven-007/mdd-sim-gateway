@@ -164,19 +164,6 @@ export const api = {
     `/api/instances/${id}/sms/send`,
     { to, body, transport },
   ),
-  allowance: (id) => j('GET', `/api/instances/${id}/allowance`),
-  saveAllowance: (id, body) => j('PUT', `/api/instances/${id}/allowance`, body),
-  allowanceQueryRule: (id) => j('GET', `/api/instances/${id}/allowance/query-rule`),
-  saveAllowanceQueryRule: (id, body) => j('PUT', `/api/instances/${id}/allowance/query-rule`, body),
-  resetAllowanceQueryRule: (id) => j('DELETE', `/api/instances/${id}/allowance/query-rule`),
-  queryAllowance: (id, transport = 'auto') => j(
-    'POST', `/api/instances/${id}/allowance/query`, { transport }),
-  // Number keeping. Config is stored server-side rather than in the line config, so saving it
-  // never restarts a running engine.
-  keepalive: (id) => j('GET', `/api/instances/${id}/keepalive`),
-  saveKeepalive: (id, body) => j('PUT', `/api/instances/${id}/keepalive`, body),
-  keepaliveSummary: () => j('GET', '/api/keepalive/summary'),
-  runKeepalive: (id) => j('POST', `/api/instances/${id}/keepalive/run`),
   // delete messages: { ids:[...] } | { peer } (whole conversation) | { all:true }
   deleteMessages: (id, sel) => j('POST', `/api/instances/${id}/messages/delete`, sel),
 

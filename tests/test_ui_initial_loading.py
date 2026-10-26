@@ -10,7 +10,6 @@ APP = (ROOT / "webui/src/App.jsx").read_text(encoding="utf-8")
 MESSAGES = (ROOT / "webui/src/views/Messages.jsx").read_text(encoding="utf-8")
 ESIM = (ROOT / "webui/src/views/Esim.jsx").read_text(encoding="utf-8")
 LOGS = (ROOT / "webui/src/views/Logs.jsx").read_text(encoding="utf-8")
-KEEPALIVE = (ROOT / "webui/src/views/Keepalive.jsx").read_text(encoding="utf-8")
 
 
 class InitialLoadingUiTests(unittest.TestCase):
@@ -42,7 +41,6 @@ class InitialLoadingUiTests(unittest.TestCase):
         self.assertIn("statusLoading", ESIM)
         self.assertNotIn("setStatus({ available: false })", ESIM)
         self.assertIn("loading ? `${t('Loading')}…`", LOGS)
-        self.assertIn("loadError ? 'Loading failed' : 'Loading'", KEEPALIVE)
 
     def test_settings_failures_do_not_create_fake_empty_configuration(self):
         self.assertNotIn("catch(() => setS({ proxy: {} }))", DEVICES)

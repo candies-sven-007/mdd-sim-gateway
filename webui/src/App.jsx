@@ -4,7 +4,6 @@ import Softphone from './views/Softphone.jsx'
 import GlobalSoftphone from './GlobalSoftphone.jsx'
 import Messages from './views/Messages.jsx'
 import Esim from './views/Esim.jsx'
-import Keepalive from './views/Keepalive.jsx'
 import { UnifiedOverview, DevicesPage, EgressPage, NotificationsPage, SystemPage, DiagnosticsPage } from './views/UnifiedPages.jsx'
 import ContactsPage from './views/Contacts.jsx'
 import { useI18n } from './i18n.jsx'
@@ -12,7 +11,7 @@ import { useI18n } from './i18n.jsx'
 const NAV = [
   ['overview', 'Overview', '⌂'], ['devices', 'Devices', '▣'], ['calls', 'Calls', '☎'],
   ['messages', 'Messages', '✉'], ['contacts', 'Contacts', '☏'],
-  ['esim', 'eSIM', '◎'], ['keepalive', 'Balance & keeping', '◷'],
+  ['esim', 'eSIM', '◎'],
   ['egress', 'Network exits', '⇄'],
   ['notifications', 'Notifications', '◉'], ['settings', 'System settings', '⚙'], ['diagnostics', 'Diagnostics', '≣'],
 ]
@@ -226,7 +225,7 @@ export default function App() {
   const common={devices,discovering,initialLoading,loadErrors,refreshDevices:refresh,instances,cards,selected:sel,setSelected,refresh,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,deviceTab,setDeviceTab,setSystemMeta,refreshUnread:loadUnread,unreadLines}
   const content={
     overview:<UnifiedOverview {...common}/>, devices:<DevicesPage {...common}/>, calls:<Softphone {...common}/>,
-    messages:<Messages {...common}/>, esim:<Esim {...common}/>, keepalive:<Keepalive {...common}/>,
+    messages:<Messages {...common}/>, esim:<Esim {...common}/>,
     egress:<EgressPage {...common}/>,
     notifications:<NotificationsPage {...common}/>,
     contacts:<ContactsPage showToast={showToast}/>,

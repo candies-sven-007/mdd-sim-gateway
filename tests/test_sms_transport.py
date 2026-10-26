@@ -163,39 +163,6 @@ class SmsTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 422)
         send.assert_not_awaited()
 
-    async def test_allowance_query_sends_only_after_resolved_rule(self):
-        inst = {"id": "1", "mcc": "310", "mnc": "240",
-                "carrier_identity": {"gid1": "value"}}
-        sent = {"ok": True, "transport": "vowifi", "message": _message(
-            "1", "out", "6700", "BAL", status="sent")}
-        with patch.object(main.cfg, "get_instance", return_value=inst), \
-                patch.object(main.carrier_id, "lookup",
-                             return_value={"name": "Ultra/Univision", "specific": True}), \
-                patch.object(main.store, "get_allowance_query_rule", return_value=None), \
-                patch.object(main.store, "start_allowance_query",
-                             return_value={"id": 4, "started_ts": 100}) as start, \
-                patch.object(main.store, "set_allowance_query_status") as status, \
-                patch.object(main, "send_sms_on_line", new=AsyncMock(return_value=sent)) as send:
-            result = await main.api_allowance_query("1", {"transport": "auto"})
-
-        self.assertTrue(result["ok"])
-        start.assert_called_once_with("1", "6700", "BAL", "ultramobile", "auto")
-        send.assert_awaited_once_with("1", "6700", "BAL", "auto")
-        status.assert_called_once_with(4, "sent")
-
-    async def test_allowance_query_unknown_carrier_never_sends(self):
-        inst = {"id": "2", "name": "ultramobile", "mcc": "310", "mnc": "240"}
-        with patch.object(main.cfg, "get_instance", return_value=inst), \
-                patch.object(main.carrier_id, "lookup",
-                             return_value={"name": "T-Mobile - US", "specific": False}), \
-                patch.object(main.store, "get_allowance_query_rule", return_value=None), \
-                patch.object(main, "send_sms_on_line", new=AsyncMock()) as send:
-            with self.assertRaises(main.HTTPException) as raised:
-                await main.api_allowance_query("2", {"transport": "auto"})
-
-        self.assertEqual(raised.exception.status_code, 409)
-        send.assert_not_awaited()
-
 
 if __name__ == "__main__":
     unittest.main()

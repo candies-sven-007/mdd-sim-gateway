@@ -31,7 +31,7 @@ def _rules(*rows: tuple[str, str]) -> tuple[tuple[frozenset[str], re.Pattern[str
 # Suffixes under /api/instances/<line>/ a client may use, by method. "WEBSOCKET" is a handshake.
 CLIENT_LINE_RULES = _rules(
     # A read-only view of the line itself.
-    ("GET", r"^/(status|availability|allowance)$"),
+    ("GET", r"^/(status|availability)$"),
     # Texts and MMS: messages/threads, messages/unread and messages/<peer>. Not messages/binary,
     # the filed raw PDUs and SIM OTA payloads, which are the administrator's to diagnose. The
     # MMS settings tell the composer the line's size limit (changing them stays administrative).
