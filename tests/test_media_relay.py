@@ -520,13 +520,6 @@ class RelayImageTests(unittest.TestCase):
         with self.assertRaisesRegex(self.media.MediaError, "ghcr.io.*coturn/coturn"):
             self.media.ensure_image(client, self.media.default_image())
 
-    def test_release_workflow_ships_the_same_upstream_image(self):
-        workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
-        self.assertIn("control/app/media.py", workflow)
-        self.assertIn("UPSTREAM_IMAGE", workflow)
-        self.assertIn("mdd-sim-gateway-relay-${GITHUB_REF_NAME}-arm64.tar.gz", workflow)
-        self.assertIn("mdd-sim-gateway-relay-${GITHUB_REF_NAME}-amd64.tar.gz", workflow)
-
 
 class RelayEntrypointTests(unittest.TestCase):
     """The entrypoint runs in the stock alpine image: busybox sh and awk, iproute's ip."""

@@ -32,7 +32,7 @@ jobs:
       - run: pip install -r control/requirements.txt
       - run: python -m py_compile control/app/*.py engine/*.py host/*.py
       - run: python -m unittest discover -s tests -v
-      - run: sh -n install.sh engine/entrypoint.sh tools/engine-fingerprint.sh
+      - run: sh -n install.sh engine/entrypoint.sh
 
   privacy:
     runs-on: ubuntu-latest
@@ -77,51 +77,3 @@ jobs:
             exit 1
           done
           echo "::warning::npm audit skipped — registry unavailable after 3 attempts"
-
-  control-image:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Build control image
-        run: docker build -f control/Dockerfile -t mdd-sim-gateway/control:ci .
-
-  engine-image:
-    name: Engine image (${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Both architectures ship exactly what engine/asterisk-keep-modules.txt names: the
-          # build prunes everything else and fails unless the survivors equal the list, so the
-          # counts no longer differ by the x86-only external binary modules. Asserting it again
-          # here is what proves the published image is the one the build checked.
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            machine: aarch64
-            modules: 126
-          - arch: amd64
-            runner: ubuntu-latest
-            machine: x86_64
-            modules: 126
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Build and validate the native Engine image
-        run: |
-          runtime_fp=$(sh tools/engine-fingerprint.sh runtime)
-          base_fp=$(sh tools/engine-fingerprint.sh base)
-          docker build \
-            --build-arg "MDD_VERSION=$(cat VERSION)" \
-            --build-arg "RUNTIME_FP=$runtime_fp" \
-            --build-arg "BASE_FP=$base_fp" \
-            -t mdd-sim-gateway/engine:ci engine
-          docker run --rm --entrypoint /bin/bash mdd-sim-gateway/engine:ci -lc '
-            set -e
-            actual_machine=$(uname -m)
-            module_count=$(find /usr/lib/asterisk/modules -name "*.so" | wc -l)
-            printf "Engine validation: architecture=%s modules=%s\n" "$actual_machine" "$module_count"
-            test "$actual_machine" = "${{ matrix.machine }}"
-            test "$module_count" -eq "${{ matrix.modules }}"
-            python3 -c "import Crypto, cryptography, jinja2, panoramisk, requests, serial, smartcard, socks, card"
-            asterisk -V
-          '

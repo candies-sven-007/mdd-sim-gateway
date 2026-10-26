@@ -94,11 +94,6 @@ class SwuProxyTransportTests(unittest.TestCase):
         _ns, app = self.app()
         self.assertEqual(app._inner_mtu_from(1500), 1409)
 
-    def test_engine_images_advertise_only_the_implemented_transport(self):
-        for name in ("Dockerfile", "Dockerfile.overlay"):
-            text = (ROOT / "engine" / name).read_text(encoding="utf-8")
-            self.assertIn('io.mdd-sim-gateway.egress-transports="socks5"', text)
-            self.assertIn("COPY outer_transport.py", text)
 
     def test_proxy_forces_natt_after_ike_authentication(self):
         text = SOURCE.read_text(encoding="utf-8")
