@@ -34,15 +34,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   const [creating, setCreating] = useState(false)
   const [savedLineId, setSavedLineId] = useState('')
   const [smscMode, setSmscMode] = useState('auto')   // 'auto' = read from SIM, 'manual' = typed
-  // Only to label the "use the system default" option with what that default currently is,
-  // so the choice does not require a trip to the settings page to interpret.
-  const [systemDefaultVm, setSystemDefaultVm] = useState(null)
-  useEffect(() => {
-    let cancelled = false
-    api.settings().then((s) => { if (!cancelled) setSystemDefaultVm(!!s.vm_enabled) })
-      .catch(() => {})
-    return () => { cancelled = true }
-  }, [])
+
 
   // Refresh the physical-reader list whenever the detected-card set changes (hotplug).
   // pcsc-lite can briefly reject a new context while the modem bridge reconnects. Keep the
@@ -379,23 +371,6 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
             onChange={(e) => updSip({ webrtc: { ...form.sip.webrtc, enable: e.target.checked } })} />
           {t('Enable browser softphone (WebRTC)')}
         </label>
-
-        <h4 style={{ marginBottom: 6, marginTop: 18 }}>{t('Voicemail')}</h4>
-        <p style={{ fontSize: 11, color: 'var(--text-mute)', margin: '0 0 6px', lineHeight: 1.5 }}>
-          {t('Record a message when a call to this line goes unanswered — including when no browser is open. A call you decline on the softphone is never recorded.')}
-        </p>
-        {/* Three states, not two: "follow the global default" has to stay distinguishable from
-            "off for this line", or turning the global on would silently switch on every line
-            that had merely been left alone. */}
-        <select value={form.sip.vm_enabled === undefined || form.sip.vm_enabled === null
-          ? 'default' : (form.sip.vm_enabled ? 'on' : 'off')}
-          onChange={(e) => updSip({ vm_enabled: e.target.value === 'default' ? undefined
-            : e.target.value === 'on' })}>
-          <option value="default">{t('Use the system default ({state})',
-            { state: systemDefaultVm === null ? `${t('Loading')}…` : systemDefaultVm ? t('on') : t('off') })}</option>
-          <option value="on">{t('On for this line')}</option>
-          <option value="off">{t('Off for this line')}</option>
-        </select>
 
         <details style={{ marginTop: 12 }}>
           <summary>{t('Advanced IMS identity')}</summary>

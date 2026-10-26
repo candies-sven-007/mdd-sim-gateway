@@ -13,7 +13,6 @@ import ipaddress
 import json
 import os
 import re
-import shutil
 import shlex
 import socket
 import subprocess
@@ -334,13 +333,7 @@ def build_context(cfg):
         "ice_advertise_addr": sip.get("ice_advertise_address", ""),
         # Outbound ring timeout (s) for Dial() — see extensions.conf.j2. Default 35.
         "ring_timeout": int(sip.get("ring_timeout", 35) or 35),
-        # Voicemail. Off by default: recording a caller is a decision the operator makes, not
-        # a default the product makes for them. vm_ring_seconds replaces the inbound Dial()
-        # timeout only while it is on, so turning it off restores the previous behaviour
-        # exactly. See extensions.conf.j2 [volte_ims].
-        "vm_enabled": bool(sip.get("vm_enabled", False)),
-        "vm_ring_seconds": int(sip.get("vm_ring_seconds", 25) or 25),
-        "vm_max_seconds": int(sip.get("vm_max_seconds", 120) or 120),
+
         # The container's own RTP bind IP (docker-bridge private, e.g. 172.17.0.2). Used as the
         # LHS of rtp.conf [ice_host_candidates] to rewrite that unreachable host candidate to
         # the host LAN IP (advertise_addr) so a LAN WebRTC browser can reach our RTP.
@@ -393,23 +386,6 @@ def main():
         with open(dest, "w") as f:
             f.write(rendered)
         print(f"[render] {tpl} -> {dest}")
-
-    # Bundled prompts. Shipped in templates/ so the overlay image carries them: the base
-    # image's Asterisk sound packages are a side effect of its build, not something this
-    # repository asserts, so nothing here may depend on them existing.
-    if ctx.get("vm_enabled"):
-        # Record() will not create its own directory, and a failure there loses the message
-        # with nothing but a dialplan warning to show for it.
-        os.makedirs("/logs/voicemail", exist_ok=True)
-    sounds_src = os.path.join(TPL_DIR, "sounds")
-    if os.path.isdir(sounds_src):
-        sounds_dst = "/var/lib/asterisk/mdd-sounds"
-        os.makedirs(sounds_dst, exist_ok=True)
-        for name in os.listdir(sounds_src):
-            src = os.path.join(sounds_src, name)
-            if os.path.isfile(src):
-                shutil.copyfile(src, os.path.join(sounds_dst, name))
-                print(f"[render] sound {name} -> {sounds_dst}")
 
     # Export env for keeper / ami_usim / swu_ike
     env_path = os.environ.get("MDD_ENV", "/run/mdd-sim-gateway/engine.env")

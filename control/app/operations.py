@@ -699,7 +699,7 @@ def support_bundle(status_documents: dict, log_lines: int = 500) -> bytes:
         except OSError:
             continue
 
-    # Explicit allow-list: voicemail recordings and every unknown future file stay excluded.
+    # Explicit allow-list: every unknown future file stays excluded.
     # Note this deliberately does NOT include the rest of /logs/asterisk: Asterisk's own `full`
     # and `messages` carry the subscriber's IMS public identity on every registration. Only
     # supervisor.jsonl is admitted whole, and it is a closed schema of exit codes and

@@ -218,12 +218,8 @@ export const api = {
   mmsSettings: (id) => j('GET', `/api/instances/${id}/mms/settings`),
   saveMmsSettings: (id, body) => j('PUT', `/api/instances/${id}/mms/settings`, body),
 
-  voicemails: (id) => j('GET', `/api/instances/${id}/voicemails`),
   // Served as audio/wav by the control plane; the <audio> element fetches it directly
   // and the session cookie rides along same-origin, so it never goes through j().
-  voicemailAudioUrl: (id, vid) => `/api/instances/${id}/voicemails/${vid}/audio`,
-  markVoicemailListened: (id, vid) => j('POST', `/api/instances/${id}/voicemails/${vid}/listened`),
-  deleteVoicemails: (id, sel) => j('POST', `/api/instances/${id}/voicemails/delete`, sel),
   calls: (id) => j('GET', `/api/instances/${id}/calls`),
   // delete call-log entries: { ids:[...] } | { all:true }
   deleteCalls: (id, sel) => j('POST', `/api/instances/${id}/calls/delete`, sel),

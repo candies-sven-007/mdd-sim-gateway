@@ -5523,9 +5523,7 @@ def api_system_status():
         "system_name": "MDD Sim Gateway",
         "host": host,
         "host_alerts": hub.host_alerts if hub.host_snapshot else sysinfo.alerts(host),
-        # Drives the unread dot on the Calls entry: a message nobody has played is the one
-        # thing on this page the user has to act on rather than merely read.
-        "unheard_voicemails": sum(store.unheard_voicemail_counts().values()),
+
         "timezone": settings.get("timezone") or "UTC",
         "version": VERSION,
         "deployment": {
@@ -7472,87 +7470,6 @@ async def api_keepalive_summary():
     return {"lines": rows, "now": now}
 
 
-# ----------------------------- Voicemail -----------------------------
-def _voicemail_dir(iid: str) -> str:
-    return os.path.join(cfg.DATA_DIR, "instances", str(iid), "logs", "voicemail")
-
-
-def _voicemail_file(iid: str, relative: str) -> str | None:
-    """Resolve a stored path, refusing anything that escapes this line's own directory.
-
-    The engine token proves an event came from *an* engine container, not that its arguments
-    are sane. A recording path is a filename this process will later open and serve, so it is
-    confined here rather than trusted.
-    """
-    root = os.path.realpath(os.path.join(cfg.DATA_DIR, "instances", str(iid), "logs"))
-    full = os.path.realpath(os.path.join(root, str(relative or "")))
-    if full != root and not full.startswith(root + os.sep):
-        return None
-    return full
-
-
-def _voicemail_view(row: dict) -> dict:
-    return {"id": row["id"], "instance": row["instance"], "peer": row["peer"],
-            "ts": row["ts"], "duration_seconds": row["duration_seconds"],
-            "size_bytes": row["size_bytes"], "listened": bool(row["listened"])}
-
-
-def _remove_voicemail_files(iid: str, paths: list[str]) -> None:
-    for relative in paths:
-        full = _voicemail_file(iid, relative)
-        if not full:
-            continue
-        try:
-            os.remove(full)
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            log.debug("could not remove voicemail %s: %r", relative, exc)
-
-
-@app.get("/api/instances/{iid}/voicemails")
-def api_voicemails(iid: str):
-    _allowance_instance(iid)
-    return {"voicemails": [_voicemail_view(r) for r in store.list_voicemails(str(iid))]}
-
-
-@app.get("/api/instances/{iid}/voicemails/{vid}/audio")
-def api_voicemail_audio(iid: str, vid: int):
-    _allowance_instance(iid)
-    row = store.get_voicemail(str(iid), int(vid))
-    if not row:
-        raise HTTPException(404, "no such voicemail")
-    full = _voicemail_file(str(iid), row["path"])
-    if not full or not os.path.isfile(full):
-        raise HTTPException(404, "the recording is no longer on disk")
-    # Inline, not an attachment: the point is to play it in the call log.
-    return FileResponse(full, media_type="audio/wav",
-                        headers={"Content-Disposition": "inline"})
-
-
-@app.post("/api/instances/{iid}/voicemails/{vid}/listened")
-async def api_voicemail_listened(iid: str, vid: int):
-    _allowance_instance(iid)
-    if not store.get_voicemail(str(iid), int(vid)):
-        raise HTTPException(404, "no such voicemail")
-    await asyncio.to_thread(store.set_voicemail_listened, str(iid), int(vid), True)
-    await hub.broadcast({"type": "voicemail", "instance": str(iid), "listened": int(vid)})
-    return {"ok": True}
-
-
-@app.post("/api/instances/{iid}/voicemails/delete")
-async def api_voicemails_delete(iid: str, body: dict):
-    """Delete recordings: {ids:[...]} or {all:true}. The audio goes with the record."""
-    _allowance_instance(iid)
-    ids = None if (body or {}).get("all") else [int(i) for i in (body or {}).get("ids") or []]
-    if ids is not None and not ids:
-        raise HTTPException(422, "provide ids or all:true")
-    paths = await asyncio.to_thread(store.delete_voicemails, str(iid), ids)
-    await asyncio.to_thread(_remove_voicemail_files, str(iid), paths)
-    await hub.broadcast({"type": "voicemail", "instance": str(iid), "deleted": len(paths)})
-    return {"deleted": len(paths)}
-
-
 # ----------------------------- Calls -----------------------------
 @app.get("/api/instances/{iid}/calls")
 def api_calls(iid: str):
@@ -8031,43 +7948,6 @@ async def api_engine_event(payload: dict):
                         hub._pushed_missed = set(list(hub._pushed_missed)[-256:])
                     asyncio.create_task(_push_missed_call(
                         iid, cid, rec.get("peer") or to))
-    elif event == "voicemail_new" and args:
-        # args: <peer> <absolute path inside the container> [seconds]
-        peer = args[0] if args else ""
-        raw = args[1] if len(args) > 1 else ""
-        seconds = int(args[2]) if len(args) > 2 and str(args[2]).lstrip("-").isdigit() else 0
-        # The container writes to /logs/voicemail/…; the manager sees the same bytes under
-        # the instance's own logs directory. Keep only the part below /logs so the stored
-        # path stays valid across container rebuilds and host data moves.
-        relative = str(raw).split("/logs/", 1)[-1].lstrip("/")
-        if not relative.startswith("voicemail/"):
-            relative = os.path.join("voicemail", os.path.basename(relative))
-        full = _voicemail_file(iid, relative)
-        if not full or not os.path.isfile(full):
-            log.warning("voicemail event for %s references an unusable path %r", iid, raw)
-            return {"ok": False, "error": "recording not found"}
-        size = os.path.getsize(full)
-        if size <= 0:
-            # Record() with the k option writes a header even when the caller hung up before
-            # speaking; an empty file is not a message and should not raise a notification.
-            os.remove(full)
-            return {"ok": True, "dropped": "empty_recording"}
-        rec, evicted = await asyncio.to_thread(
-            store.add_voicemail, iid, peer, relative, max(0, seconds), size)
-        if evicted:
-            await asyncio.to_thread(_remove_voicemail_files, iid, evicted)
-        call = await asyncio.to_thread(store.link_voicemail_to_call, iid, peer, rec["id"])
-        await hub.broadcast({"type": "voicemail", "instance": iid,
-                             "voicemail": _voicemail_view(rec)})
-        if call:
-            await hub.broadcast({"type": "call", "instance": iid, "call": call})
-        minutes, secs = divmod(max(0, seconds), 60)
-        # The number and the length, never the audio: a push channel is not a place to put a
-        # recording of somebody's voice.
-        _dispatch_push(notify_push.EV_VOICEMAIL, iid, peer,
-                       f"来自 {peer or '未知号码'} 的语音留言，时长 {minutes}:{secs:02d}。"
-                       "请在控制台收听。")
-        return {"ok": True, "voicemail": rec["id"]}
     elif event == "ussd" and args:
         # A carrier answers a service code in signalling rather than audio (T-Mobile puts it
         # on the BYE), so this is reported by a hangup handler on the carrier's own leg —
@@ -8127,36 +8007,11 @@ async def push_status(iid: str):
         log.debug("push_status error: %r", e)
 
 
-MISSED_CALL_VOICEMAIL_GRACE_SECONDS = 4.0
-
-
-def _voicemail_enabled(inst: dict) -> bool:
-    """Resolve the same per-line-over-global order config.render_instance_json uses."""
-    sip = (inst or {}).get("sip") or {}
-    if "vm_enabled" in sip:
-        return bool(sip["vm_enabled"])
-    return bool(cfg.get_settings().get("vm_enabled", False))
-
-
 async def _push_missed_call(iid: str, call_id: int, peer: str) -> None:
-    """Announce a missed call — unless the caller left a message.
-
-    "You have a 0:42 message from X" already says everything "you missed a call from X" says,
-    so sending both makes one event buzz the user's phone twice. The dialplan starts
-    voicemail_new before the 'h' handler starts call_result, but both are backgrounded
-    processes and neither orders the other, so this waits briefly for the recording to be
-    filed rather than assuming it already has been.
-    """
+    """Announce a missed call."""
     try:
-        if _voicemail_enabled(cfg.get_instance(iid) or {}):
-            deadline = time.monotonic() + MISSED_CALL_VOICEMAIL_GRACE_SECONDS
-            while True:
-                if await asyncio.to_thread(store.call_has_voicemail, iid, call_id):
-                    return
-                if time.monotonic() >= deadline:
-                    break
-                await asyncio.sleep(0.3)
         _dispatch_push(notify_push.EV_MISSED_CALL, iid, peer)
+
     except Exception as exc:  # noqa
         log.debug("missed-call push failed instance=%s: %r", iid, exc)
 

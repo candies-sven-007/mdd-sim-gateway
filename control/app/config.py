@@ -100,11 +100,7 @@ DEFAULTS = {
         # "delete" (default), "when_full" or "keep". Deliberately absent from these defaults:
         # an unset key defers to MDD_CELLULAR_SMS_STORAGE, so a deployment can choose the
         # policy from its service environment; a value saved here takes precedence.
-        # Voicemail defaults. Off unless asked for: recording a caller is the operator's
-        # decision. Per-line overrides live in the line's sip.* block, like ring_timeout.
-        "vm_enabled": False,
-        "vm_ring_seconds": 25,
-        "vm_max_seconds": 120,
+
         # Country-aware outer ePDG routing. Disabled preserves the legacy host routing until the
         # host-side orchestrator is installed/configured. When enabled, a line fails closed if
         # its SIM country has no healthy exit (unless that country explicitly selects direct).
@@ -1208,13 +1204,7 @@ def _render_instance_json(inst: dict, settings: dict) -> dict:
             # settings default, else 35s. Clamped to a sane 5..180 range.
             "ring_timeout": max(5, min(180, int(
                 sip.get("ring_timeout") or settings.get("ring_timeout", 35)))),
-            # Voicemail: per-line override wins, else the global default. The ring bound stops
-            # short of the inbound INVITE timeout so the carrier does not give up first.
-            "vm_enabled": bool(sip.get("vm_enabled", settings.get("vm_enabled", False))),
-            "vm_ring_seconds": max(5, min(55, int(
-                sip.get("vm_ring_seconds") or settings.get("vm_ring_seconds", 25)))),
-            "vm_max_seconds": max(30, min(300, int(
-                sip.get("vm_max_seconds") or settings.get("vm_max_seconds", 120)))),
+
             # Honest product identity unless the line explicitly overrides it: carriers that
             # gate IMS registration on a User-Agent whitelist reject the default with 403, and
             # the operator running that SIM is the one who can tell. Blank = default.

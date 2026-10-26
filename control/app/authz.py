@@ -49,9 +49,7 @@ CLIENT_LINE_RULES = _rules(
     ("GET", r"^/(calls|cellular-call/status)$"),
     ("POST", r"^/(call|hangup|calls/delete|cellular-call|cellular-call/hangup)$"),
     # Voicemail.
-    ("GET", r"^/voicemails$"),
-    ("GET", r"^/voicemails/[^/]+/audio$"),
-    ("POST", r"^/(voicemails/delete|voicemails/[^/]+/listened)$"),
+
     # The softphone: its provisioning and the signalling relay.
     ("GET", r"^/softphone$"),
     ("WEBSOCKET", r"^/softphone/ws$"),
@@ -74,7 +72,8 @@ CLIENT_GLOBAL_RULES = _rules(
 
 # Live events a client receives, and only for a line: its conversations, calls and the line's
 # own state. Host alerts, hardware, cards and engine maintenance stay with the administrator.
-CLIENT_EVENTS = frozenset({"sms", "call", "voicemail", "status", "line"})
+CLIENT_EVENTS = frozenset({"sms", "call", "status", "line"})
+
 
 
 def allowed(principal, method: str, path: str) -> bool:

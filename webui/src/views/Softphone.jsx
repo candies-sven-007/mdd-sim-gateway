@@ -13,30 +13,6 @@ const fmtDur = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 
 // Call-history dispositions as recorded by the backend (_call_disposition), mapped to
 // translatable labels.
-function VoicemailRow({ instanceId, voicemail, open, onOpen, onHeard, onDelete, t }) {
-  // The recording is fetched only when the user asks for it: rendering an <audio src> per row
-  // would make opening the call log download every message on the line.
-  const mins = Math.floor((voicemail.duration_seconds || 0) / 60)
-  const secs = String((voicemail.duration_seconds || 0) % 60).padStart(2, '0')
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginTop: 7, padding: '7px 10px',
-      border: '1px solid var(--border)', borderRadius: 9, background: 'var(--hover)', maxWidth: 360 }}>
-      {!voicemail.listened && <i title={t('Not played yet')} style={{ flex: 'none', width: 7, height: 7,
-        borderRadius: '50%', background: RED }} />}
-      {open ? (
-        <audio controls autoPlay style={{ flex: 1, height: 32 }} onPlay={onHeard}
-          src={api.voicemailAudioUrl(instanceId, voicemail.id)} />
-      ) : (
-        <button className="btn btn-ghost" style={{ padding: '3px 10px', fontSize: 12 }}
-          onClick={onOpen}>▶ {t('Play')}</button>
-      )}
-      <span style={{ flex: 'none', color: 'var(--text-mute)', fontSize: 11 }}>{mins}:{secs}</span>
-      <button className="row-del" style={{ opacity: .6 }} title={t('Delete this voicemail')}
-        onClick={onDelete}>🗑</button>
-    </div>
-  )
-}
-
 const CALL_STATUS_LABEL = {
   answered: 'Answered', missed: 'Missed', rejected: 'Declined', busy: 'Busy',
   'no answer': 'No answer', cancelled: 'Cancelled', failed: 'Failed',
@@ -171,11 +147,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
     : <div className="mono" style={{ fontSize: size, fontWeight: 700 }}>{call.number || fallback}</div>
   const [callSelMode, setCallSelMode] = useState(false)
   const [callSel, setCallSel] = useState(() => new Set())
-  // Keyed by voicemail id. The <audio> is only created once the user asks to play, so a log
-  // full of messages does not open a fetch per row.
-  const [voicemails, setVoicemails] = useState({})
   const [historyLoading, setHistoryLoading] = useState(false)
-  const [vmOpen, setVmOpen] = useState(null)
   const phone = useRef(null)
   // JsSIP can emit `unregistered` while a freshly-created UA is still opening its websocket.
   // That is an initial condition, not evidence that a working registration was lost.
@@ -207,26 +179,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
     api.calls(id).then((r) => { if (seq === loadSeq.current) setCalls(r.calls || []) }).catch(() => {})
       .finally(() => { if (seq === loadSeq.current) setHistoryLoading(false) })
   }, [id])
-  const markHeard = (vid) => {
-    if (voicemails[vid]?.listened) return
-    setVoicemails((v) => ({ ...v, [vid]: { ...v[vid], listened: true } }))
-    api.markVoicemailListened(id, vid).catch(() => {})
-  }
-  const deleteVoicemail = async (vid, e) => {
-    e?.stopPropagation()
-    try {
-      await api.deleteVoicemails(id, { ids: [vid] })
-      if (vmOpen === vid) setVmOpen(null)
-      loadVoicemails(); loadCalls()
-    } catch (error) { showToast?.(error.message) }
-  }
-  const loadVoicemails = useCallback(() => {
-    if (!id) return
-    api.voicemails(id)
-      .then((r) => setVoicemails(Object.fromEntries((r.voicemails || []).map((v) => [v.id, v]))))
-      .catch(() => {})
-  }, [id])
-  useEffect(() => { loadCalls(true); loadVoicemails() }, [loadCalls, loadVoicemails])
+  useEffect(() => { loadCalls(true) }, [loadCalls])
   useEffect(() => { setCallSelMode(false); setCallSel(new Set()); setCallTransport('vowifi') }, [id])
   useEffect(() => {
     if (!cellularReady && callTransport === 'cellular') setCallTransport('vowifi')
@@ -238,7 +191,6 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   // rides the BYE), so it reaches the browser over the websocket rather than through JsSIP.
   // Graft it onto the call still on screen so the user sees the reply where they asked.
   useEffect(() => subscribe && subscribe((m) => {
-    if (m.type === 'voicemail' && m.instance === id) { loadVoicemails(); loadCalls(); return }
     if (m.type !== 'call' || m.instance !== id) return
     // The manager decides an outcome from the Q.850 cause, which is strictly better evidence
     // than the SIP cause JsSIP hands us — and the history list already shows ITS verdict.
@@ -249,7 +201,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
         : c))
     }
     loadCalls()
-  }), [subscribe, id, loadCalls, loadVoicemails])
+  }), [subscribe, id, loadCalls])
 
   // The manager's verdict for the call on screen. Prefer what the websocket pushed, but fall
   // back to the history list — it is the same data fetched over the API, so this no longer
@@ -909,13 +861,6 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
                   {c.ussd_text && (
                     <div title={c.ussd_text} style={{ fontSize: 11.5, marginTop: 3, color: 'var(--text-soft)',
                       overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.ussd_text}</div>
-                  )}
-                  {c.voicemail_id && voicemails[c.voicemail_id] && (
-                    <VoicemailRow instanceId={id} voicemail={voicemails[c.voicemail_id]} t={t}
-                      open={vmOpen === c.voicemail_id}
-                      onOpen={(e) => { e.stopPropagation(); setVmOpen(c.voicemail_id) }}
-                      onHeard={() => markHeard(c.voicemail_id)}
-                      onDelete={(e) => deleteVoicemail(c.voicemail_id, e)} />
                   )}
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
