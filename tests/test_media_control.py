@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 from control.app import main, media
 from control.app import state as app_state
 from control.app.routers import softphone as softphone_routes
+from control.app import tasks as app_tasks
 
 INSTANCE = {"id": "1", "mcc": "001", "mnc": "01",
             "sip": {"webrtc": {"enable": True, "username": "webrtc", "password": "p"}}}
@@ -51,12 +52,12 @@ class MediaControlTests(unittest.TestCase):
                 patch.object(main.time, "monotonic", return_value=now), \
                 patch.object(app_state.hub, "drop_ami", side_effect=drop_ami), \
                 patch.object(app_state.hub, "reset_health"):
-            rebuilt = asyncio.run(main._media_converge_once())
+            rebuilt = asyncio.run(app_tasks._media_converge_once())
         return rebuilt, started, order
 
     def setUp_retry(self):
-        main._media_retry.clear()
-        self.addCleanup(main._media_retry.clear)
+        app_tasks._media_retry.clear()
+        self.addCleanup(app_tasks._media_retry.clear)
 
     def test_lines_already_in_the_recorded_mode_are_left_alone(self):
         self.setUp_retry()
@@ -84,22 +85,22 @@ class MediaControlTests(unittest.TestCase):
         self.assertTrue(rebuilt)
         self.assertEqual([iid for iid, _ in started], ["2"])
         self.assertNotIn(("drop_ami", "1"), order)
-        self.assertEqual(main._media_retry["1"]["failures"], 1)
+        self.assertEqual(app_tasks._media_retry["1"]["failures"], 1)
 
         modes["2"] = "relay"
         _rebuilt, _started, order = self.converge(modes, failing={"1"}, now=1030.0)
         self.assertEqual(order, [])                       # still backing off
         _rebuilt, _started, order = self.converge(modes, failing={"1"}, now=1061.0)
         self.assertEqual(order, [("start", "1")])
-        self.assertEqual(main._media_retry["1"]["failures"], 2)
-        self.assertEqual(main._media_retry["1"]["at"], 1061.0 + 120)
+        self.assertEqual(app_tasks._media_retry["1"]["failures"], 2)
+        self.assertEqual(app_tasks._media_retry["1"]["at"], 1061.0 + 120)
 
     def test_the_backoff_is_bounded(self):
         self.setUp_retry()
         media.save_state({"mode": "relay", "secret": "x"})
-        main._media_retry["1"] = {"at": 0.0, "failures": 9}
+        app_tasks._media_retry["1"] = {"at": 0.0, "failures": 9}
         self.converge({"1": "direct"}, failing={"1"})
-        self.assertEqual(main._media_retry["1"]["at"], 1000.0 + main.MEDIA_RETRY_MAX_SECONDS)
+        self.assertEqual(app_tasks._media_retry["1"]["at"], 1000.0 + app_tasks.MEDIA_RETRY_MAX_SECONDS)
 
     def test_a_line_left_pending_is_not_rebuilt_on_every_pass(self):
         """Review of #181: a start that lands in relay-pending succeeded, so the line used to
@@ -115,14 +116,14 @@ class MediaControlTests(unittest.TestCase):
             if started:
                 self.assertIn(("drop_ami", "1"), order)   # its old container is gone
         self.assertEqual(len(rebuilds), 1)
-        self.assertEqual(main._media_retry["1"]["failures"], 1)
+        self.assertEqual(app_tasks._media_retry["1"]["failures"], 1)
         _rebuilt, started, _order = self.converge(modes, pending={"1"}, now=1061.0)
         self.assertEqual(len(started), 1)
-        self.assertEqual(main._media_retry["1"]["failures"], 2)
+        self.assertEqual(app_tasks._media_retry["1"]["failures"], 2)
         # Once the network can be had the line lands in relay mode and its backoff is gone.
         _rebuilt, started, _order = self.converge(modes, now=1061.0 + 121)
         self.assertEqual((len(started), modes["1"]), (1, "relay"))
-        self.assertNotIn("1", main._media_retry)
+        self.assertNotIn("1", app_tasks._media_retry)
 
     def test_a_line_started_without_the_media_network_is_tried_again(self):
         self.setUp_retry()

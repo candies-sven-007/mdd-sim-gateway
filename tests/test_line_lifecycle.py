@@ -11,6 +11,9 @@ from control.app import failover
 from control.app import device_state
 from control.app.routers import lines as lines_routes
 from fastapi import HTTPException
+from control.app import status as status_mod
+from control.app import sysinfo
+from control.app import tasks as app_tasks
 
 
 _lifecycle_patcher = None
@@ -277,7 +280,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.cfg, "get_instance", return_value=inst), \
                 patch.object(app_state, "_record_lifecycle") as lifecycle, \
                 patch.object(main.engine, "is_running", return_value=False):
-            stopped = await main._on_card_remove(entry)
+            stopped = await app_tasks._on_card_remove(entry)
 
         self.assertFalse(stopped)
         health = app_state.hub.health["removed"]
@@ -311,7 +314,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
         app_state.hub.host_alerts = [{"code": "disk_critical"}]
         with patch.object(main.operations, "prune_dangling_build_cache",
                           return_value={"ok": True, "space_reclaimed_bytes": 4096}) as prune, \
-                patch.object(main.sysinfo, "collect",
+                patch.object(sysinfo, "collect",
                              return_value={"disk": {"used_percent": 70.0}}):
             result = await system_routes.api_system_maintenance({"action": "prune_build_cache"})
         self.assertEqual(result["space_reclaimed_bytes"], 4096)
@@ -331,7 +334,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_maintenance_can_drop_old_mdd_images_on_explicit_request(self):
         with patch.object(main.operations, "prune_old_mdd_images", return_value={
                 "ok": True, "removed_images": 2, "space_reclaimed_bytes": 8192}) as prune, \
-                patch.object(main.sysinfo, "collect", return_value={"disk": {}}):
+                patch.object(sysinfo, "collect", return_value={"disk": {}}):
             result = await system_routes.api_system_maintenance({"action": "prune_old_images"})
         self.assertEqual(result["action"], "prune_old_images")
         self.assertEqual(result["removed_images"], 2)
@@ -375,14 +378,14 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         instances = [{"id": "ok", "enabled": True}, {"id": "away", "enabled": True}]
         app_state.hub.status_cache["ok"] = {"state": "OK"}
         app_state.hub.status_cache["away"] = {"state": "STOPPED"}
-        self.assertEqual(main._status_poll_delay(instances), main.STATUS_POLL_HEALTHY_SECONDS)
+        self.assertEqual(app_tasks._status_poll_delay(instances), app_tasks.STATUS_POLL_HEALTHY_SECONDS)
         app_state.hub.status_cache.pop("ok", None)
         app_state.hub.status_cache.pop("away", None)
 
     def test_registering_line_keeps_fast_polling(self):
         instances = [{"id": "starting", "enabled": True}]
         app_state.hub.status_cache["starting"] = {"state": "REGISTERING"}
-        self.assertEqual(main._status_poll_delay(instances), main.STATUS_POLL_FAST_SECONDS)
+        self.assertEqual(app_tasks._status_poll_delay(instances), app_tasks.STATUS_POLL_FAST_SECONDS)
         app_state.hub.status_cache.pop("starting", None)
 
     async def test_ims_rejection_uses_retry_budget_before_cooldown_rebuild(self):
@@ -520,8 +523,8 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.engine, "stop") as stop, \
                 patch.object(app_state.hub, "drop_ami", new=AsyncMock()) as drop_ami, \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()) as broadcast, \
-                patch.object(main.status_mod, "compute", new=AsyncMock()) as compute:
-            await main._poll_instance_status(inst)
+                patch.object(status_mod, "compute", new=AsyncMock()) as compute:
+            await app_tasks._poll_instance_status(inst)
 
         stop.assert_called_once_with("3")
         drop_ami.assert_awaited_once_with("3")
@@ -543,9 +546,9 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
                     "running": True, "ip": "172.17.0.2", "container_id": "race"})), \
                 patch.object(main.engine, "stop") as stop, \
                 patch.object(app_state.hub, "ami_for", new=AsyncMock(return_value=object())), \
-                patch.object(main.status_mod, "compute", new=AsyncMock(return_value=sampled)), \
+                patch.object(status_mod, "compute", new=AsyncMock(return_value=sampled)), \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()):
-            await main._poll_instance_status(stale)
+            await app_tasks._poll_instance_status(stale)
 
         stop.assert_not_called()
         self.assertEqual(app_state.hub.status_cache["race"]["state"], "REGISTERING")
@@ -606,17 +609,17 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         app_state.hub.status_sampled_at[iid] = sampled_at
         inst = {"id": iid, "enabled": True}
         with patch.object(app_state.hub, "ami_for", new=AsyncMock(return_value=object())), \
-                patch.object(main.status_mod, "compute", new=AsyncMock(return_value=unknown)), \
+                patch.object(status_mod, "compute", new=AsyncMock(return_value=unknown)), \
                 patch.object(app_state.hub.runtime, "get", new=AsyncMock(return_value={
                     "running": True, "ip": "172.17.0.2", "container_id": "grace"})), \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()):
-            await main._poll_instance_status(inst)
+            await app_tasks._poll_instance_status(inst)
             self.assertEqual(app_state.hub.status_cache[iid]["state"], "OK")
             self.assertEqual(app_state.hub.status_sampled_at[iid], sampled_at)
 
             app_state.hub.status_sampled_at[iid] = (
-                main.time.monotonic() - main.STATUS_OK_GRACE_SECONDS - 1)
-            await main._poll_instance_status(inst)
+                main.time.monotonic() - app_tasks.STATUS_OK_GRACE_SECONDS - 1)
+            await app_tasks._poll_instance_status(inst)
 
         self.assertEqual(app_state.hub.status_cache[iid]["state"], "REGISTERING")
         app_state.hub.reset_health(iid)
@@ -636,25 +639,25 @@ class ConnectivityTimelineEvidenceTests(unittest.TestCase):
     """
 
     def test_a_registered_line_is_up(self):
-        self.assertEqual(main._line_state_kind(
+        self.assertEqual(app_tasks._line_state_kind(
             {"state": "OK", "detail": {"registration": "Registered"}}), "up")
 
     def test_a_stopped_line_is_off(self):
-        self.assertEqual(main._line_state_kind({"state": "STOPPED", "detail": {}}), "off")
+        self.assertEqual(app_tasks._line_state_kind({"state": "STOPPED", "detail": {}}), "off")
 
     def test_an_unreadable_registration_is_not_evidence_of_a_disconnect(self):
         for detail in ({"registration": "unknown"}, {"registration": ""}, {}):
-            self.assertIsNone(main._line_state_kind({"state": "REGISTERING", "detail": detail}))
+            self.assertIsNone(app_tasks._line_state_kind({"state": "REGISTERING", "detail": detail}))
 
     def test_a_carrier_answer_is_still_recorded_as_down(self):
         # These are real observations of a line that is not registered.
         for registration in ("Unregistered", "Rejected"):
-            self.assertEqual(main._line_state_kind(
+            self.assertEqual(app_tasks._line_state_kind(
                 {"state": "REGISTERING", "detail": {"registration": registration}}), "down")
 
     def test_failures_before_registration_are_recorded_as_down(self):
         for state in ("TUNNEL_DOWN", "EPDG_UNRESOLVED", "NO_CARD", "PIN_PROBLEM", "ERROR"):
-            self.assertEqual(main._line_state_kind({"state": state, "detail": {}}), "down")
+            self.assertEqual(app_tasks._line_state_kind({"state": state, "detail": {}}), "down")
 
 
 class HostAlertSuppressionTests(unittest.TestCase):
@@ -723,7 +726,7 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
 
     async def _verify(self, stored, observed, source="ims"):
         inst = {"id": "5", "name": "voxi", "msisdn": stored, "msisdn_source": source}
-        with patch.object(main, "extract_msisdn", return_value=observed), \
+        with patch.object(app_tasks, "extract_msisdn", return_value=observed), \
                 patch.object(main.engine, "exec_cli") as exec_cli, \
                 patch.object(main.cfg, "upsert_instance",
                              side_effect=lambda x: {**inst, **x}) as upsert, \
@@ -731,7 +734,7 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(app_state, "_start_engine_checked") as restart, \
                 patch.object(app_state.hub, "drop_ami", new=AsyncMock()), \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()) as dispatch:
-            await main._verify_ims_msisdn("5", inst)
+            await app_tasks._verify_ims_msisdn("5", inst)
             for _ in range(20):
                 await __import__("asyncio").sleep(0.01)
                 if dispatch.called:
@@ -741,7 +744,7 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_new_carrier_number_is_adopted_and_announced(self):
         # The first check must run even when the host has been up for less than the
         # verification interval (CI runners and newly booted gateways commonly have).
-        with patch.object(main, "MSISDN_VERIFY_INTERVAL_SECONDS", float("inf")):
+        with patch.object(app_tasks, "MSISDN_VERIFY_INTERVAL_SECONDS", float("inf")):
             upsert, restart, dispatch, exec_cli = await self._verify(
                 "+447700900456", "+447700900123")
         self.assertEqual(upsert.call_args.args[0]["msisdn"], "+447700900123")
@@ -778,25 +781,25 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_failed_rebuild_does_not_commit_the_new_number(self):
         inst = {"id": "5", "name": "voxi", "msisdn": "+447700900456",
                 "msisdn_source": "ims"}
-        with patch.object(main, "extract_msisdn", return_value="+447700900123"), \
+        with patch.object(app_tasks, "extract_msisdn", return_value="+447700900123"), \
                 patch.object(main.engine, "exec_cli"), \
                 patch.object(main.cfg, "upsert_instance") as upsert, \
                 patch.object(main.cfg, "get_settings", return_value={}), \
                 patch.object(app_state, "_start_engine_checked", side_effect=RuntimeError("docker")), \
                 patch.object(app_state.hub, "drop_ami", new=AsyncMock()):
             with self.assertLogs("vowifi.main", level="WARNING") as captured:
-                await main._verify_ims_msisdn("5", inst)
+                await app_tasks._verify_ims_msisdn("5", inst)
         upsert.assert_not_called()
         self.assertIn("will retry", "\n".join(captured.output))
 
     def test_ported_number_check_uses_a_slow_default_cadence(self):
-        self.assertGreaterEqual(main.MSISDN_VERIFY_INTERVAL_SECONDS, 6 * 60 * 60)
+        self.assertGreaterEqual(app_tasks.MSISDN_VERIFY_INTERVAL_SECONDS, 6 * 60 * 60)
 
     def test_latest_associated_identity_wins(self):
         with patch.object(main.engine, "logs", return_value=(
                 "P-Associated-Uri: <tel:+447700000001>\n"
                 "P-Associated-Uri: <sip:+447700000002@example.invalid>\n")):
-            self.assertEqual(main.extract_msisdn("5"), "+447700000002")
+            self.assertEqual(app_tasks.extract_msisdn("5"), "+447700000002")
 
     def test_the_number_is_read_from_an_ordinary_registration(self):
         """The patched engine announces the identity of every REGISTER it makes, so no SIP
@@ -804,7 +807,7 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main.engine, "logs", return_value=(
                 "[Aug 21 09:00:00] NOTICE[123] res_pjsip_outbound_registration.c: "
                 "IMS public identity: <sip:+447700000001@ims.example.invalid>\n")):
-            self.assertEqual(main.extract_msisdn("5"), "+447700000001")
+            self.assertEqual(app_tasks.extract_msisdn("5"), "+447700000001")
 
     def test_an_imsi_derived_identity_does_not_hide_the_dialable_number(self):
         """Carriers list every public identity. The IMSI-derived IMPU comes first and carries
@@ -812,11 +815,11 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main.engine, "logs", return_value=(
                 "NOTICE[123]: IMS public identity: <sip:234100000000001@ims.example.invalid>,"
                 "<tel:+447700000003>\n")):
-            self.assertEqual(main.extract_msisdn("5"), "+447700000003")
+            self.assertEqual(app_tasks.extract_msisdn("5"), "+447700000003")
 
     def test_an_engine_that_never_announced_one_reports_nothing(self):
         with patch.object(main.engine, "logs", return_value="Registration successful\n"):
-            self.assertIsNone(main.extract_msisdn("5"))
+            self.assertIsNone(app_tasks.extract_msisdn("5"))
 
 
 class SustainedAlertTests(unittest.TestCase):
@@ -827,29 +830,29 @@ class SustainedAlertTests(unittest.TestCase):
     def test_a_one_sample_spike_is_not_reported(self):
         streaks = {}
         spike = [{"code": "swap_pressure", "severity": "warning", "detail": {}}]
-        self.assertEqual(main._sustained_alerts(spike, streaks), [])
+        self.assertEqual(app_tasks._sustained_alerts(spike, streaks), [])
 
     def test_a_rate_that_holds_is_reported(self):
         streaks = {}
         spike = [{"code": "swap_pressure", "severity": "warning", "detail": {}}]
-        for _ in range(main.SUSTAINED_ALERT_SAMPLES - 1):
-            self.assertEqual(main._sustained_alerts(spike, streaks), [])
-        kept = main._sustained_alerts(spike, streaks)
+        for _ in range(app_tasks.SUSTAINED_ALERT_SAMPLES - 1):
+            self.assertEqual(app_tasks._sustained_alerts(spike, streaks), [])
+        kept = app_tasks._sustained_alerts(spike, streaks)
         self.assertEqual([x["code"] for x in kept], ["swap_pressure"])
-        self.assertEqual(kept[0]["detail"]["samples"], main.SUSTAINED_ALERT_SAMPLES)
+        self.assertEqual(kept[0]["detail"]["samples"], app_tasks.SUSTAINED_ALERT_SAMPLES)
 
     def test_a_gap_restarts_the_count(self):
         streaks = {}
         spike = [{"code": "swap_pressure", "severity": "warning", "detail": {}}]
-        main._sustained_alerts(spike, streaks)
-        main._sustained_alerts([], streaks)          # subsided
-        self.assertEqual(main._sustained_alerts(spike, streaks), [])
+        app_tasks._sustained_alerts(spike, streaks)
+        app_tasks._sustained_alerts([], streaks)          # subsided
+        self.assertEqual(app_tasks._sustained_alerts(spike, streaks), [])
 
     def test_conditions_that_are_instantaneous_are_reported_at_once(self):
         # A brown-out lasts seconds; waiting three minutes would simply miss it.
         streaks = {}
         alerts = [{"code": "undervoltage_now", "severity": "critical", "detail": {}}]
-        self.assertEqual(main._sustained_alerts(alerts, streaks), alerts)
+        self.assertEqual(app_tasks._sustained_alerts(alerts, streaks), alerts)
 
 
 class ImeiSourceFollowsReaderTests(unittest.TestCase):
@@ -908,7 +911,7 @@ class OutageDetailTests(unittest.TestCase):
         st = {"reason_code": "epdg_unresolved",
               "detail": {"epdg_fqdn": "epdg.epc.mnc260.mcc310.pub.3gppnetwork.org",
                          "nameservers": ["223.5.5.5", "119.29.29.29"]}}
-        evidence = __import__("json").loads(main._outage_detail(st))
+        evidence = __import__("json").loads(app_tasks._outage_detail(st))
         self.assertEqual(evidence, {
             "code": "client_dns_unresolved",
             "peer": "epdg.epc.mnc260.mcc310.pub.3gppnetwork.org",
@@ -918,7 +921,7 @@ class OutageDetailTests(unittest.TestCase):
     def test_a_tunnel_failure_names_the_epdg(self):
         st = {"reason_code": "tunnel_network",
               "detail": {"epdg_fqdn": "epdg.epc.mnc010.mcc234.pub.3gppnetwork.org"}}
-        evidence = __import__("json").loads(main._outage_detail(st))
+        evidence = __import__("json").loads(app_tasks._outage_detail(st))
         self.assertEqual(evidence["code"], "server_epdg_ike_unanswered")
         self.assertEqual(evidence["peer"], "epdg.epc.mnc010.mcc234.pub.3gppnetwork.org")
 
@@ -926,26 +929,26 @@ class OutageDetailTests(unittest.TestCase):
         st = {"reason_code": "reg_rejected",
               "detail": {"pcscf": "fd00:976a:2:153::5", "registration": "Rejected",
                          "sip_status": 403}}
-        evidence = __import__("json").loads(main._outage_detail(st))
+        evidence = __import__("json").loads(app_tasks._outage_detail(st))
         self.assertEqual(evidence, {"code": "server_pcscf_sip_rejected",
                                     "peer": "fd00:976a:2:153::5", "status": 403})
 
     def test_child_rekey_timeout_names_server_request_and_peer(self):
         st = {"reason_code": "tunnel_child_rekey_timeout",
               "detail": {"epdg_fqdn": "epdg.example"}}
-        evidence = __import__("json").loads(main._outage_detail(st))
+        evidence = __import__("json").loads(app_tasks._outage_detail(st))
         self.assertEqual(evidence, {"code": "server_epdg_child_rekey_unanswered",
                                     "peer": "epdg.example"})
 
     def test_tunnel_setup_does_not_call_recovery_the_outage_cause(self):
         st = {"reason_code": "tunnel_setup",
               "detail": {"epdg_fqdn": "epdg.example"}}
-        evidence = __import__("json").loads(main._outage_detail(st))
+        evidence = __import__("json").loads(app_tasks._outage_detail(st))
         self.assertEqual(evidence, {"code": "tunnel_cause_not_captured",
                                     "peer": "epdg.example"})
 
     def test_codes_without_useful_evidence_stay_quiet(self):
-        self.assertEqual(main._outage_detail({"reason_code": "no_card", "detail": {}}), "")
+        self.assertEqual(app_tasks._outage_detail({"reason_code": "no_card", "detail": {}}), "")
 
 
 class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):

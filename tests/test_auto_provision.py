@@ -9,6 +9,9 @@ from control.app.routers import esim as esim_routes
 from control.app import device_state
 from control.app import vowifi_support
 from control.app.routers import lines as lines_routes
+from control.app import sim
+from control.app import tasks as app_tasks
+from control.app import usbreader
 
 
 class AutoProvisionTests(unittest.TestCase):
@@ -327,14 +330,14 @@ class LateCardDataTests(unittest.IsolatedAsyncioTestCase):
         draft = {"id": "2", "provisioning_state": "draft", "iccid": entry["iccid"]}
         app_state.hub.cards[entry["name"]] = entry
         try:
-            with patch.object(main, "_CARD_REREAD_DELAYS", (0,)), \
+            with patch.object(app_tasks, "_CARD_REREAD_DELAYS", (0,)), \
                     patch.object(main.cfg, "get_instance", return_value=draft), \
                     patch.object(app_state, "_hardware_imei_for_card",
                                  return_value=("490154203237518", "reader-1", "reader")), \
-                    patch.object(main.sim, "read_card", return_value=self.card()), \
+                    patch.object(sim, "read_card", return_value=self.card()), \
                     patch.object(app_state, "_auto_start_hotplugged_line",
                                  new=AsyncMock()) as start:
-                await main._complete_draft_from_card(entry["name"])
+                await app_tasks._complete_draft_from_card(entry["name"])
                 await asyncio.sleep(0)
             start.assert_awaited_once_with("2")
             self.assertEqual(app_state.hub.cards[entry["name"]]["mnc"], "33")
@@ -346,9 +349,9 @@ class LateCardDataTests(unittest.IsolatedAsyncioTestCase):
         draft = {"id": "2", "provisioning_state": "draft", "iccid": entry["iccid"]}
         app_state.hub.cards[entry["name"]] = entry
         try:
-            with patch.object(main.sim, "list_readers",
+            with patch.object(sim, "list_readers",
                               return_value=["r0", "r1", "r2", "r3", entry["name"]]), \
-                    patch.object(main.sim, "read_card", return_value=self.card()), \
+                    patch.object(sim, "read_card", return_value=self.card()), \
                     patch.object(main.cfg, "get_instance", return_value=draft), \
                     patch.object(app_state, "_hardware_imei_for_card",
                                  return_value=("490154203237518", "reader-1", "reader")), \
@@ -367,7 +370,7 @@ class LateCardDataTests(unittest.IsolatedAsyncioTestCase):
         app_state.hub.cards[entry["name"]] = entry
         try:
             with patch.object(app_state, "_device_for_card", return_value=("reader-1", "reader")), \
-                    patch.object(main.sim, "read_card", return_value=self.card(mnc="")), \
+                    patch.object(sim, "read_card", return_value=self.card(mnc="")), \
                     patch.object(main.cfg, "get_instance", return_value=draft), \
                     patch.object(app_state, "_hardware_imei_for_card",
                                  return_value=("490154203237518", "reader-1", "reader")), \
@@ -383,12 +386,12 @@ class LateCardDataTests(unittest.IsolatedAsyncioTestCase):
 
 class ImsIdentityLearningTests(unittest.IsolatedAsyncioTestCase):
     def test_modemmanager_number_requires_ims_confirmation(self):
-        self.assertTrue(main._needs_ims_msisdn_learning({
+        self.assertTrue(app_tasks._needs_ims_msisdn_learning({
             "msisdn": "447000000000", "msisdn_source": "modemmanager"}))
-        self.assertTrue(main._needs_ims_msisdn_learning({"msisdn": ""}))
-        self.assertFalse(main._needs_ims_msisdn_learning({
+        self.assertTrue(app_tasks._needs_ims_msisdn_learning({"msisdn": ""}))
+        self.assertFalse(app_tasks._needs_ims_msisdn_learning({
             "msisdn": "+447000000001", "msisdn_source": "ims"}))
-        self.assertFalse(main._needs_ims_msisdn_learning({
+        self.assertFalse(app_tasks._needs_ims_msisdn_learning({
             "msisdn": "+447000000001", "msisdn_source": "manual"}))
 
     async def test_ims_correction_is_persisted_and_applied_to_running_engine(self):
@@ -397,7 +400,7 @@ class ImsIdentityLearningTests(unittest.IsolatedAsyncioTestCase):
         corrected = {**current, "msisdn": "+447000000001", "msisdn_source": "ims"}
         with patch.object(main.asyncio, "sleep", new=AsyncMock()), \
                 patch.object(main.engine, "exec_cli", return_value=""), \
-                patch.object(main, "extract_msisdn", return_value=corrected["msisdn"]), \
+                patch.object(app_tasks, "extract_msisdn", return_value=corrected["msisdn"]), \
                 patch.object(main.cfg, "get_instance", return_value=current), \
                 patch.object(main.cfg, "upsert_instance", return_value=corrected) as upsert, \
                 patch.object(main.cfg, "get_settings", return_value={}), \
@@ -406,7 +409,7 @@ class ImsIdentityLearningTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(app_state.hub, "drop_ami", new=AsyncMock()) as drop_ami, \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()), \
                 patch.object(app_state.hub, "reset_health"):
-            await main.learn_msisdn("2")
+            await app_tasks.learn_msisdn("2")
 
         upsert.assert_called_once_with({"id": "2", "msisdn": "+447000000001",
                                         "msisdn_source": "ims"})
@@ -423,11 +426,11 @@ class IdenticalNativeReaderTests(unittest.IsolatedAsyncioTestCase):
         to their own lines before the live reader indices are refreshed.
         """
         cards = {
-            0: main.sim.CardInfo(
+            0: sim.CardInfo(
                 reader="AK9563 00 00", reader_index=0, present=True,
                 iccid="iccid-b", imsi="imsi-b", mcc="002", mnc="02",
                 pin_enabled=False, pin_tries=3, smsc="+200"),
-            1: main.sim.CardInfo(
+            1: sim.CardInfo(
                 reader="AK9563 01 00", reader_index=1, present=True,
                 iccid="iccid-a", imsi="imsi-a", mcc="001", mnc="01",
                 pin_enabled=False, pin_tries=3, smsc="+100"),
@@ -447,18 +450,18 @@ class IdenticalNativeReaderTests(unittest.IsolatedAsyncioTestCase):
 
         app_state.hub.cards.clear()
         self.addCleanup(app_state.hub.cards.clear)
-        with patch.object(main.usbreader, "port_for_index",
+        with patch.object(usbreader, "port_for_index",
                           side_effect=lambda idx: {0: "2-3", 1: "2-1"}[idx]), \
                 patch.object(main.cfg, "list_instances",
                              side_effect=lambda: [dict(value) for value in instances.values()]), \
                 patch.object(main.engine, "is_running", return_value=True), \
                 patch.object(main.engine, "read_run_json",
                              side_effect=lambda iid, _name: {"reader": pin_readers[str(iid)]}), \
-                patch.object(main.sim, "read_card", side_effect=lambda idx: cards[idx]) as read, \
+                patch.object(sim, "read_card", side_effect=lambda idx: cards[idx]) as read, \
                 patch.object(main.cfg, "upsert_instance", side_effect=upsert), \
                 patch.object(app_state, "_auto_start_hotplugged_line", new=AsyncMock()):
-            await main._on_card_insert("AK9563 00 00", 0)
-            await main._on_card_insert("AK9563 01 00", 1)
+            await app_tasks._on_card_insert("AK9563 00 00", 0)
+            await app_tasks._on_card_insert("AK9563 01 00", 1)
             await asyncio.sleep(0)
 
         self.assertEqual(read.call_count, 2)
@@ -489,7 +492,7 @@ class EsimProfileRefreshTests(unittest.IsolatedAsyncioTestCase):
                 "reader_port": "1-1.2", "matched": "4",
                 "iccid": "89441000400130000000",
         }}, clear=True), \
-                patch.object(main.sim, "read_card", return_value=card), \
+                patch.object(sim, "read_card", return_value=card), \
                 patch.object(app_state, "_match_instance_by_iccid", return_value=None), \
                 patch.object(main.cfg, "card_auto_create_suppressed", return_value=False), \
                 patch.object(app_state, "_ensure_card_draft", return_value=draft) as ensure, \
