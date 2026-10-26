@@ -96,11 +96,6 @@ DEFAULTS = {
         # gives up and CANCELs. 35 covers a normal answer window; most carriers roll to
         # voicemail by ~30s. Shorter = the callee is re-alerted fewer times when unanswered.
         "ring_timeout": 35,
-        # What happens to an SMS object on the modem/SIM once its message is in the database:
-        # "delete" (default), "when_full" or "keep". Deliberately absent from these defaults:
-        # an unset key defers to MDD_CELLULAR_SMS_STORAGE, so a deployment can choose the
-        # policy from its service environment; a value saved here takes precedence.
-
         # Country-aware outer ePDG routing. Disabled preserves the legacy host routing until the
         # host-side orchestrator is installed/configured. When enabled, a line fails closed if
         # its SIM country has no healthy exit (unless that country explicitly selects direct).
@@ -1177,7 +1172,6 @@ def _render_instance_json(inst: dict, settings: dict) -> dict:
         "reader_port": inst.get("reader_port", ""),
         "iccid": inst.get("iccid", ""),
         "msisdn": inst.get("msisdn", ""),
-        "smsc": inst.get("smsc", ""),
         "pcscf": inst.get("pcscf", ""),
         # Usually blank so the Engine derives the carrier ePDG hostname.  In an
         # isolated country-egress run Control resolves that hostname first and

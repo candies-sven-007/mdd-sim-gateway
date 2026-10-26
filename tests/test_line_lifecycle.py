@@ -113,7 +113,6 @@ class LineDeleteApiTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.hub, "drop_ami", new=AsyncMock()), \
                 patch.object(main.cfg, "delete_instance") as delete_config, \
                 patch.object(main.engine, "delete_instance_data") as delete_data, \
-                patch.object(main.store, "clear_messages", return_value=12) as clear_messages, \
                 patch.object(main.store, "clear_calls", return_value=3) as clear_calls, \
                 patch.object(main.store, "clear_line_states", return_value=7) as clear_states, \
                 patch.object(main, "_refresh_card_matches"), \
@@ -123,7 +122,6 @@ class LineDeleteApiTests(unittest.IsolatedAsyncioTestCase):
         suppress.assert_called_once_with("test-iccid")
         delete_config.assert_called_once_with("1")
         delete_data.assert_called_once_with("1")
-        clear_messages.assert_called_once_with("1")
         clear_calls.assert_called_once_with("1")
         clear_states.assert_called_once_with("1")
         self.assertTrue(result["history_deleted"])
@@ -136,14 +134,12 @@ class LineDeleteApiTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.hub, "drop_ami", new=AsyncMock()), \
                 patch.object(main.cfg, "delete_instance"), \
                 patch.object(main.engine, "delete_instance_data"), \
-                patch.object(main.store, "clear_messages") as clear_messages, \
                 patch.object(main.store, "clear_calls") as clear_calls, \
                 patch.object(main.store, "clear_line_states") as clear_states, \
                 patch.object(main, "_refresh_card_matches"), \
                 patch.object(main.hub, "broadcast", new=AsyncMock()):
             result = await main.api_instance_delete("1", delete_history=False, confirm_id="1")
 
-        clear_messages.assert_not_called()
         clear_calls.assert_not_called()
         self.assertFalse(result["history_deleted"])
 

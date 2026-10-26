@@ -279,7 +279,7 @@ class BearerTests(GateTestCase):
         self.assertEqual(result.status, 403)
 
     def test_a_bearer_request_needs_no_csrf_token(self):
-        result = run(http("/api/instances/sim1/sms/send", "POST", cookie=None, headers=BEARER))
+        result = run(http("/api/instances/sim1/hangup", "POST", cookie=None, headers=BEARER))
         self.assertEqual(result.status, 200)
 
     def test_a_client_is_refused_what_authz_does_not_list(self):

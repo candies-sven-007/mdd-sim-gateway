@@ -32,24 +32,9 @@ def _rules(*rows: tuple[str, str]) -> tuple[tuple[frozenset[str], re.Pattern[str
 CLIENT_LINE_RULES = _rules(
     # A read-only view of the line itself.
     ("GET", r"^/(status|availability)$"),
-    # Texts and MMS: messages/threads, messages/unread and messages/<peer>. Not messages/binary,
-    # the filed raw PDUs and SIM OTA payloads, which are the administrator's to diagnose. The
-    # MMS settings tell the composer the line's size limit (changing them stays administrative).
-    ("GET", r"^/messages/(?!binary$)[^/]+$"),
-    ("GET", r"^/messages/[^/]+/mms/parts/[^/]+$"),
-    ("POST", r"^/(sms/send|mms/send|messages/delete|messages/read)$"),
-    ("GET", r"^/mms/settings$"),
-    ("POST", r"^/messages/[^/]+/mms/download$"),
-    # Composing an MMS: attachments are uploaded as they are added, fitted to the limit and
-    # previewed as they will be sent, and removed again, as the WebUI does.
-    ("POST", r"^/mms/attachments(/fit)?$"),
-    ("GET", r"^/mms/attachments/[^/]+/preview$"),
-    ("DELETE", r"^/mms/attachments/[^/]+$"),
-    # Calls, through the softphone relay and over the modem.
-    ("GET", r"^/(calls|cellular-call/status)$"),
-    ("POST", r"^/(call|hangup|calls/delete|cellular-call|cellular-call/hangup)$"),
-    # Voicemail.
-
+    # Calls, through the softphone relay.
+    ("GET", r"^/calls$"),
+    ("POST", r"^/(call|hangup|calls/delete)$"),
     # The softphone: its provisioning and the signalling relay.
     ("GET", r"^/softphone$"),
     ("WEBSOCKET", r"^/softphone/ws$"),
@@ -61,15 +46,12 @@ CLIENT_GLOBAL_RULES = _rules(
     ("GET", r"^/api/instances$"),
     ("GET", r"^/api/auth/status$"),
     ("POST", r"^/api/auth/client/logout$"),
-    ("GET", r"^/api/messages/unread$"),
-    # The address book is the administrator's, and a client acts for the administrator: the
-    # names a phone shows are the ones the WebUI shows.
     ("WEBSOCKET", r"^/ws$"),
 )
 
 # Live events a client receives, and only for a line: its conversations, calls and the line's
 # own state. Host alerts, hardware, cards and engine maintenance stay with the administrator.
-CLIENT_EVENTS = frozenset({"sms", "call", "status", "line"})
+CLIENT_EVENTS = frozenset({"call", "status", "line"})
 
 
 

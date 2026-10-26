@@ -33,7 +33,6 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   const [deleteHistory, setDeleteHistory] = useState(true)
   const [creating, setCreating] = useState(false)
   const [savedLineId, setSavedLineId] = useState('')
-  const [smscMode, setSmscMode] = useState('auto')   // 'auto' = read from SIM, 'manual' = typed
 
 
   // Refresh the physical-reader list whenever the detected-card set changes (hotplug).
@@ -136,7 +135,6 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
       return
     }
     const patch = { imsi: c.imsi || form.imsi, mcc: c.mcc || form.mcc, mnc: c.mnc || form.mnc }
-    if (c.smsc && smscMode === 'auto') patch.smsc = c.smsc   // SMSC from the SIM (EF_SMSP)
     if (c.imsi) patch.reader = `imsi:${c.imsi}`
     // Bind the line to the reader's stable physical USB port (from the detected card, else the
     // live monitor). Persisted so start-time re-resolves the correct index for this socket.
@@ -205,8 +203,8 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   const del = async () => {
     const lineLabel = form.name || `${form.mcc || ''}-${form.mnc || ''}` || form.id
     const warning = deleteHistory
-      ? t('Delete this SIM line and all of its messages and call records?')
-      : t('Delete this SIM line? Messages and call records will be preserved.')
+      ? t('Delete this SIM line and all of its call records?')
+      : t('Delete this SIM line? Call records will be preserved.')
     if (!confirm(`${t('You are deleting SIM line “{name}” (ID {id}).', { name: lineLabel, id: form.id })}\n\n${warning}\n\n${t('If the SIM is still inserted, automatic setup pauses until it is removed and inserted again.')}`)) return
     const typed = prompt(t('Type the line ID “{id}” to confirm deletion.', { id: form.id }), '')
     if (String(typed || '').trim() !== String(form.id)) {
@@ -238,7 +236,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
   }
 
   const missing = targetDevice?.provisioning?.missing || []
-  const missingLabels = { imsi: 'IMSI / PIN', imei: 'IMEI', smsc: t('SMS centre (SMSC)'), mcc_mnc: 'MCC/MNC', pin: t('setup.field.pin') }
+  const missingLabels = { imsi: 'IMSI / PIN', imei: 'IMEI', mcc_mnc: 'MCC/MNC', pin: t('setup.field.pin') }
   const imeiReady = String(targetDevice?.imei || '').replace(/[^0-9]/g, '').length === 15
   const existingLine = instances.some(line => String(line.id) === String(form.id))
 
@@ -317,22 +315,6 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
             onChange={(e) => upd({ proxy_country: e.target.value.replace(/[^a-z]/gi, '').toLowerCase() })}
             placeholder={`auto (${(form.proxy_country_effective || 'MCC').toUpperCase()})`} /></Field>
           <Field label={t('Phone number (MSISDN)')}><input className="mono" value={form.msisdn} onChange={(e) => upd({ msisdn: e.target.value })} placeholder={t('auto-learned')} /></Field>
-          <Field label={t('SMS centre (SMSC)')}>
-            <div style={{ display: 'flex', gap: 12, marginBottom: 6, fontSize: 13 }}>
-              <label style={{ display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>
-                <input type="radio" name="scmode" checked={smscMode === 'auto'} style={{ width: 'auto' }}
-                  onChange={() => { setSmscMode('auto'); if (card?.smsc) upd({ smsc: card.smsc }) }} />{t('Auto (from SIM)')}
-              </label>
-              <label style={{ display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>
-                <input type="radio" name="scmode" checked={smscMode === 'manual'} style={{ width: 'auto' }}
-                  onChange={() => setSmscMode('manual')} />{t('Manual')}
-              </label>
-            </div>
-            <input className="mono" value={form.smsc} readOnly={smscMode === 'auto'}
-              onChange={(e) => upd({ smsc: e.target.value })}
-              placeholder={smscMode === 'auto' ? t('detect card / verify PIN to read from SIM') : '+1...'}
-              style={smscMode === 'auto' ? { opacity: .7 } : undefined} />
-          </Field>
           {!creating && <Field label={t('Reader match')}><input className="mono" value={form.reader} onChange={(e) => upd({ reader: e.target.value })} placeholder="imsi:302..." /></Field>}
           <Field label="APN"><input className="mono" value={form.apn ?? 'ims'} onChange={(e) => upd({ apn: e.target.value })} placeholder="ims" /></Field>
           <Field label={t('ePDG identity (IDr)')}>
@@ -430,7 +412,7 @@ export default function SimConfig({ instances, selected, refresh, cards, setSele
         </div>
         {existingLine && <div className="u-line-delete">
           <div><h4>{t('Delete SIM line')}</h4><p>{t('Deletes IMS settings, saved PIN, routing and runtime files for this SIM. The physical device record is not affected.')}</p>
-            <label><input type="checkbox" checked={deleteHistory} onChange={event => setDeleteHistory(event.target.checked)} />{t('Also delete all messages and call records')}</label>
+            <label><input type="checkbox" checked={deleteHistory} onChange={event => setDeleteHistory(event.target.checked)} />{t('Also delete all call records')}</label>
           </div>
           <button className="btn btn-danger" disabled={deleting} onClick={del}>{t(deleting ? 'Deleting…' : 'Delete SIM line')}</button>
         </div>}

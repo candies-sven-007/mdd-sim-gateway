@@ -289,7 +289,6 @@ def build_context(cfg):
         "epdg": epdg,
         "nai": nai,
         "msisdn": cfg.get("msisdn", ""),
-        "smsc": cfg.get("smsc", ""),
         "pcscf": pcscf,          # explicit or discovered
         # Address family of the discovered P-CSCF. The IMS core transport must bind the same
         # family or Asterisk cannot reach the P-CSCF over the tunnel: IPv6 P-CSCF (Telus, EE)

@@ -7,7 +7,6 @@ ROOT = Path(__file__).resolve().parent.parent
 SOFTPHONE = (ROOT / "webui/src/views/Softphone.jsx").read_text(encoding="utf-8")
 DEVICES = (ROOT / "webui/src/views/UnifiedPages.jsx").read_text(encoding="utf-8")
 APP = (ROOT / "webui/src/App.jsx").read_text(encoding="utf-8")
-MESSAGES = (ROOT / "webui/src/views/Messages.jsx").read_text(encoding="utf-8")
 ESIM = (ROOT / "webui/src/views/Esim.jsx").read_text(encoding="utf-8")
 LOGS = (ROOT / "webui/src/views/Logs.jsx").read_text(encoding="utf-8")
 
@@ -31,7 +30,6 @@ class InitialLoadingUiTests(unittest.TestCase):
         self.assertIn("const [loadErrors, setLoadErrors] = useState({})", APP)
         self.assertIn("initialLoading,loadErrors,refreshDevices", APP)
         self.assertIn("if (initialLoading && !id)", SOFTPHONE)
-        self.assertIn("if (initialLoading && !id)", MESSAGES)
         self.assertIn("if (initialLoading && !present.length)", ESIM)
         self.assertIn("loadErrors?.cards && !present.length", ESIM)
 

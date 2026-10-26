@@ -33,10 +33,8 @@ from starlette import formparsers as starlette_formparsers
 
 from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, notify_push, lpa, auth,
-               estkme, usbreader, egress, device_state, operations, cellular_sms,
-               sysinfo, failover, carrier_id, cellular_call, sms_pdu, ussd, mms,
-
-               mms_media, mms_staging, mms_transport, softphone_ws, modem_ims, vowifi_support,
+               estkme, usbreader, egress, device_state, operations,
+               sysinfo, failover, carrier_id, softphone_ws, modem_ims, vowifi_support,
                modem_voice, gate, line_offline, media, clients, authz)
 
 from .version import SOURCE_URL, VERSION
@@ -453,13 +451,6 @@ class Hub:
         self._restart_counts: dict[str, int] = {}
         self._msisdn_tries: dict[str, int] = {}
         self._msisdn_checked: dict[str, float] = {}   # last passive re-check
-        # Serialise route selection and submission per line. In particular, two concurrent
-        # ``auto`` requests must not both decide that the preferred route is unavailable and
-        # submit the same user action through different transports.
-        self.sms_send_locks: dict[str, asyncio.Lock] = {}
-        # Inbound MMS a user asked to download although the line does not auto-download.
-        self.mms_forced: set[int] = set()
-        self.mms_wakeup = asyncio.Event()
         # Per-line exit failover ledger. Persisted: a control-plane restart must not
         # re-announce a give-up it already reported, nor re-walk an exhausted pool.
         self.exit_ledgers: dict[str, dict] = _load_exit_ledgers()
@@ -953,21 +944,18 @@ def _line_auto_start_allowed(inst: dict) -> tuple[bool, str]:
     return True, ""
 
 
-_DRAFT_FIELD_KEYS = {"IMSI": "imsi", "MCC/MNC": "mcc_mnc", "IMEI": "imei", "SMSC": "smsc",
-                     "SIM PIN": "pin"}
+_DRAFT_FIELD_KEYS = {"IMSI": "imsi", "MCC/MNC": "mcc_mnc", "IMEI": "imei", "SIM PIN": "pin"}
 
 
 def _draft_missing(inst: dict, card_info: dict, cards: list[dict]) -> list[str]:
     """What an auto-created draft still lacks before it can become a line.
 
     The device page shows this list, so the operator is told what is actually missing. It
-    used to say only that an IMEI was needed. Once the IMEI was saved, a SIM whose SMSC the
-    reader could not read stayed a draft, and the only hint left was a generic "waiting".
+    used to say only that an IMEI was needed.
     """
     imsi = str(card_info.get("imsi") or inst.get("imsi") or "").strip()
     mcc = str(card_info.get("mcc") or inst.get("mcc") or (imsi[:3] if len(imsi) >= 3 else ""))
     mnc = str(card_info.get("mnc") or inst.get("mnc") or "")
-    smsc = str(card_info.get("smsc") or inst.get("smsc") or "").strip()
     imei, _hardware_id, _device_type = _hardware_imei_for_card(card_info, cards)
     missing = []
     if not imsi:
@@ -976,18 +964,16 @@ def _draft_missing(inst: dict, card_info: dict, cards: list[dict]) -> list[str]:
         missing.append("MCC/MNC")
     if len(imei) != 15:
         missing.append("IMEI")
-    if not smsc:
-        missing.append("SMSC")
     if card_info.get("pin_enabled") is True and not inst.get("pin"):
         missing.append("SIM PIN")
     return missing
 
 
 # Draft fields that only a card read can supply; the rest come from the operator.
-_CARD_READ_FIELDS = {"IMSI", "MCC/MNC", "SMSC"}
-# Seen on an Alcor AK9563: the read at insertion returned no SMSC for a SIM whose EF_SMSP a
-# later read returned without trouble. Retry on a widening schedule, then leave it to the
-# operator, who is shown the missing field and a re-read button.
+_CARD_READ_FIELDS = {"IMSI", "MCC/MNC"}
+# Seen on an Alcor AK9563: an early read at insertion can come back incomplete where a later
+# read succeeds. Retry on a widening schedule, then leave it to the operator, who is shown the
+# missing field and a re-read button.
 _CARD_REREAD_DELAYS = (10, 30, 60, 120, 300)
 
 
@@ -1877,291 +1863,6 @@ HOST_ALERT_TEXT = {
 }
 
 
-# A text longer than one SMS is split by the SMSC into several SMS-DELIVER PDUs, each tagged
-# in its User Data Header with (reference, total, sequence). The engine's Asterisk exposes that
-# triplet (patches/asterisk/mt_concat_udh.py) and the dialplan appends it to the sms_in event,
-# so the parts can be put back together here rather than surfacing as N separate messages.
-# A gap left by a part that never arrives is marked with this, so a message that lost one reads
-# as incomplete instead of quietly losing text. Language-neutral: the UI is bilingual and the
-# message body is stored as the carrier sent it.
-SMS_GAP_MARK = "[…]"
-
-
-def _concat_triplet(args: list) -> tuple[int, int, int] | None:
-    """Parse the (ref, total, seq) segment triplet trailing an sms_in event.
-
-    Returns None for an ordinary single-part SMS — where the dialplan passes three empty
-    strings — and for anything malformed, so such a message takes the normal path and is
-    stored on its own. Also None for an older engine image that does not send the fields at
-    all, which keeps the manager compatible with an engine that has not been rebuilt yet."""
-    if len(args) < 5:
-        return None
-    try:
-        ref, total, seq = (int(str(a).strip()) for a in args[2:5])
-    except (TypeError, ValueError):
-        return None
-    if total < 2 or not 1 <= seq <= total:
-        return None
-    return ref, total, seq
-
-
-def _join_sms_parts(bodies: list[str], seqs: list[int], total: int) -> str:
-    """Concatenate parts in sequence order, marking each run of missing ones."""
-    have = dict(zip(seqs, bodies))
-    out: list[str] = []
-    in_gap = False
-    for i in range(1, total + 1):
-        if i in have:
-            out.append(have[i])
-            in_gap = False
-        elif not in_gap:
-            out.append(SMS_GAP_MARK)
-            in_gap = True
-    return "".join(out)
-
-
-def _keep_modem_storage_on_upgrade(previous_schema: int | None) -> bool:
-    """Leave modem SMS storage alone on an installation upgraded from before the policy existed.
-
-    Deleting imported objects is the right default, but switching it on silently during an
-    upgrade would empty every modem the first time the scanner runs -- including texts the
-    operator deliberately kept on a SIM. An upgraded installation therefore gets "keep" written
-    into its settings, visibly, and the release notes explain how to opt in to "delete". A new
-    installation (no history database yet) and an explicit choice, in settings or in
-    MDD_CELLULAR_SMS_STORAGE, are left as they are. Runs before the schema migration, so a
-    crash in between cannot lose the distinction.
-    """
-    if previous_schema is None or previous_schema >= 1:
-        return False
-    if os.environ.get(cellular_sms.STORAGE_POLICY_ENV, "").strip():
-        return False
-    if "cellular_sms_storage" in (cfg.get_settings() or {}):
-        return False
-    cfg.update_settings({"cellular_sms_storage": "keep"})
-    log.warning("upgraded installation: modem SMS storage policy set to 'keep'; set "
-                "settings.cellular_sms_storage to 'delete' to empty modem storage as "
-                "messages are imported")
-    return True
-
-
-def _line_subscriber(iid: str) -> str:
-    """The SIM a line's messages belong to, for message identity: ICCID, else IMSI."""
-    inst = cfg.get_instance(iid) or {}
-    iccid = cellular_sms._normalize_iccid(inst.get("iccid"))
-    if iccid:
-        return f"iccid:{iccid}"
-    imsi = cellular_sms._normalize_imsi(inst.get("imsi"))
-    return f"imsi:{imsi}" if imsi else ""
-
-
-# Opens the push sent when a late part completes a text already pushed incomplete, so the
-# second notification reads as the rest of the first rather than as a new message.
-SMS_COMPLETED_MARK = "（补全）"
-
-
-async def _publish_completed_sms(rec: dict) -> None:
-    """Announce a text that a late part has just made whole (#193).
-
-    Its incomplete form was published when the reaper gave up waiting -- pushed like any text,
-    since that is what stored it -- and many people read only the push, where the missing part
-    may have been the code they were waiting for. So the whole text is pushed once more, once
-    the last part is in rather than for each part on the way. It is not a new arrival for read
-    state: the message stays where the reader saw it, marked completed.
-    """
-    iid = str(rec["instance"])
-    _dispatch_push(notify_push.EV_INCOMING_SMS, iid, rec["peer"],
-                   SMS_COMPLETED_MARK + rec["body"])
-
-
-async def _publish_incoming_sms(rec: dict) -> None:
-    """Announce one newly stored inbound text, whichever transport delivered it."""
-    iid = str(rec["instance"])
-    await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
-    if (rec.get("kind") or "sms") == "mms":
-        # Pushed by the MMS worker once there is content to show, or once it is clear there
-        # will not be; a push now could only say "an MMS is on its way".
-        hub.mms_wakeup.set()
-        return
-    _dispatch_push(notify_push.EV_INCOMING_SMS, iid, rec["peer"], rec["body"])
-
-
-def _mms_push_text(rec: dict) -> str:
-    mms_state = rec.get("mms") or {}
-    parts = [p for p in mms_state.get("parts") or []
-             if not str(p.get("content_type", "")).startswith(("text/", "application/smil"))]
-    summary = "[MMS]"
-    if mms_state.get("subject"):
-        summary += f" {mms_state['subject']}"
-    if rec.get("body") and rec["body"] != mms_state.get("subject"):
-        summary += f"\n{rec['body']}"
-    if parts:
-        summary += f"\n({len(parts)} attachment{'s' if len(parts) != 1 else ''})"
-    elif mms_state.get("state") in ("notified", "failed", "expired") and mms_state.get("size"):
-        summary += f" ({int(mms_state['size']) // 1024 or 1} KB, not downloaded)"
-    return summary
-
-
-# How often the MMS worker looks for attachment files an interrupted save or deletion left,
-# and for uploads of a message that was never sent.
-MMS_SWEEP_SECONDS = 3600
-
-
-async def mms_worker():
-    """Retrieve notified MMS from the MMSC, retrying on the schedule mms.download() sets."""
-    try:
-        await asyncio.to_thread(store.reset_interrupted_mms)
-    except Exception as exc:  # noqa
-        log.debug("MMS state recovery failed: %r", exc)
-    swept = time.monotonic()
-    while True:
-        try:
-            await asyncio.wait_for(hub.mms_wakeup.wait(), timeout=20)
-        except asyncio.TimeoutError:
-            pass
-        hub.mms_wakeup.clear()
-        if time.monotonic() - swept > MMS_SWEEP_SECONDS:
-            swept = time.monotonic()
-            try:
-                removed = await asyncio.to_thread(store.sweep_mms_orphans)
-                if removed:
-                    log.info("removed %d unreferenced MMS file(s)", removed)
-                removed = await asyncio.to_thread(mms_staging.sweep)
-                if removed:
-                    log.info("removed %d abandoned MMS attachment upload(s)", removed)
-            except Exception as exc:  # noqa
-                log.debug("MMS sweep failed: %r", exc)
-        try:
-            due = await asyncio.to_thread(store.due_mms_downloads)
-        except Exception as exc:  # noqa
-            log.debug("MMS queue read failed: %r", exc)
-            continue
-        # Lines on different modems download in parallel; mms.io_lock() serialises the
-        # exchanges that share one modem.
-        await asyncio.gather(*(_process_mms_download(row) for row in due))
-
-
-async def _process_mms_download(row: dict) -> None:
-    mid, iid = int(row["message_id"]), str(row["instance"])
-    try:
-        inst = await asyncio.to_thread(cfg.get_instance, iid)
-        settings = (mms_transport.resolve_settings(inst) if inst else {})
-        forced = mid in hub.mms_forced
-        if not inst or not settings.get("enabled") or not (settings.get("auto_download")
-                                                           or forced):
-            # Parked until someone asks for it; say once that it arrived.
-            await asyncio.to_thread(store.set_mms_state, mid, row["state"],
-                                    next_attempt_ts=None)
-            rec = await asyncio.to_thread(store.get_message, mid)
-            if rec and int(row.get("attempts") or 0) == 0:
-                _dispatch_push(notify_push.EV_INCOMING_SMS, iid, rec["peer"], _mms_push_text(rec))
-            return
-        hub.mms_forced.discard(mid)
-        result = await asyncio.to_thread(mms.download, inst, mid)
-        rec = await asyncio.to_thread(store.get_message, mid)
-        if not rec:
-            return
-        await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
-        if result.get("ok"):
-            log.info("retrieved MMS %d on line %s", mid, iid)
-            _dispatch_push(notify_push.EV_INCOMING_SMS, iid, rec["peer"], _mms_push_text(rec))
-        else:
-            log.info("MMS %d on line %s not retrieved: %s", mid, iid, result.get("error"))
-            if (result.get("final") and not result.get("expired") and not forced
-                    and int(row.get("attempts") or 0) == 0):
-                _dispatch_push(notify_push.EV_INCOMING_SMS, iid, rec["peer"],
-                               _mms_push_text(rec))
-    except Exception as exc:  # noqa
-        log.warning("MMS download %d failed unexpectedly: %r", mid, exc)
-        # Last resort when mms.download() could not record the failure itself (the database
-        # was unavailable too): put the MMS back on the retry schedule.
-        try:
-            await asyncio.to_thread(store.release_stuck_mms_download, mid)
-        except Exception as inner:  # noqa
-            log.warning("MMS %d could not be requeued: %r", mid, inner)
-
-
-async def _publish_binary_sms(result: dict) -> None:
-    """Announce what a binary SMS turned out to be: an MMS, a delivery report, or a filed
-    payload nobody reads (which refreshes a count, never a toast or a push)."""
-    iid = str(result["instance"])
-    if result.get("message"):
-        await _publish_incoming_sms(result["message"])
-    elif result.get("delivery"):
-        await hub.broadcast({"type": "sms", "instance": iid, "message": result["delivery"]})
-    elif result.get("filed"):
-        await hub.broadcast({"type": "sms", "instance": iid, "binary": True})
-
-
-def _ingest_binary_sms(iid: str, sender: str, data: bytes, *, transport: str,
-                       sent_ts: int | None = None, pdu=None, segment=None,
-                       body_text: str = "") -> dict:
-    """Route one binary SMS payload: an MMS push to the MMS store, anything else to filing.
-
-    Returns {"binary": True, "instance", "message"|"delivery"|"filed"} so the caller can
-    announce it; falsy "message" with "handled" means a notification already held.
-    """
-    result = mms.handle_wap_push(iid, sender, data, transport=transport, sent_ts=sent_ts)
-    if result.get("handled"):
-        return {**result, "binary": True, "instance": str(iid),
-                "direction": "in"} if (result.get("message") or result.get("delivery")) else None
-    rec = store.add_binary_sms(
-        iid, sender, ts=sent_ts, transport=transport,
-        tp_pid=getattr(pdu, "tp_pid", None), tp_dcs=getattr(pdu, "tp_dcs", None),
-        concat=segment, udh_hex=getattr(pdu, "udh_hex", ""),
-        tpdu_hex=getattr(pdu, "tpdu_hex", ""), body_hex=bytes(data).hex())
-    log.info("filed a non-text SMS from %s on line %s (pid=%s dcs=%s, %d bytes) — "
-             "not shown as a message", sender, iid, rec["tp_pid"], rec["tp_dcs"],
-             len(rec["body_hex"]) // 2)
-    return {"binary": True, "instance": str(iid), "direction": "in", "filed": rec}
-
-
-async def sms_segment_reaper():
-    """Store what a multi-part SMS collected when the rest of its parts never arrive.
-
-    Carriers deliver the parts of one text within seconds, so a group still incomplete after
-    store.SEGMENT_TIMEOUT is not going to be completed. Publishing the partial text (with the
-    gaps marked) is strictly better than holding it forever: the user still sees who wrote and
-    most of what they said."""
-    while True:
-        await asyncio.sleep(60)
-        try:
-            stale = await asyncio.to_thread(store.take_stale_sms_segments)
-        except Exception as exc:  # noqa
-            log.debug("SMS segment sweep failed: %r", exc)
-            continue
-        try:
-            for group in await asyncio.to_thread(store.take_stale_sms_segments, kind="wap"):
-                for seq, body in zip(group["seqs"], group["bodies"]):
-                    await asyncio.to_thread(
-                        store.add_binary_sms, str(group["instance"]), group["peer"],
-                        ts=group["first_ts"], body_hex=body,
-                        concat=(group["concat_ref"], group["total"], seq))
-        except Exception as exc:  # noqa
-            log.debug("stale WAP Push sweep failed: %r", exc)
-        try:
-            await asyncio.to_thread(store.prune_late_sms_groups)
-        except Exception as exc:  # noqa
-            log.debug("late SMS group prune failed: %r", exc)
-        for group in stale:
-            iid = str(group["instance"])
-            body = _join_sms_parts(group["bodies"], group["seqs"], group["total"])
-            log.info("incomplete multi-part SMS on line %s from %s: parts %s of %d — storing "
-                     "what arrived", iid, group["peer"],
-                     ",".join(str(n) for n in group["seqs"]), group["total"])
-            rec = await asyncio.to_thread(
-                store.ingest_message, iid, "in", group["peer"], body, transport="vowifi",
-                sent_ts=group.get("sent_ts"), received_ts=group["first_ts"])
-            if rec is None:
-                continue
-            # Keep the group addressable so the parts still in flight complete THIS message
-            # rather than being published as a second fragment of the same text.
-            if len(group["seqs"]) < group["total"]:
-                await asyncio.to_thread(
-                    store.remember_partial_sms_group, iid, group["peer"], group["concat_ref"],
-                    group["total"], rec["id"], group["seqs"], group["bodies"])
-            await _publish_incoming_sms(rec)
-
-
 def _host_alert_summary(alerts: list[dict]) -> str:
     lines = []
     for item in alerts:
@@ -2469,41 +2170,6 @@ def _save_host_alert_state(state: dict) -> None:
         os.replace(temporary, path)
     except OSError as exc:
         log.debug("cannot persist host alert state: %r", exc)
-
-
-async def cellular_sms_poller():
-    """Import SMS received by the 4G modem even when its VoWiFi engine is stopped."""
-    scanner = cellular_sms.Scanner(local_sms_tracker=store)
-
-    def ingest(record: dict) -> dict | None:
-        if record.get("data"):
-            return _ingest_binary_sms(record["instance"], record["peer"], record["data"],
-                                      transport="cellular", sent_ts=record["ts"] or None)
-        return store.ingest_message(
-            record["instance"], record["direction"], record["peer"], record["body"],
-            transport="cellular", sent_ts=record["ts"] or None,
-            legacy_fingerprint=record.get("legacy_fingerprint"))
-
-    while True:
-        try:
-            # One config read serves both the line list and the scanner's policy, so the
-            # operator's choice takes effect without restarting the control plane.
-            conf = await asyncio.to_thread(cfg.load)
-            settings = conf.get("settings") or {}
-            stored = await asyncio.to_thread(
-                scanner.poll, list((conf.get("instances") or {}).values()), ingest,
-                policy=cellular_sms.storage_policy(settings))
-            for rec in stored:
-                if rec.get("binary"):
-                    await _publish_binary_sms(rec)
-                elif rec["direction"] == "in":
-                    await _publish_incoming_sms(rec)
-                else:
-                    await hub.broadcast({"type": "sms", "instance": rec["instance"],
-                                         "message": rec})
-        except Exception as exc:  # noqa
-            log.debug("cellular SMS poll failed: %r", exc)
-        await asyncio.sleep(5)
 
 
 async def _poll_instance_status(inst: dict) -> None:
@@ -2954,15 +2620,7 @@ def apply_health(iid, inst, st, container_id: str | None = None):
 async def lifespan(app: FastAPI):
     if operations.container_stack_enabled():
         await asyncio.to_thread(operations.settle_container_service_restart)
-    _keep_modem_storage_on_upgrade(store.schema_version())
-    store.set_subscriber_resolver(_line_subscriber)
-    try:
-        store.init()
-    except store.MigrationBackupError as exc:
-        # Refusing to start is deliberate: the upgrade deletes rows, and it only runs once a
-        # verified copy exists. Free space in the data directory, then start again.
-        log.critical("%s", exc)
-        raise
+    store.init()
     # An upgrade from an older/self-use build may inherit more than five running containers.
     # Keep every saved record, but stop excess engines before background recovery begins.
     for saved_line in cfg.list_instances():
@@ -2973,18 +2631,6 @@ async def lifespan(app: FastAPI):
                 log.warning("stopped line %s because it exceeds the SIM line limit", iid)
             except Exception as exc:  # noqa: BLE001 - startup must continue to surface status
                 log.error("could not stop over-limit line %s: %s", iid, exc)
-    # Legacy history used a free-form line name. Map only unique, non-numeric current names;
-    # numeric ids are reusable and therefore unsafe to guess across deleted/recreated lines.
-    aliases: dict[str, list[str]] = {}
-    for item in cfg.list_instances():
-        alias = re.sub(r"[^a-z0-9]+", "", str(item.get("name") or "").lower())
-        if alias and not alias.isdigit():
-            aliases.setdefault(alias, []).append(str(item["id"]))
-    unique_aliases = {alias: ids[0] for alias, ids in aliases.items() if len(ids) == 1}
-    migrated = store.migrate_legacy_history(unique_aliases)
-    if migrated["calls"] or migrated["messages"]:
-        log.info("merged legacy history: %d call(s), %d message(s)",
-                 migrated["calls"], migrated["messages"])
     # Restore known serial-modem lines from passive bridge metadata before card_monitor can
     # block on a discovery APDU.  Each recovered line is then handed to the same guarded
     # hotplug auto-start path used for a physical insertion.
@@ -2995,28 +2641,18 @@ async def lifespan(app: FastAPI):
     await hub.runtime.start(hub.runtime_changed)
     poller = asyncio.create_task(status_poller())
     monitor = asyncio.create_task(card_monitor())
-    sms_poller = asyncio.create_task(cellular_sms_poller())
     host_poller = asyncio.create_task(host_health_poller())
-    segment_reaper = asyncio.create_task(sms_segment_reaper())
-    mms_runner = asyncio.create_task(mms_worker())
-
     media_task = asyncio.create_task(media_supervisor())
     for iid in recovered_modem_lines:
         asyncio.create_task(_auto_start_hotplugged_line(iid))
     yield
     poller.cancel()
     monitor.cancel()
-    sms_poller.cancel()
     host_poller.cancel()
-    segment_reaper.cancel()
-    mms_runner.cancel()
-
     media_task.cancel()
     # Reap the cancelled tasks (the monitor may be parked in a to_thread wait for up to
     # its timeout; awaiting keeps shutdown deterministic instead of leaking the error).
-    await asyncio.gather(poller, monitor, sms_poller, host_poller,
-                         segment_reaper, mms_runner, media_task,
-
+    await asyncio.gather(poller, monitor, host_poller, media_task,
                          return_exceptions=True)
     await hub.runtime.close()
     for c in hub.ami.values():
@@ -4099,12 +3735,9 @@ async def api_provision(body: dict):
         c.mcc, c.mnc, c.iccid or c.imsi,
         body.get("sip") or {"transport": "udp", "external": []})
     sip.setdefault("webrtc", {"enable": bool(body.get("webrtc", True))})
-    # SMSC: manual override wins; otherwise read from the SIM (EF_SMSP, authoritative).
-    # If the SIM can't provide it we ask the user to type it (no carrier presets).
-    smsc = (body.get("smsc") or "").strip() or c.smsc
-    if not smsc:
-        raise HTTPException(422, "smsc_unreadable: could not read the SMS centre from the SIM — "
-                                 "please provide it manually.")
+    # The SMS centre is kept for reference only: this build sends no SMS, so a SIM that does
+    # not expose EF_SMSP is still a usable line.
+    smsc = (body.get("smsc") or "").strip() or c.smsc or ""
     live_cards = hub.cards_list()
     live_card = next((item for item in live_cards
                       if (item.get("name") == c.reader or item.get("index") == idx
@@ -5829,7 +5462,7 @@ async def api_instance_country(iid: str, body: dict):
 
 @app.delete("/api/instances/{iid}")
 async def api_instance_delete(iid: str, delete_history: bool = True, confirm_id: str = ""):
-    """Delete one SIM line and its engine data; optionally retain SMS/call history.
+    """Delete one SIM line and its engine data; optionally retain its call history.
 
     If the card is still inserted, suppress automatic draft creation until it is physically
     removed. Otherwise the card monitor would recreate the line immediately and make a
@@ -5860,11 +5493,9 @@ async def api_instance_delete(iid: str, delete_history: bool = True, confirm_id:
     hub._msisdn_tries.pop(str(iid), None)
     cfg.delete_instance(iid)
     await asyncio.to_thread(engine.delete_instance_data, iid)
-    deleted_messages = deleted_calls = 0
+    deleted_calls = 0
     if delete_history:
-        deleted_messages, deleted_calls = await asyncio.gather(
-            asyncio.to_thread(store.clear_messages, iid),
-            asyncio.to_thread(store.clear_calls, iid))
+        deleted_calls = await asyncio.to_thread(store.clear_calls, iid)
     # Line ids are reused by the next created line, so its connectivity timeline always goes
     # with the line it describes — a new SIM must never inherit another SIM's outages.
     _line_state_written.pop(str(iid), None)
@@ -5879,12 +5510,10 @@ async def api_instance_delete(iid: str, delete_history: bool = True, confirm_id:
     await hub.broadcast({"type": "cards", "cards": _client_cards()})
     await hub.broadcast({"type": "line", "instance": str(iid), "event": "deleted"})
     if delete_history:
-        await hub.broadcast({"type": "sms", "instance": str(iid),
-                             "deleted": deleted_messages})
         await hub.broadcast({"type": "call", "instance": str(iid),
                              "deleted": deleted_calls})
     return {"ok": True, "history_deleted": bool(delete_history),
-            "deleted_messages": deleted_messages, "deleted_calls": deleted_calls}
+            "deleted_calls": deleted_calls}
 
 
 @app.post("/api/instances/{iid}/start")
@@ -6094,672 +5723,6 @@ def _owner(request: Request) -> int:
     return store.ADMIN_OWNER
 
 
-# ----------------------------- SMS -----------------------------
-@app.get("/api/instances/{iid}/messages/threads")
-def api_threads(iid: str):
-    return {"threads": store.list_threads(iid)}
-
-
-# Declared before /messages/{peer}: a path parameter would otherwise swallow "unread" and
-# answer with the conversation with somebody called that.
-@app.get("/api/instances/{iid}/messages/unread")
-async def api_messages_unread(iid: str, request: Request):
-    """Which conversations on this line have not been read, and how many messages each."""
-    owner = _owner(request)
-    counts = await asyncio.to_thread(store.unread_counts, owner, str(iid))
-    return {"unread": counts, "total": sum(counts.values())}
-
-
-@app.post("/api/instances/{iid}/messages/read")
-async def api_messages_read(iid: str, body: dict, request: Request):
-    """Mark one conversation read, or the whole line.
-
-    A client's first run marks the line read: an upgrade must not present years of history as
-    unread. Afterwards it marks each conversation as the person opens it.
-    """
-    owner = _owner(request)
-    message_id = body.get("message_id")
-    if message_id is not None:
-        try:
-            message_id = int(message_id)
-        except (TypeError, ValueError):
-            raise HTTPException(400, "message_id must be a message id") from None
-    if body.get("all"):
-        position = await asyncio.to_thread(store.mark_line_read, owner, str(iid), message_id)
-        return {"ok": True, "line": str(iid), "last_read_id": position}
-    peer = str(body.get("peer") or "").strip()
-    if not peer:
-        raise HTTPException(400, "provide peer or all")
-    position = await asyncio.to_thread(store.mark_thread_read, owner, str(iid), peer,
-                                       message_id)
-    return {"ok": True, "peer": peer, "last_read_id": position}
-
-
-@app.get("/api/messages/unread")
-async def api_messages_unread_total(request: Request):
-    """One number for a badge, across every line."""
-    owner = _owner(request)
-    lines = [str(inst.get("id")) for inst in cfg.list_instances()]
-    return {"total": await asyncio.to_thread(store.unread_total, owner, lines), "lines": lines}
-
-
-@app.get("/api/instances/{iid}/messages/binary")
-def api_binary_sms(iid: str, limit: int = 200):
-    """Non-text payloads received on this line: binary/SIM-addressed SMS that are kept out of
-    the conversations. Read-only and deliberately raw — identifying what an encrypted payload
-    belongs to needs the PDU as it arrived, not a decode of it.
-
-    Each row carries `tags` saying WHY it was filed. The UI needs that for more than curiosity:
-    the classification can be wrong (a carrier mislabelling a real text's TP-DCS would hide it
-    for good), so the reason has to be inspectable rather than implicit."""
-    rows = store.list_binary_sms(iid, limit)
-    for row in rows:
-        row["tags"] = sms_pdu.payload_tags(row.get("tp_pid"), row.get("tp_dcs"))
-    return {"payloads": rows}
-
-
-@app.get("/api/instances/{iid}/messages/{peer}")
-def api_messages(iid: str, peer: str):
-    return {"messages": store.list_messages(iid, peer)}
-
-
-# Largest file accepted as picked: a camera original is often several megabytes and is
-# converted and shrunk here to fit the line's limit (mms.fit_attachments).
-MMS_UPLOAD_LIMIT = 25 * 1024 * 1024
-
-
-async def _mms_line(iid: str) -> tuple[dict, dict]:
-    inst = await asyncio.to_thread(cfg.get_instance, iid)
-    if not inst:
-        raise HTTPException(404, "no such line")
-    settings = mms_transport.resolve_settings(inst)
-    if not settings.get("enabled"):
-        raise HTTPException(409, "MMS is turned off for this line")
-    if not settings.get("configured"):
-        raise HTTPException(409, "no MMSC is known for this line's carrier")
-    return inst, settings
-
-
-# Largest of the fields that travel with an attachment -- the text, subject and recipients.
-# This is all starlette's ``max_part_size`` bounds: a file part is streamed straight to a
-# spooled temporary file with no limit of its own, so passing the upload limit here raised the
-# ceiling on the fields and did nothing whatever for the files.
-MMS_FIELD_LIMIT = 256 * 1024
-
-
-class _BodyTooLarge(Exception):
-    pass
-
-
-def _spool_upload(*args, **kwargs):
-    """Where starlette puts an uploaded file once it passes 1 MB: under the data directory.
-
-    starlette gives no way to choose, so tempfile's default applies -- /tmp, which in the
-    control container is a 32 MB tmpfs, less than one /mms/send request may carry, and shared
-    by every upload in flight. The files are unnamed (O_TMPFILE, or unlinked at once where that
-    is missing), so a process that dies leaves nothing behind."""
-    directory = os.path.join(store.DATA_DIR, "uploads")
-    os.makedirs(directory, exist_ok=True)
-    kwargs.setdefault("dir", directory)
-    return tempfile.SpooledTemporaryFile(*args, **kwargs)
-
-
-starlette_formparsers.SpooledTemporaryFile = _spool_upload
-
-
-def _limited_request(request: Request, limit: int) -> Request:
-    """The request with its body held to `limit` bytes as it is read.
-
-    A file part is measured only once it has been spooled to disk, which is too late to be a
-    limit, and a declared Content-Length is not one either: a chunked or HTTP/2 upload through
-    a reverse proxy may carry none, and nothing obliges the body to match it. So the bytes are
-    counted as the parser pulls them off the connection, and reading stops at the first chunk
-    that goes past the limit; starlette then closes the temporary files it had begun. A
-    declared length that is already too large is refused before anything is read."""
-    declared = request.headers.get("content-length")
-    if declared is not None:
-        try:
-            length = int(declared)
-        except ValueError:
-            raise HTTPException(400, "unreadable Content-Length") from None
-        if length > limit:
-            raise _too_large(limit)
-    received = 0
-
-    async def receive():
-        nonlocal received
-        message = await request.receive()
-        if message["type"] == "http.request":
-            received += len(message.get("body", b""))
-            if received > limit:
-                raise _BodyTooLarge
-        return message
-
-    return Request(request.scope, receive)
-
-
-def _too_large(limit: int) -> HTTPException:
-    return HTTPException(413, f"the request is larger than {limit // (1024 * 1024)} MB")
-
-
-async def _mms_form(request: Request, *, files: int, limit: int):
-    limited = _limited_request(request, limit)
-    try:
-        return await limited.form(max_files=files, max_fields=40,
-                                  max_part_size=MMS_FIELD_LIMIT)
-    except _BodyTooLarge:
-        raise _too_large(limit) from None
-    except Exception as exc:  # noqa
-        raise HTTPException(413 if "size" in str(exc).lower() else 422,
-                            f"unreadable MMS form: {exc}") from None
-
-
-async def _read_upload(upload) -> dict:
-    data = await upload.read(MMS_UPLOAD_LIMIT + 1)
-    if len(data) > MMS_UPLOAD_LIMIT:
-        raise HTTPException(413, f"{upload.filename or 'the file'} is larger than "
-                                 f"{MMS_UPLOAD_LIMIT // (1024 * 1024)} MB")
-    return {"name": upload.filename or "", "content_type": upload.content_type or "",
-            "data": data}
-
-
-def _recipient_list(value) -> list[str]:
-    return mms.parse_recipients(value or "")
-
-
-def _staged_ids(values) -> list[str]:
-    """The staged attachments a request names, refused when there are more than a line can
-    hold. Every id is loaded into memory to be fitted, so an unbounded list is a way to ask
-    the gateway to read the same 25 MB upload a thousand times over."""
-    ids = [str(i) for i in values or [] if str(i)]
-    if len(ids) > mms_staging.MAX_PER_LINE:
-        raise HTTPException(400, f"at most {mms_staging.MAX_PER_LINE} attachments can be sent "
-                                 f"in one request")
-    return ids
-
-
-@app.post("/api/instances/{iid}/mms/attachments")
-async def api_mms_attachment_add(iid: str, request: Request):
-    """Upload one attachment while composing (multipart field "file"). It is checked at once
-    -- a format the gateway will not send is refused here, not at sending time -- and kept
-    as the original until the MMS is sent or the attachment removed."""
-    await _mms_line(iid)
-    form = await _mms_form(request, files=1, limit=MMS_UPLOAD_LIMIT + MMS_FIELD_LIMIT)
-    try:
-        upload = form.get("file")
-        if not hasattr(upload, "read"):
-            raise HTTPException(422, "no file")
-        item = await _read_upload(upload)
-    finally:
-        # A form parsed here rather than by FastAPI is not closed for us.
-        await form.close()
-    _checked, problem = await asyncio.to_thread(mms.check_attachments, [item], convert=True)
-    if problem:
-        raise HTTPException(422, problem)
-    try:
-        meta = await asyncio.to_thread(mms_staging.stage, iid, item["name"],
-                                       item["content_type"], item["data"])
-    except OverflowError as exc:
-        raise HTTPException(409, str(exc)) from None
-    return {"ok": True, "attachment": meta}
-
-
-@app.post("/api/instances/{iid}/mms/attachments/fit")
-async def api_mms_attachments_fit(iid: str, body: dict):
-    """What sending would carry: body {ids, text, subject, to, split}. Converts and shrinks the
-    staged attachments to fit the line's limit -- together in one message, or with `split`
-    each in its own -- and reports each one's size before and after, a preview version token,
-    and each message's packaged size (see mms.plan_messages). Sending fits again."""
-    _inst, settings = await _mms_line(iid)
-    body = body or {}
-    ids = _staged_ids(body.get("ids"))
-    try:
-        items = await asyncio.to_thread(mms_staging.load, iid, ids)
-    except KeyError as exc:
-        raise HTTPException(404, f"no such attachment: {exc.args[0]}") from None
-    messages, problem, summary = await asyncio.to_thread(
-        mms.plan_messages, items, str(body.get("text") or ""),
-        str(body.get("subject") or "").strip()[:80], _recipient_list(body.get("to")), settings,
-        split=bool(body.get("split")))
-    fitted = [part for message in messages for part in message["attachments"]]
-    for attachment_id, part, entry in zip(ids, fitted, summary.get("attachments") or []):
-        entry["id"] = attachment_id
-        entry["preview"] = await asyncio.to_thread(
-            mms_staging.save_fitted, iid, attachment_id, part["content_type"], part["data"])
-    return {"ok": problem is None, "problem": problem, **summary}
-
-
-@app.get("/api/instances/{iid}/mms/attachments/{aid}/preview")
-def api_mms_attachment_preview(iid: str, aid: str, v: str | None = None):
-    """A staged attachment as the composer shows it; `v` names a fitted version (the
-    "preview" token a fit returned), so a thumbnail never shows another mode's version."""
-    found = mms_staging.preview_file(iid, aid, v or None)
-    if not found:
-        raise HTTPException(404, "no such attachment")
-    path, content_type = found
-    if not mms_media.previewable(content_type) or not content_type.startswith("image/"):
-        raise HTTPException(415, "no preview for this attachment")
-    return FileResponse(path, media_type=content_type,
-                        headers={"X-Content-Type-Options": "nosniff",
-                                 "Content-Security-Policy": "sandbox; default-src 'none'",
-                                 # A version token names fixed content; without one the
-                                 # latest version is served, which a later fit replaces.
-                                 "Cache-Control": "private, max-age=3600" if v else "no-store"})
-
-
-@app.delete("/api/instances/{iid}/mms/attachments/{aid}")
-async def api_mms_attachment_remove(iid: str, aid: str):
-    await asyncio.to_thread(mms_staging.remove, iid, [aid])
-    return {"ok": True}
-
-
-@app.post("/api/instances/{iid}/mms/send")
-async def api_mms_send(iid: str, request: Request):
-    """Compose and submit MMS. multipart/form-data: to (comma-separated), text, subject, any
-    number of `attachment_ids` (uploaded with POST .../mms/attachments) and/or `attachments`
-    files, and `split` ("1" to send each attachment as its own MMS, the text and subject with
-    the first). Every attachment is converted and shrunk to fit the line's limit. Returns at
-    once with the stored messages ("message" is the first); the upload to the MMSC can take
-    minutes over the modem and is reported over the websocket."""
-    _inst, settings = await _mms_line(iid)
-    # Attachments sent directly, rather than staged first, are held to the same budget the
-    # staging area gives a line: one request can never carry more than the line may hold.
-    form = await _mms_form(request, files=mms_staging.MAX_PER_LINE,
-                           limit=mms_staging.MAX_BYTES_PER_LINE + MMS_FIELD_LIMIT)
-    try:
-        recipients = _recipient_list(form.get("to"))
-        text = str(form.get("text") or "")
-        subject = str(form.get("subject") or "").strip()[:80]
-        split = str(form.get("split") or "").lower() in ("1", "true", "yes")
-        staged_ids = _staged_ids(form.getlist("attachment_ids"))
-        try:
-            attachments = await asyncio.to_thread(mms_staging.load, iid, staged_ids)
-        except KeyError as exc:
-            raise HTTPException(404, f"no such attachment: {exc.args[0]}") from None
-        for upload in form.getlist("attachments"):
-            if hasattr(upload, "read"):
-                attachments.append(await _read_upload(upload))
-    finally:
-        await form.close()
-    messages, problem, _summary = await asyncio.to_thread(
-        mms.prepare_outgoing, recipients, text, attachments, settings, subject, split=split)
-    if problem:
-        raise HTTPException(422, problem)
-    records = []
-    for message in messages:
-        records.append(await asyncio.to_thread(
-            mms.create_outgoing, iid, recipients, message["text"], message["attachments"],
-            message["subject"]))
-    await asyncio.to_thread(mms_staging.remove, iid, staged_ids)
-    for rec in records:
-        await hub.broadcast({"type": "sms", "instance": str(iid), "message": rec})
-    asyncio.create_task(_send_mms_sequence(str(iid), [int(r["id"]) for r in records]))
-    return {"ok": True, "message": records[0], "messages": records}
-
-
-async def _send_mms_sequence(iid: str, mids: list[int]) -> None:
-    """Submit several MMS one after another, so they reach the recipient in order."""
-    for mid in mids:
-        await _send_mms_task(iid, mid)
-
-
-async def _send_mms_task(iid: str, mid: int) -> None:
-    try:
-        inst = await asyncio.to_thread(cfg.get_instance, iid)
-        result = await asyncio.to_thread(mms.send, inst or {}, mid)
-        log.info("MMS %d on line %s: %s%s", mid, iid, result["status"],
-                 f" ({result['error']})" if result.get("error") else "")
-    except Exception as exc:  # noqa
-        log.warning("MMS send %d failed unexpectedly: %r", mid, exc)
-        await asyncio.to_thread(store.set_mms_state, mid, "failed", error=str(exc),
-                                message_status="failed")
-    rec = await asyncio.to_thread(store.get_message, mid)
-    if rec:
-        await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
-
-
-@app.post("/api/instances/{iid}/messages/{mid}/mms/download")
-async def api_mms_download(iid: str, mid: int):
-    """Retrieve (or retry) one inbound MMS now, whatever the line's auto-download setting."""
-    if not await asyncio.to_thread(store.schedule_mms_download, iid, mid):
-        raise HTTPException(409, "this MMS cannot be downloaded")
-    hub.mms_forced.add(int(mid))
-    hub.mms_wakeup.set()
-    rec = await asyncio.to_thread(store.get_message, mid)
-    await hub.broadcast({"type": "sms", "instance": str(iid), "message": rec})
-    return {"ok": True, "message": rec}
-
-
-# Served inline only for media the browser renders without running anything. SVG and HTML
-# can carry script, so like every other type they are downloads.
-_MMS_INLINE_TYPES = ("image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp",
-                     "audio/", "video/", "text/plain")
-
-
-@app.get("/api/instances/{iid}/messages/{mid}/mms/parts/{pid}")
-def api_mms_part(iid: str, mid: int, pid: int, download: bool = False):
-    part = store.mms_part_file(iid, mid, pid)
-    if not part:
-        raise HTTPException(404, "no such MMS part")
-    content_type = str(part["content_type"] or "").split(";")[0].strip().lower()
-    inline = not download and content_type.startswith(_MMS_INLINE_TYPES)
-    media_type = content_type if inline else "application/octet-stream"
-    if inline and content_type == "text/plain":
-        media_type = f"text/plain; charset={part['charset'] or 'utf-8'}"
-    # The same rule as when the name was stored; rows written before it existed get it here.
-    name = mms_media.display_name(part["name"] or "", content_type)
-    return FileResponse(part["file"], media_type=media_type, filename=name,
-                        content_disposition_type="inline" if inline else "attachment",
-                        headers={"X-Content-Type-Options": "nosniff",
-                                 "Content-Security-Policy": "sandbox; default-src 'none'",
-                                 "Cache-Control": "private, max-age=86400"})
-
-
-_MMS_SETTING_KEYS = ("enabled", "auto_download", "transport", "apn", "mmsc", "proxy",
-                     "username", "password", "user_agent", "max_size")
-
-
-def _mms_settings_view(inst: dict) -> dict:
-    effective = mms_transport.resolve_settings(inst)
-    effective.pop("password", None)
-    if effective.get("detected"):
-        effective["detected"] = {k: v for k, v in effective["detected"].items()
-                                 if k != "password"}
-    own = dict(inst.get("mms") or {})
-    own["password_set"] = bool(own.pop("password", ""))
-    return {"effective": effective, "line": own, "formats": mms.attachment_formats()}
-
-
-@app.get("/api/instances/{iid}/mms/settings")
-async def api_mms_settings(iid: str):
-    inst = await asyncio.to_thread(cfg.get_instance, iid)
-    if not inst:
-        raise HTTPException(404, "no such line")
-    return await asyncio.to_thread(_mms_settings_view, inst)
-
-
-@app.put("/api/instances/{iid}/mms/settings")
-async def api_mms_settings_save(iid: str, body: dict):
-    inst = await asyncio.to_thread(cfg.get_instance, iid)
-    if not inst:
-        raise HTTPException(404, "no such line")
-    current = dict(inst.get("mms") or {})
-    clean = {}
-    for key in _MMS_SETTING_KEYS:
-        if key not in (body or {}):
-            if key in current:
-                clean[key] = current[key]
-            continue
-        value = body[key]
-        if key in ("enabled", "auto_download"):
-            clean[key] = bool(value)
-        elif key == "transport":
-            if value not in mms_transport.TRANSPORTS:
-                raise HTTPException(422, "transport must be auto, modem or host")
-            clean[key] = value
-        elif key == "max_size":
-            try:
-                clean[key] = max(30 * 1024, min(5 * 1024 * 1024, int(value)))
-            except (TypeError, ValueError):
-                raise HTTPException(422, "max_size must be a number of bytes") from None
-        else:
-            text = str(value or "").strip()
-            if any(ch in text for ch in "\"\r\n\0"):
-                raise HTTPException(422, f"{key} contains characters that are not allowed")
-            if key == "mmsc" and text and not text.startswith("http://"):
-                raise HTTPException(422, "the MMSC must be an http:// URL")
-            if key == "proxy" and text and mms_transport.parse_proxy(text) is None:
-                raise HTTPException(422, "the MMS proxy must be host:port")
-            if key == "password" and not text and current.get("password") \
-                    and not body.get("clear_password"):
-                clean[key] = current["password"]      # blank means "unchanged"
-                continue
-            clean[key] = text
-    updated = await asyncio.to_thread(cfg.upsert_instance, {"id": str(iid), "mms": clean})
-    hub.mms_wakeup.set()
-    return await asyncio.to_thread(_mms_settings_view, updated)
-
-
-@app.post("/api/instances/{iid}/messages/delete")
-async def api_messages_delete(iid: str, body: dict):
-    """Delete messages. Body: {ids:[...]} for specific messages, {peer:"..."} for a whole
-    conversation, or {all:true} to wipe every message on the line. Broadcasts a refresh."""
-    if body.get("all"):
-        n = await asyncio.to_thread(store.clear_messages, iid)
-    elif body.get("peer") is not None:
-        n = await asyncio.to_thread(store.delete_thread, iid, body["peer"])
-    elif body.get("ids"):
-        n = await asyncio.to_thread(store.delete_messages, iid, body["ids"])
-    else:
-        raise HTTPException(400, "provide ids, peer, or all")
-    await hub.broadcast({"type": "sms", "instance": str(iid), "deleted": n})
-    return {"ok": True, "deleted": n}
-
-
-SMS_RESP_RE = re.compile(r"Received SIP response")
-# The patched (sysmocom) Asterisk logs the raw 3GPP RP PDU of every SMS it parses via
-# res_pjsip_messaging.c parse_rpdata. For an MO SMS the SMSC returns an async RP-ACK / RP-ERROR
-# "submit report" (an incoming application/vnd.3gpp.sms MESSAGE whose Call-ID is
-# <our-outbound-Call-ID>:sm-submit-report) — THIS, not the SIP 202 Accepted, is the authoritative
-# delivery verdict. Byte 0 low 3 bits = RP-MTI: 3 = RP-ACK (delivered), 5 = RP-ERROR (failed,
-# followed by an RP-Cause). 1 = RP-DATA (a real inbound SMS) which we ignore here.
-RPDATA_RE = re.compile(r"parse_rpdata:\s*SMS RP-DATA\s*'([0-9a-fA-F]+)'")
-_RP_ACK_MTI = 3
-_RP_ERROR_MTI = 5
-# RP-Cause value (3GPP TS 24.011 §8.2.5.4, values per TS 24.008) -> human reason.
-RP_CAUSE = {
-    1: "unassigned/unallocated number", 8: "operator determined barring", 10: "call barred",
-    11: "reserved", 21: "short message transfer rejected", 22: "memory capacity exceeded",
-    27: "destination out of order", 28: "unidentified subscriber", 29: "facility rejected",
-    30: "unknown subscriber", 38: "network out of order", 41: "temporary failure",
-    42: "congestion", 47: "resources unavailable", 50: "requested facility not subscribed",
-    69: "requested facility not implemented", 81: "invalid short message reference value",
-    95: "invalid message", 96: "invalid mandatory information", 97: "message type non-existent",
-    98: "message not compatible with SM protocol state", 99: "information element non-existent",
-    111: "protocol error", 127: "interworking, unspecified",
-}
-
-
-def _decode_rp_report(pdu_hex: str) -> dict | None:
-    """Decode an RP submit-report PDU (hex). Returns {ok, cause, reason} for an RP-ACK/RP-ERROR,
-    or None when the PDU is not a submit report (e.g. RP-DATA, a real inbound SMS)."""
-    try:
-        b = bytes.fromhex(pdu_hex)
-    except ValueError:
-        return None
-    if not b:
-        return None
-    mti = b[0] & 0x07
-    if mti == _RP_ACK_MTI:
-        return {"ok": True}
-    if mti == _RP_ERROR_MTI:
-        # octet0 MTI, octet1 msg-ref, octet2 RP-Cause IE length, octet3 cause value (bit8=ext).
-        cause = (b[3] & 0x7f) if len(b) >= 4 else None
-        reason = RP_CAUSE.get(cause, f"cause {cause}" if cause is not None else "delivery failed")
-        return {"ok": False, "cause": cause, "reason": reason}
-    return None
-
-
-def detect_sms_result(iid: str, since=None) -> dict:
-    """Determine the real MO SMS outcome. Two authoritative signals, checked in order:
-      1. The SMSC's RP-ACK/RP-ERROR submit report (parse_rpdata) — the true delivery verdict.
-      2. A SIP 4xx/5xx to our MESSAGE (IMS rejected it before the SMSC).
-    A SIP 202/2xx is NOT success — the carrier accepts almost everything and reports the real
-    result via the async RP submit report. Returns {ok: True|False|None, code?, reason?}."""
-    raw = engine.logs(iid, 4000, since=since)
-    raw = re.sub(r"\x1b\[[0-9;]*m", "", raw)
-    # 1. RP submit report (authoritative). Take the LAST ACK/ERROR seen in the window (our send's).
-    for h in reversed(RPDATA_RE.findall(raw)):
-        d = _decode_rp_report(h)
-        if d is not None:
-            if d["ok"]:
-                return {"ok": True}
-            return {"ok": False, "reason": d.get("reason", "delivery failed"),
-                    "cause": d.get("cause")}
-    # 2. Fall back to a negative SIP response to our MESSAGE.
-    result = {"ok": None}
-    for b in SMS_RESP_RE.split(raw)[1:]:
-        m = re.search(r"SIP/2\.0 (\d{3})([^\n]*)", b)
-        if not m:
-            continue
-        if re.search(r"CSeq:\s*\d+\s+MESSAGE", b):   # a response to our MESSAGE
-            code = int(m.group(1))
-            result = {"ok": 200 <= code < 300, "code": code, "reason": m.group(2).strip()}
-    return result
-
-
-async def _watch_sms_delivery(iid: str, mid: int, since: int, timeout: float = 40.0):
-    """Asynchronously resolve an MO SMS's REAL delivery outcome after the IMS accepted it.
-    The message is already stored as 'sent'; here we poll for the SMSC's RP submit report (or a
-    SIP 4xx) and update the record to 'delivered' or 'failed' (+ reason), broadcasting each change
-    so the open Messages view refreshes. On timeout the message stays 'sent' (accepted, delivery
-    unconfirmed — e.g. Asterisk SMS debug off, or the network sent no report)."""
-    iid = str(iid)
-    loops = max(1, int(timeout // 2))
-    for _ in range(loops):
-        await asyncio.sleep(2)
-        if not await asyncio.to_thread(engine.is_running, iid):
-            return
-        d = await asyncio.to_thread(detect_sms_result, iid, since)
-        if d.get("ok") is True:
-            store.set_message_status(mid, "delivered", None)
-            await hub.broadcast({"type": "sms", "instance": iid,
-                                 "message": {"id": mid, "status": "delivered",
-                                             "direction": "out", "error": None}})
-            return
-        if d.get("ok") is False:
-            reason = d.get("reason") or "unknown"
-            code = d.get("code")
-            err = (f"Carrier rejected the SMS: {reason}"
-                   + (f" (SIP {code})" if code else "")).strip()
-            store.set_message_status(mid, "failed", err)
-            await hub.broadcast({"type": "sms", "instance": iid,
-                                 "message": {"id": mid, "status": "failed",
-                                             "direction": "out", "error": err}})
-            return
-    # no verdict within the window — leave as 'sent' (accepted, unconfirmed).
-
-
-async def _send_sms_vowifi(iid: str, to: str, text: str,
-                           ami: AmiClient | None = None) -> dict:
-    """Submit one MO SMS through Asterisk/IMS and start its delivery watcher."""
-    ami = ami or await hub.ami_for(iid)
-    if not ami:
-        return {"ok": False, "unavailable": True, "message": None,
-                "error": "VoWiFi is not running / its control channel is unavailable.",
-                "transport": "vowifi"}
-    since = int(time.time())
-    rec = store.add_message(iid, "out", to, text, status="pending", transport="vowifi")
-    res = await ami.send_sms(to, text)
-
-    if not res.get("ok"):
-        # Asterisk itself refused to dispatch (endpoint down, bad address, etc.) — final failure.
-        err = res.get("detail") or res.get("error") or "Send rejected by the line."
-        store.set_message_status(rec["id"], "failed", err)
-        rec["status"], rec["error"] = "failed", err
-        await hub.broadcast({"type": "sms", "instance": str(iid), "message": rec})
-        return {"ok": False, "message": rec, "error": err, "transport": "vowifi"}
-
-    # IMS accepted the MESSAGE (SIP 202). That is NOT delivery confirmation — mark the message
-    # 'sent' now and resolve the REAL outcome asynchronously from the SMSC's RP submit report,
-    # flipping it to 'delivered' or 'failed' (+ reason) when it arrives. This keeps the send
-    # snappy and stops the old false "success" on carrier/SMSC rejections.
-    store.set_message_status(rec["id"], "sent", None)
-    rec["status"], rec["error"] = "sent", None
-    await hub.broadcast({"type": "sms", "instance": str(iid), "message": rec})
-    asyncio.create_task(_watch_sms_delivery(iid, rec["id"], since))
-    return {"ok": True, "message": rec, "error": None, "transport": "vowifi",
-            "pending_delivery": True}
-
-
-async def _registered_vowifi_ami(iid: str) -> AmiClient | None:
-    """Return a sender only when IMS registration is confirmed before submission.
-
-    This preflight is used solely by ``auto`` routing. If it cannot prove that VoWiFi is ready,
-    no SMS has been attempted yet and selecting cellular is safe. Once either transport's send
-    operation begins, ``auto`` never retries on the other transport: an action timeout may still
-    mean that the first copy reached the SMSC.
-    """
-    ami = await hub.ami_for(iid)
-    if not ami or not ami.connected:
-        return None
-    state = await ami.registration_state()
-    return ami if state == "Registered" else None
-
-
-async def _send_sms_cellular(iid: str, to: str, text: str) -> dict:
-    """Submit one MO SMS through the physical modem managed by ModemManager."""
-    instances = await asyncio.to_thread(cfg.list_instances)
-    result = await asyncio.to_thread(
-        cellular_sms.send, instances, iid, to, text, local_sms_tracker=store)
-    message_id = result.pop("message_id", None)
-    if result.get("unavailable"):
-        return {**result, "message": None}
-
-    # ModemManager's successful ``Send`` means submitted, not handset delivery-confirmed.
-    # A timeout is explicitly unknown and must remain visible as such; treating it as failed
-    # encourages a retry that may create a duplicate and an extra roaming charge.
-    message_status = ("sent" if result.get("ok") else
-                      "unknown" if result.get("uncertain") else "failed")
-    rec = (await asyncio.to_thread(store.get_message, message_id)
-           if message_id is not None else None)
-    if rec is None:
-        rec = store.add_message(iid, "out", to, text, status=message_status,
-                                transport="cellular")
-    error = result.get("error")
-    store.set_message_status(rec["id"], message_status, error)
-    rec["status"], rec["error"] = message_status, error
-    await hub.broadcast({"type": "sms", "instance": str(iid), "message": rec})
-    return {**result, "message": rec, "transport": "cellular"}
-
-
-async def send_sms_on_line(iid: str, to: str, text: str,
-                           transport: str = "auto") -> dict:
-    """Send one MO SMS using ``auto``, ``vowifi`` or ``cellular``.
-
-    ``auto`` prefers a *confirmed registered* VoWiFi route. It selects cellular only before any
-    VoWiFi submission has been attempted, and never retries across transports after an error or
-    timeout because SMS has no cross-transport idempotency key.
-    """
-    iid, transport = str(iid), str(transport or "auto").lower()
-    if transport not in {"auto", "vowifi", "cellular"}:
-        return {"ok": False, "unavailable": True, "message": None,
-                "error": "Unknown SMS transport; use auto, vowifi, or cellular."}
-
-    lock = hub.sms_send_locks.setdefault(iid, asyncio.Lock())
-    async with lock:
-        if transport == "vowifi":
-            return await _send_sms_vowifi(iid, to, text)
-        if transport == "cellular":
-            return await _send_sms_cellular(iid, to, text)
-
-        ami = await _registered_vowifi_ami(iid)
-        if ami:
-            result = await _send_sms_vowifi(iid, to, text, ami=ami)
-        else:
-            result = await _send_sms_cellular(iid, to, text)
-            if result.get("unavailable"):
-                cellular_error = result.get("error") or "Cellular SMS is unavailable."
-                result["error"] = f"VoWiFi is not registered. {cellular_error}"
-        result["requested_transport"] = "auto"
-        return result
-
-
-@app.post("/api/instances/{iid}/sms/send")
-async def api_sms_send(iid: str, body: dict):
-    to = str((body or {}).get("to") or "").strip()
-    text = (body or {}).get("body")
-    transport = str((body or {}).get("transport") or "auto").lower()
-    if not to or not isinstance(text, str) or not text:
-        raise HTTPException(422, "recipient and non-empty message body are required")
-    if transport not in {"auto", "vowifi", "cellular"}:
-        raise HTTPException(422, "transport must be auto, vowifi, or cellular")
-    result = await send_sms_on_line(iid, to, text, transport)
-    if result.pop("unavailable", False):
-        raise HTTPException(409, result["error"])
-    return result
-
-
 def _local_tz() -> ZoneInfo:
     """The user's configured zone, for timestamps shown in local time."""
     try:
@@ -6818,78 +5781,6 @@ async def api_hangup(iid: str):
     result = await hangup_on_line(iid)
     if result.pop("unavailable", False):
         raise HTTPException(409, result["error"])
-    return result
-
-
-def _cellular_call_result_status(value: str) -> tuple[str, bool]:
-    state = str(value or "").casefold()
-    if state == "active":
-        return "answered", False
-    if state in {"dialing", "ringing-out"}:
-        return "ringing", False
-    if state in {"terminated", "ended", "idle"}:
-        return "ended", True
-    if state == "unknown":
-        return "unknown", False
-    return state or "unknown", False
-
-
-def _sync_cellular_call_record(iid: str, state: str) -> dict | None:
-    rec = store.get_open_call_for_transport(str(iid), "cellular")
-    if not rec:
-        return None
-    status, ended = _cellular_call_result_status(state)
-    store.update_call(rec["id"], status, ended=ended)
-    rec["status"] = status
-    if ended:
-        rec["end_ts"] = int(time.time())
-    return rec
-
-
-@app.post("/api/instances/{iid}/cellular-call")
-async def api_cellular_call(iid: str, body: dict):
-    if not cfg.get_instance(str(iid)):
-        raise HTTPException(404, "instance not found")
-    number = str((body or {}).get("to") or "").strip()
-    result = await asyncio.to_thread(
-        cellular_call.dial, cfg.list_instances(), str(iid), number)
-    if result.pop("unavailable", False):
-        raise HTTPException(409, result.get("error") or "Cellular calling is unavailable")
-    if result.get("ok") or result.get("uncertain"):
-        rec = store.add_call(str(iid), "out", number,
-                             status="unknown" if result.get("uncertain") else "ringing",
-                             transport="cellular")
-        result["record"] = rec
-        await hub.broadcast({"type": "call", "instance": str(iid), "call": rec})
-    return result
-
-
-@app.get("/api/instances/{iid}/cellular-call/status")
-async def api_cellular_call_status(iid: str):
-    if not cfg.get_instance(str(iid)):
-        raise HTTPException(404, "instance not found")
-    result = await asyncio.to_thread(
-        cellular_call.status, cfg.list_instances(), str(iid))
-    if not result.get("unavailable"):
-        rec = _sync_cellular_call_record(str(iid), result.get("status") or "")
-        if rec:
-            result["record"] = rec
-    return result
-
-
-@app.post("/api/instances/{iid}/cellular-call/hangup")
-async def api_cellular_call_hangup(iid: str):
-    if not cfg.get_instance(str(iid)):
-        raise HTTPException(404, "instance not found")
-    result = await asyncio.to_thread(
-        cellular_call.hangup, cfg.list_instances(), str(iid))
-    if result.pop("unavailable", False):
-        raise HTTPException(409, result.get("error") or "Cellular calling is unavailable")
-    if result.get("ok"):
-        rec = _sync_cellular_call_record(str(iid), "ended")
-        if rec:
-            result["record"] = rec
-            await hub.broadcast({"type": "call", "instance": str(iid), "call": rec})
     return result
 
 
@@ -7062,110 +5953,12 @@ async def api_engine_event(payload: dict):
     iid = str(payload.get("instance", ""))
     event = payload.get("event", "")
     args = payload.get("args", [])
-    if event == "sms_in" and len(args) >= 2:
-        try:
-            text = base64.b64decode(args[1]).decode(errors="replace")
-        except Exception:
-            text = args[1]
-        sender = args[0] or ""
-        # Drop inbound MESSAGEs that carry NO human-readable text (empty/whitespace body). Two
-        # real sources produce these, and neither is a text the user should see:
-        #   1. IMS-internal signalling: the carrier's IP-SM-GW / SMSC sends non-user MESSAGEs
-        #      whose From is a bare private-IP SIP URI (e.g. <sip:10.183.150.10>).
-        #   2. A non-text PDU whose user data happens to decode to nothing (seen from short-codes
-        #      like 20023). Note this catches only the ones that decode to an EMPTY string —
-        #      most binary payloads decode to a non-empty run of mojibake and are caught by the
-        #      classifier below, which reads the PDU header instead of guessing from the body.
-        # A genuine text always has a non-empty decoded body, so dropping on empty-body never
-        # loses a real message. (An empty body with a normal sender is likewise nothing to show.)
-        # A payload that was never meant to be read — 8-bit binary, message class 2 (addressed
-        # to the SIM), TP-PID 0x7F — is filed away instead of becoming a message. Asterisk
-        # unpacks 8-bit user data one byte per character, so without this check it reaches the
-        # conversation view as a wall of mojibake (line 1 collected 16 from short-codes
-        # 2942/2939 that way). This precedes the concatenation buffer on purpose: a binary
-        # payload split across parts must not be text-joined, and its UDH — kept in the filed
-        # row — still holds the triplet needed to piece the bytes back together later.
-        # looks_binary() is the fallback for an engine image built before the header fields
-        # existed, where args carries no TP-DCS to judge by.
-        pdu = sms_pdu.parse_event_args(args)
-        segment = _concat_triplet(args)
-        sent_ts = sms_pdu.deliver_timestamp(pdu.tpdu_hex)
-        if pdu.is_machine_payload or (not pdu.known and sms_pdu.looks_binary(text)):
-            whole = sms_pdu.deliver_user_data(pdu.tpdu_hex)
-            payload = whole.hex() if whole is not None else sms_pdu.body_to_hex(text)
-            if segment and mms.is_wap_push_udh(pdu.udh_hex) and payload:
-                # A WAP Push too long for one SMS: its parts are joined byte-for-byte before
-                # anything can read it. The reaper files a group that never completes.
-                ref, total, seq = segment
-                group = await asyncio.to_thread(
-                    store.add_sms_segment, iid, sender, ref, total, seq, payload,
-                    sent_ts=sent_ts, with_meta=True, kind="wap")
-                if group is None:
-                    return {"ok": True, "buffered": f"{seq}/{total}"}
-                payload, sent_ts, segment = "".join(group["bodies"]), group["sent_ts"], None
-            result = await asyncio.to_thread(
-                _ingest_binary_sms, iid, sender, bytes.fromhex(payload), transport="vowifi",
-                sent_ts=sent_ts, pdu=pdu, segment=segment)
-            # A filed payload only refreshes the page's count: the toast in the web UI keys on
-            # a "message", and a payload nobody can read must not raise "SMS from …".
-            if result:
-                await _publish_binary_sms(result)
-            if result and result.get("filed"):
-                return {"ok": True, "stored": "binary", "id": result["filed"]["id"]}
-            return {"ok": True, "stored": "mms"}
-        # One part of a multi-part text: buffer it and wait for its siblings. The empty-body
-        # rule below is deliberately NOT applied to a part — the sources it guards against
-        # (IMS signalling, OTA payloads) never carry a concatenation header, whereas dropping
-        # a part that decoded to nothing would leave the whole message forever incomplete.
-        if segment:
-            ref, total, seq = segment
-            # A part can arrive long after its group was flushed incomplete (ten minutes
-            # measured between segment 1 and segment 2 of one text crossing two networks).
-            # Buffering it again would publish a second fragment of a message the thread
-            # already shows, so it is folded back into that message first.
-            late = await asyncio.to_thread(store.merge_late_sms_segment, iid, sender, ref,
-                                           total, seq, text)
-            if late is not None:
-                if late["duplicate"]:
-                    log.info("ignoring a repeat of part %d/%d from %s (ref %d) already in "
-                             "message %d", seq, total, sender, ref, late["message_id"])
-                    return {"ok": True, "merged": "duplicate"}
-                merged = _join_sms_parts(late["bodies"], late["seqs"], total)
-                rec = await asyncio.to_thread(
-                    store.set_message_body, late["message_id"], merged,
-                    int(time.time()) if late["complete"] else None)
-                log.info("late part %d/%d from %s (ref %d) merged into message %d — %s",
-                         seq, total, sender, ref, late["message_id"],
-                         "now complete" if late["complete"]
-                         else f"{len(late['seqs'])}/{total} parts")
-                if rec:
-                    await hub.broadcast({"type": "sms", "instance": iid, "message": rec})
-                    if late["complete"]:
-                        await _publish_completed_sms(rec)
-                return {"ok": True, "merged": f"{len(late['seqs'])}/{total}"}
-            group = await asyncio.to_thread(store.add_sms_segment, iid, sender, ref, total,
-                                            seq, text, sent_ts=sent_ts, with_meta=True)
-            if group is None:
-                log.info("buffered part %d/%d of a multi-part SMS from %s (ref %d)",
-                         seq, total, sender, ref)
-                return {"ok": True, "buffered": f"{seq}/{total}"}
-            log.info("reassembled a %d-part SMS from %s (ref %d)", total, sender, ref)
-            text, sent_ts = "".join(group["bodies"]), group["sent_ts"]
-        elif not text.strip():
-            log.info("dropping empty-body inbound SMS (internal signalling / binary/OTA "
-                     "SIM message — no displayable text)")
-            return {"ok": True, "dropped": "empty_body"}
-        rec = await asyncio.to_thread(store.ingest_message, iid, "in", sender, text,
-                                      transport="vowifi", sent_ts=sent_ts)
-        if rec is None:
-            # A carrier re-delivery, or the modem holding this SIM already imported its copy.
-            log.info("inbound SMS from %s on line %s is already stored — not shown twice",
-                     sender, iid)
-            return {"ok": True, "duplicate": True}
-        await _publish_incoming_sms(rec)
-    elif event == "sms_out" and len(args) >= 2:
-        pass  # already stored by the send path
-    elif event == "call_in":
+    if event in ("sms_in", "sms_out", "ussd", "voicemail_new"):
+        # Messaging, USSD and voicemail are not part of this build. The network's SMS is
+        # acknowledged inside Asterisk and its content discarded there; an event that still
+        # arrives (an older engine) is dropped here and never stored or broadcast.
+        return {"ok": True, "ignored": True}
+    if event == "call_in":
         # Log inbound calls even when the caller withholds/omits their number (peer "") so an
         # anonymous call still gets a record that the 'h' disposition can finalize. The IMS
         # delivers one INVITE several times (VoLTE preconditions / GRUU fork / retransmit),
@@ -7246,24 +6039,6 @@ async def api_engine_event(payload: dict):
                         hub._pushed_missed = set(list(hub._pushed_missed)[-256:])
                     asyncio.create_task(_push_missed_call(
                         iid, cid, rec.get("peer") or to))
-    elif event == "ussd" and args:
-        # A carrier answers a service code in signalling rather than audio (T-Mobile puts it
-        # on the BYE), so this is reported by a hangup handler on the carrier's own leg —
-        # the caller's leg, where call_result comes from, never sees the payload.
-        peer = args[0] if args else ""
-        reply = ussd.parse(args[1] if len(args) > 1 else "")
-        if reply:
-            rec = store.set_ussd_for_peer(iid, peer, reply["text"])
-            if not rec:
-                # Same race as call_result above: this is fired from the carrier leg's hangup
-                # handler and can beat call_out to the manager.
-                for _ in range(15):
-                    await asyncio.sleep(0.2)
-                    rec = store.set_ussd_for_peer(iid, peer, reply["text"])
-                    if rec:
-                        break
-            if rec:
-                await hub.broadcast({"type": "call", "instance": iid, "call": rec})
     elif event == "cp_mode_resolved" and args:
         # CP auto-discovery success: the engine found the address family (v6/v4/dual) that yields a
         # usable PDN on this carrier. Repin the line from 'auto' to the resolved family so it stops

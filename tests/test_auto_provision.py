@@ -310,25 +310,32 @@ class ReaderImeiCompletionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DraftSetupGuidanceTests(unittest.IsolatedAsyncioTestCase):
-    """Seen on a DS1621+: an EE SIM in an Alcor reader stayed a draft after its IMEI was
-    saved, because the reader could not read the SMSC. The page still spoke only about the
-    IMEI, then only of a generic wait, so the operator had to guess that the SIM tab mattered."""
+    """A draft whose IMEI is saved must say exactly what still blocks it, so the operator is not
+    left guessing which tab matters. This build sends no SMS, so a SIM that does not expose its
+    SMS centre is no longer held back for it."""
 
     draft = {"id": "2", "iccid": "test-card", "provisioning_state": "draft", "enabled": False,
-             "imsi": "234330000000000", "mcc": "234", "mnc": "33"}
+             "imsi": "234330000000000", "mcc": "234"}
     card = {"present": True, "iccid": "test-card", "hardware_id": "reader-1",
-            "imsi": "234330000000000", "mcc": "234", "mnc": "33", "smsc": ""}
+            "imsi": "234330000000000", "mcc": "234", "mnc": "", "smsc": ""}
 
     def test_missing_lists_exactly_what_blocks_promotion(self):
         with patch.object(main, "_hardware_imei_for_card",
                           return_value=("490154203237518", "reader-1", "reader")):
-            self.assertEqual(main._draft_missing(self.draft, self.card, [self.card]), ["SMSC"])
+            self.assertEqual(main._draft_missing(self.draft, self.card, [self.card]),
+                             ["MCC/MNC"])
             promoted = main._auto_promote_card_draft(self.draft, self.card, [self.card])
         self.assertEqual(promoted["provisioning_state"], "draft")
-        self.assertEqual(promoted["auto_provision_missing"], ["SMSC"])
+        self.assertEqual(promoted["auto_provision_missing"], ["MCC/MNC"])
+
+    def test_a_sim_without_an_sms_centre_is_not_held_as_a_draft(self):
+        card = {**self.card, "mnc": "33", "smsc": ""}
+        with patch.object(main, "_hardware_imei_for_card",
+                          return_value=("490154203237518", "reader-1", "reader")):
+            self.assertEqual(main._draft_missing({**self.draft, "mnc": "33"}, card, [card]), [])
 
     def test_a_locked_sim_without_a_saved_pin_is_reported(self):
-        card = {**self.card, "smsc": "+447700900000", "pin_enabled": True}
+        card = {**self.card, "mnc": "33", "pin_enabled": True}
         with patch.object(main, "_hardware_imei_for_card",
                           return_value=("490154203237518", "reader-1", "reader")):
             self.assertEqual(main._draft_missing(self.draft, card, [card]), ["SIM PIN"])
@@ -350,11 +357,11 @@ class DraftSetupGuidanceTests(unittest.IsolatedAsyncioTestCase):
 
         start.assert_not_called()
         self.assertFalse(result["started"])
-        self.assertEqual(result["missing"], ["SMSC"])
+        self.assertEqual(result["missing"], ["MCC/MNC"])
 
 
 class LateCardDataTests(unittest.IsolatedAsyncioTestCase):
-    """On a DS1621+ an Alcor AK9563 read no SMSC at insertion; a later read returned it.
+    """An Alcor AK9563 can return an incomplete read at insertion that a later read completes.
     Nothing read the card again, and the SIM tab's "Read SIM card" only filled the form, so
     the line stayed a draft until the operator also pressed Save."""
 
@@ -368,20 +375,20 @@ class LateCardDataTests(unittest.IsolatedAsyncioTestCase):
     def entry(self, **overrides):
         values = {"name": "Alcor Link AK9563 00 00", "index": 4, "present": True,
                   "iccid": "8944000000000000001", "imsi": "234330000000000", "mcc": "234",
-                  "mnc": "33", "smsc": None, "matched": "2", "carrier_identity": {}}
+                  "mnc": None, "smsc": None, "matched": "2", "carrier_identity": {}}
         values.update(overrides)
         return values
 
     def test_a_later_read_only_fills_gaps(self):
         entry = self.entry(imsi="234330000000000")
         self.assertTrue(main._merge_card_read(entry, self.card(imsi="999990000000000")))
-        self.assertEqual(entry["smsc"], "+447700900000")
+        self.assertEqual(entry["mnc"], "33")
         self.assertEqual(entry["imsi"], "234330000000000")   # never replaced
 
     def test_a_read_of_another_card_is_ignored(self):
         entry = self.entry()
         self.assertFalse(main._merge_card_read(entry, self.card(iccid="8944000000000000999")))
-        self.assertIsNone(entry["smsc"])
+        self.assertIsNone(entry["mnc"])
 
     async def test_the_background_retry_completes_the_draft(self):
         entry = self.entry()
@@ -398,7 +405,7 @@ class LateCardDataTests(unittest.IsolatedAsyncioTestCase):
                 await main._complete_draft_from_card(entry["name"])
                 await asyncio.sleep(0)
             start.assert_awaited_once_with("2")
-            self.assertEqual(main.hub.cards[entry["name"]]["smsc"], "+447700900000")
+            self.assertEqual(main.hub.cards[entry["name"]]["mnc"], "33")
         finally:
             main.hub.cards.pop(entry["name"], None)
 
@@ -428,14 +435,14 @@ class LateCardDataTests(unittest.IsolatedAsyncioTestCase):
         main.hub.cards[entry["name"]] = entry
         try:
             with patch.object(main, "_device_for_card", return_value=("reader-1", "reader")), \
-                    patch.object(main.sim, "read_card", return_value=self.card(smsc="")), \
+                    patch.object(main.sim, "read_card", return_value=self.card(mnc="")), \
                     patch.object(main.cfg, "get_instance", return_value=draft), \
                     patch.object(main, "_hardware_imei_for_card",
                                  return_value=("490154203237518", "reader-1", "reader")), \
                     patch.object(main.hub, "broadcast", new=AsyncMock()), \
                     patch.object(main, "_auto_start_hotplugged_line", new=AsyncMock()) as start:
                 result = await main.api_device_sim_reread("reader-1")
-            self.assertEqual(result["missing"], ["SMSC"])
+            self.assertEqual(result["missing"], ["MCC/MNC"])
             self.assertFalse(result["completing"])
             start.assert_not_awaited()
         finally:

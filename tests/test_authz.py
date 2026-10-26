@@ -47,25 +47,10 @@ class AuthorizationTableTests(unittest.TestCase):
             ("POST", "/api/auth/client/logout"),
             ("WEBSOCKET", "/ws"),
             ("GET", "/api/instances/sim1/status"),
-            ("GET", "/api/instances/sim1/messages/threads"),
-            ("GET", "/api/instances/sim1/messages/+61400000000"),
-            ("POST", "/api/instances/sim1/sms/send"),
-            ("POST", "/api/instances/sim1/mms/send"),
-            ("POST", "/api/instances/sim1/messages/42/mms/download"),
-            ("GET", "/api/instances/sim1/messages/42/mms/parts/1"),
             ("POST", "/api/instances/sim1/call"),
             ("POST", "/api/instances/sim1/hangup"),
-            ("POST", "/api/instances/sim1/cellular-call"),
             ("GET", "/api/instances/sim1/softphone"),
             ("WEBSOCKET", "/api/instances/sim1/softphone/ws"),
-            ("GET", "/api/instances/sim1/messages/unread"),
-            ("POST", "/api/instances/sim1/messages/read"),
-            ("GET", "/api/messages/unread"),
-            ("GET", "/api/instances/sim1/mms/settings"),
-            ("POST", "/api/instances/sim1/mms/attachments"),
-            ("POST", "/api/instances/sim1/mms/attachments/fit"),
-            ("GET", "/api/instances/sim1/mms/attachments/0123456789abcdef/preview"),
-            ("DELETE", "/api/instances/sim1/mms/attachments/0123456789abcdef"),
         ):
             with self.subTest(method=method, path=path):
                 self.assertTrue(authz.allowed(CLIENT, method, path))
@@ -123,12 +108,12 @@ STATUS = {"state": "REGISTERED", "label": "Registered", "reason_code": "ok", "re
 
 class EventScopeTests(unittest.TestCase):
     def test_a_client_hears_its_lines_conversations_and_calls_only(self):
-        for event in ({"type": "sms", "instance": "sim1"}, {"type": "call", "instance": "sim1"},
+        for event in ({"type": "call", "instance": "sim1"},
                       {"type": "status", "instance": "sim1"}, {"type": "line", "instance": "sim1"}):
             with self.subTest(event=event):
                 self.assertIsNotNone(authz.event_for(CLIENT, event))
         for event in ({"type": "host_alert"}, {"type": "cards"}, {"type": "hardware"},
-                      {"type": "voicemail", "instance": "sim1"},
+                      {"type": "voicemail", "instance": "sim1"}, {"type": "sms", "instance": "sim1"},
                       {"type": "engine", "instance": "sim1"}, {"type": "capability", "device": 1},
                       {"type": "sms", "instance": ""}, {"type": "something-added-later",
                                                         "instance": "sim1"}):

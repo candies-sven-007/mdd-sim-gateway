@@ -109,7 +109,7 @@ function ListenOnlyNote({ t }) {
   </div>
 }
 
-export default function Softphone({ selected, subscribe, instances, cards, devices, setSelected, showToast, initialLoading, loadErrors, unreadLines }) {
+export default function Softphone({ selected, subscribe, instances, cards, devices, setSelected, showToast, initialLoading, loadErrors }) {
   const { t } = useI18n()
   const id = selected?.id
   const [prov, setProv] = useState(null)
@@ -544,7 +544,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   if (loadErrors?.instances && !id) return <p className="u-error">{t('Loading failed')}</p>
   if (!id) return (
     <div>
-      <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} unreadLines={unreadLines} />
+      <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} />
       <div style={{ color: 'var(--text-dim)' }}>{t('Select a SIM / line to use the softphone.')}</div>
     </div>
   )
@@ -591,7 +591,7 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
       {/* Persistent remote-audio sink: JsSIP writes the remote MediaStream here. autoPlay +
           a stable DOM element + unlockAudio() on the first click = reliable playback. */}
       <audio ref={audioRef} autoPlay playsInline style={{ display: 'none' }} />
-      <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} unreadLines={unreadLines} />
+      <SimSelector instances={instances} cards={cards} devices={devices} selected={selected} setSelected={setSelected} />
       <div className="u-softphone-split">
       {IncomingOverlay}
       <style>{`@keyframes ringpulse{0%{box-shadow:0 0 0 0 ${GREEN}88}70%{box-shadow:0 0 0 16px ${GREEN}00}100%{box-shadow:0 0 0 0 ${GREEN}00}}`}</style>

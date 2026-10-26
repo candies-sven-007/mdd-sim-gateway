@@ -79,9 +79,6 @@ export const api = {
   authLogin: (username, password, remember) => j('POST', '/api/auth/login', { username, password, remember }),
   authLogout: () => j('POST', '/api/auth/logout', {}),
   authPassword: (current_password, new_password) => j('POST', '/api/auth/password', { current_password, new_password }),
-  unreadMessages: (id) => j('GET', `/api/instances/${encodeURIComponent(id)}/messages/unread`),
-  markThreadRead: (id, body) => j('POST', `/api/instances/${encodeURIComponent(id)}/messages/read`, body),
-  unreadTotal: () => j('GET', '/api/messages/unread'),
   authClients: () => j('GET', '/api/auth/clients'),
   revokeAuthClient: (id) => j('DELETE', `/api/auth/clients/${encodeURIComponent(id)}`),
   // Unified physical-device control plane. Older deployments may return 404;
@@ -147,59 +144,6 @@ export const api = {
   logs: (id, tail = 300) => j('GET', `/api/instances/${id}/logs?tail=${tail}`),
   register: (id) => j('POST', `/api/instances/${id}/register`),
 
-  threads: (id) => j('GET', `/api/instances/${id}/messages/threads`),
-  messages: (id, peer) => j('GET', `/api/instances/${id}/messages/${encodeURIComponent(peer)}`),
-  // Payloads that were filed instead of shown: binary / SIM-addressed SMS. Kept reachable so a
-  // misclassified real text cannot vanish silently.
-  binarySms: (id) => j('GET', `/api/instances/${id}/messages/binary`),
-  sendSms: (id, to, body, transport = 'auto') => j(
-    'POST',
-    `/api/instances/${id}/sms/send`,
-    { to, body, transport },
-  ),
-  // delete messages: { ids:[...] } | { peer } (whole conversation) | { all:true }
-  deleteMessages: (id, sel) => j('POST', `/api/instances/${id}/messages/delete`, sel),
-
-  // MMS. Uploads and sending are multipart/form-data, so they go through form() rather than
-  // j(); everything else is plain JSON like the rest of the API.
-  mmsDownload: (id, mid) => j('POST', `/api/instances/${id}/messages/${mid}/mms/download`, {}),
-  // Same-origin, cookie-authenticated URL for a part's content — used directly as an <img
-  // src>, <audio>/<video> src, or download <a href>. download=1 forces attachment disposition.
-  mmsPartUrl: (id, mid, pid, download = false) =>
-    `/api/instances/${id}/messages/${mid}/mms/parts/${pid}${download ? '?download=1' : ''}`,
-  // Upload one attachment while composing. The gateway checks it at once (422 with a human
-  // -readable `detail` for a format it will refuse, 409 when too many uploads are already
-  // waiting, 413 when it is too large) and keeps it staged until sent or removed.
-  stageMmsAttachment: (id, file) => {
-    const fd = new FormData()
-    fd.append('file', file, file.name)
-    return form('POST', `/api/instances/${id}/mms/attachments`, fd)
-  },
-  // What the message would actually carry once the gateway converts and shrinks these staged
-  // attachments together: { ids, text, subject, to }. A 404 means one of the ids is gone (e.g.
-  // swept) -- the caller should drop it and retry with what remains.
-  fitMmsAttachments: (id, body) => j('POST', `/api/instances/${id}/mms/attachments/fit`, body),
-  // The fitted picture for a staged attachment's thumbnail (415 for a non-image). `version` is
-  // the "preview" token the fit returned: the same attachment fits differently when it shares
-  // a message and when it is sent alone, and the token names the version that fit produced.
-  mmsAttachmentPreviewUrl: (id, aid, version) =>
-    `/api/instances/${id}/mms/attachments/${encodeURIComponent(aid)}/preview?v=${encodeURIComponent(version ?? '')}`,
-  removeMmsAttachment: (id, aid) => j('DELETE', `/api/instances/${id}/mms/attachments/${encodeURIComponent(aid)}`),
-  // `split` sends each attachment as its own MMS (the text and subject with the first).
-  sendMms: (id, { to, text, subject, attachment_ids, split }) => {
-    const fd = new FormData()
-    fd.append('to', to || '')
-    fd.append('text', text || '')
-    if (subject) fd.append('subject', subject)
-    if (split) fd.append('split', '1')
-    for (const aid of (attachment_ids || [])) fd.append('attachment_ids', aid)
-    return form('POST', `/api/instances/${id}/mms/send`, fd)
-  },
-  mmsSettings: (id) => j('GET', `/api/instances/${id}/mms/settings`),
-  saveMmsSettings: (id, body) => j('PUT', `/api/instances/${id}/mms/settings`, body),
-
-  // Served as audio/wav by the control plane; the <audio> element fetches it directly
-  // and the session cookie rides along same-origin, so it never goes through j().
   calls: (id) => j('GET', `/api/instances/${id}/calls`),
   // delete call-log entries: { ids:[...] } | { all:true }
   deleteCalls: (id, sel) => j('POST', `/api/instances/${id}/calls/delete`, sel),

@@ -211,15 +211,15 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
     ? (device.provisioning?.missing || []) : []
   const needsImei = setupMissing.includes('imei')
   const needsSim = setupMissing.some(key => key !== 'imei')
-  // IMSI, MCC/MNC and SMSC come from the card itself. A reader can miss them on the read at
+  // IMSI and MCC/MNC come from the card itself. A reader can miss them on the read at
   // insertion and return them on the next, so offer that before asking anyone to type them.
-  const needsCardRead = setupMissing.some(key => ['imsi', 'mcc_mnc', 'smsc'].includes(key))
+  const needsCardRead = setupMissing.some(key => ['imsi', 'mcc_mnc'].includes(key))
   const [rereading, setRereading] = useState(false)
   const rereadSim = async () => {
     setRereading(true)
     try {
       const result = await api.rereadDeviceSim(device.id)
-      const cardFields = (result.missing || []).filter(name => ['IMSI', 'MCC/MNC', 'SMSC'].includes(name))
+      const cardFields = (result.missing || []).filter(name => ['IMSI', 'MCC/MNC'].includes(name))
       showToast?.(result.completing ? t('SIM read again; the line is being completed and started')
         : cardFields.length ? t('The SIM still did not report: {fields}. Enter them on the SIM tab.', { fields: cardFields.join(t('list separator')) })
         : t('SIM read again'))

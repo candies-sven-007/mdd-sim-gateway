@@ -2,14 +2,12 @@ import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { api, connectWs, setCsrf } from './api.js'
 import Softphone from './views/Softphone.jsx'
 import GlobalSoftphone from './GlobalSoftphone.jsx'
-import Messages from './views/Messages.jsx'
 import Esim from './views/Esim.jsx'
 import { UnifiedOverview, DevicesPage, EgressPage, NotificationsPage, SystemPage, DiagnosticsPage } from './views/UnifiedPages.jsx'
 import { useI18n } from './i18n.jsx'
 
 const NAV = [
   ['overview', 'Overview', '⌂'], ['devices', 'Devices', '▣'], ['calls', 'Calls', '☎'],
-  ['messages', 'Messages', '✉'],
   ['esim', 'eSIM', '◎'],
   ['egress', 'Network exits', '⇄'],
   ['notifications', 'Notifications', '◉'], ['settings', 'System settings', '⚙'], ['diagnostics', 'Diagnostics', '≣'],
@@ -103,25 +101,6 @@ export default function App() {
   const [deviceTab, setDeviceTab] = useState(null)
   const [theme, setTheme] = useState(() => localStorage.getItem('theme') || 'auto')
   const [systemMeta, setSystemMeta] = useState({ version: '', repository_url: '' })
-  // Unread messages across every line, for the badge on Messages. The page itself keeps the
-  // per-conversation counts; this is refreshed when a message arrives and when one is read.
-  const [unreadTotal, setUnreadTotal] = useState(0)
-  const [unreadLines, setUnreadLines] = useState({})
-  const unreadRequest = useRef(0)
-  const loadUnread = useCallback(async () => {
-    const request = ++unreadRequest.current
-    try {
-      const summary = await api.unreadTotal()
-      const lines = await Promise.all((summary.lines || []).map(async id => {
-        try { return [id, Number((await api.unreadMessages(id)).total) || 0] }
-        catch { return [id, 0] }
-      }))
-      if (request === unreadRequest.current) {
-        setUnreadTotal(Number(summary.total) || 0)
-        setUnreadLines(Object.fromEntries(lines))
-      }
-    } catch {}
-  }, [])
   const [authState, setAuthState] = useState(null)
   const wsEvents = useRef({ handlers: new Set() }); const toastTimer = useRef(null); const unifiedAvailable = useRef(false)
   const refreshInFlight = useRef(false)
@@ -195,7 +174,6 @@ export default function App() {
   // The event socket was refused for the page's origin: live updates and the softphone are off
   // until the reverse proxy is fixed, so this stays up rather than being a passing toast.
   const [originRefused, setOriginRefused] = useState(false)
-  useEffect(()=>{ if(authState?.authenticated) loadUnread() },[authState?.authenticated,loadUnread])
 
   useEffect(()=>{ if(!authState?.authenticated)return; return connectWs(msg=>{
     if(msg.type==='status'){
@@ -212,19 +190,17 @@ export default function App() {
       showToast({card_removed:t('SIM removed — line stopped'),reader_lost:t('Reader unplugged — line stopped'),reader_added:`${t('Card reader connected')}${name?`: ${name}`:''}`,reader_removed:`${t('Card reader disconnected')}${name?`: ${name}`:''}`}[msg.event])
     }
     if(['device','capability','cellular','engine'].includes(msg.type)) refresh()
-    if(msg.type==='sms') loadUnread()
     wsEvents.current.handlers.forEach(h=>h(msg))
-    if(msg.type==='sms'&&msg.message?.direction==='in')showToast(t('SMS from {peer}',{peer:msg.message.peer}))
     if(msg.type==='call'&&msg.call?.direction==='in')showToast(t('Incoming call from {peer}',{peer:msg.call.peer}))
-  },expireAuth,()=>setOriginRefused(true))},[refresh,showToast,t,authState?.authenticated,expireAuth,loadUnread])
+  },expireAuth,()=>setOriginRefused(true))},[refresh,showToast,t,authState?.authenticated,expireAuth])
   const subscribe=useCallback(h=>{wsEvents.current.handlers.add(h);return()=>wsEvents.current.handlers.delete(h)},[])
   if (!authState) return <div className="auth-shell"><div className="auth-card"><h1>MDD Sim Gateway</h1><p>{t('Loading…')}</p></div></div>
   if (!authState.authenticated) return <AuthScreen configured={authState.configured} accountUsername={authState.username} t={t} onDone={result=>{setCsrf(result.csrf);setAuthState(s=>({...s,configured:true,authenticated:true,csrf:result.csrf}))}} />
   const sel=instances.find(i=>i.id===selected)
-  const common={devices,discovering,initialLoading,loadErrors,refreshDevices:refresh,instances,cards,selected:sel,setSelected,refresh,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,deviceTab,setDeviceTab,setSystemMeta,refreshUnread:loadUnread,unreadLines}
+  const common={devices,discovering,initialLoading,loadErrors,refreshDevices:refresh,instances,cards,selected:sel,setSelected,refresh,subscribe,showToast,setView,selectedDeviceId,setSelectedDeviceId,deviceTab,setDeviceTab,setSystemMeta}
   const content={
     overview:<UnifiedOverview {...common}/>, devices:<DevicesPage {...common}/>, calls:<Softphone {...common}/>,
-    messages:<Messages {...common}/>, esim:<Esim {...common}/>,
+    esim:<Esim {...common}/>,
     egress:<EgressPage {...common}/>,
     notifications:<NotificationsPage {...common}/>,
     settings:<SystemPage {...common}/>, diagnostics:<DiagnosticsPage {...common}/>,
@@ -234,7 +210,7 @@ export default function App() {
     <GlobalSoftphone instances={instances} excludedId={view === 'calls' ? sel?.id : null} showToast={showToast} />
     <aside className={`u-sidebar ${menuOpen?'open':''}`}>
       <div className="u-brand"><img src="/logo.svg" alt="" /><div>MDD Sim Gateway<small>{t('4G + VoWiFi unified')}</small></div></div>
-      <nav>{NAV.map(([key,label,icon])=><button key={key} className={view===key?'active':''} onClick={()=>{setView(key);setMenuOpen(false)}}><span>{icon}</span>{t(label)}{key==='diagnostics'&&!!systemMeta.host_alerts?.length&&<i className={`u-nav-dot ${systemMeta.host_alerts.some(a=>a.severity==='critical')?'critical':'warning'}`} title={t('The gateway host needs attention')}/>}{key==='messages'&&unreadTotal>0&&<span className="u-nav-count" aria-label={t('{count} unread',{count:unreadTotal})}>{unreadTotal>99?'99+':unreadTotal}</span>}</button>)}</nav>
+      <nav>{NAV.map(([key,label,icon])=><button key={key} className={view===key?'active':''} onClick={()=>{setView(key);setMenuOpen(false)}}><span>{icon}</span>{t(label)}{key==='diagnostics'&&!!systemMeta.host_alerts?.length&&<i className={`u-nav-dot ${systemMeta.host_alerts.some(a=>a.severity==='critical')?'critical':'warning'}`} title={t('The gateway host needs attention')}/>}</button>)}</nav>
       <div className="u-sidebar-foot"><div className="u-theme">{[['auto','◐'],['light','☀'],['dark','☾']].map(([k,x])=><button key={k} className={theme===k?'active':''} onClick={()=>setTheme(k)} title={t(k)}>{x}</button>)}</div><small>{discovering&&!devices.length?t('Detecting devices…'):`${devices.length} ${t(devices.length === 1 ? 'device' : 'devices')}`}</small><a className="u-feedback-link" href={issueUrl} target="_blank" rel="noreferrer"><span>◉</span>{t('Issues and suggestions')}<b>↗</b></a><div className="u-project-meta"><span className="u-version">{systemMeta.version ? `v${systemMeta.version}` : '—'}</span>{systemMeta.repository_url&&<a className="u-repo-actions" href={systemMeta.repository_url} target="_blank" rel="noreferrer">{t('Source code')}</a>}</div><button className="btn btn-ghost" onClick={async()=>{try{await api.authLogout()}finally{setCsrf('');setAuthState(s=>({...s,configured:true,authenticated:false,csrf:''}))}}}>{t('Sign out')}</button></div>
     </aside>
     <button className="u-menu" onClick={()=>setMenuOpen(!menuOpen)}>☰</button>

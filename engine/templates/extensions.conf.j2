@@ -63,24 +63,13 @@ same => n,TrySystem(/usr/local/bin/notify.py call_result in "${CALLPEER}" "${DIA
 same => n,Hangup()
 
 ; ===== Incoming SMS from the IMS/VoWiFi side =====
-
+; This build does not handle SMS, but the network still delivers it (receive_sms=yes keeps the
+; registration SMS-capable) and the SMSC waits for an RP-ACK. res_pjsip_messaging answers 200 and
+; sends that RP-ACK only when the message has somewhere to go in the dialplan; with no matching
+; extension it answers 404 and the SMSC keeps re-sending. So the message is routed here, where
+; nothing reads, logs or forwards it: no MESSAGE(from), no MESSAGE(body), no file, no event.
 [volte_ims_msg]
-exten => {{ any_extension }},1,NoOp(Incoming SMS from ${MESSAGE(from)})
-same => n,Set(NL=${BASE64_DECODE(Cg==)})
-same => n,Set(FILE(/logs/messages.txt,,,a)=IN SMS from ${MESSAGE(from)} at ${STRFTIME(${EPOCH},,%Y-%m-%d %H:%M:%S)}:${NL}${MESSAGE(body)}${NL}=====${NL})
-; Arguments 3-5 carry the concatenated-SMS segment triplet (ref/total/seq) that
-; res_pjsip_messaging exposes for a multi-part text (see patches/asterisk/mt_concat_udh.py).
-; They are EMPTY for an ordinary single-part SMS; the manager reassembles the parts.
-; Arguments 6-9 carry the PDU's own header: TP-PID, TP-DCS, the UDH IE area and the raw PDU.
-; They say whether this is a text at all — an 8-bit or SIM-addressed payload decodes to a
-; mojibake-looking string that must NOT reach the conversation view (control/app/sms_pdu.py).
-; Every one of them is a plain integer or lowercase hex, so nothing here can be shell-injected
-; from the network; an empty value keeps its argument position so the manager stays compatible
-; with an engine image built before the fields existed.
-same => n,TrySystem(/usr/local/bin/notify.py sms_in "${MESSAGE(from)}" "${BASE64_ENCODE(${MESSAGE(body)})}" "${MESSAGE_DATA(SMS_CONCAT_REF)}" "${MESSAGE_DATA(SMS_CONCAT_TOTAL)}" "${MESSAGE_DATA(SMS_CONCAT_SEQ)}" "${MESSAGE_DATA(SMS_TP_PID)}" "${MESSAGE_DATA(SMS_TP_DCS)}" "${MESSAGE_DATA(SMS_UDH_HEX)}" "${MESSAGE_DATA(SMS_TPDU_HEX)}" &)
-; The manager stores the text and the WebUI shows it from there. It is not also sent to the
-; browser softphone as a SIP MESSAGE: the softphone has no handler for one and answered every
-; such forward with 405 Method Not Allowed.
+exten => {{ any_extension }},1,NoOp(MT SMS acknowledged and discarded)
 same => n,Hangup()
 
 ; ===== Outgoing call from the authenticated browser softphone =====
@@ -111,15 +100,14 @@ same => n,TrySystem(/usr/local/bin/notify.py call_out "${EXTEN}" &)
 ; '#' must be percent-escaped again on the way out: PJSIP decoded it out of the inbound
 ; request URI, and an unescaped '#' would truncate the outbound URI's user part. A plain
 ; number contains no '#', so this is a no-op for ordinary calls. Log/notify keep raw ${EXTEN}.
-; Inheritable (leading _): the carrier leg needs to say WHICH code it is answering, and
-; a channel created by Dial() gets its own variable space otherwise.
-same => n,Set(_USSDPEER=${EXTEN})
+
+
 same => n,Set(DIALTARGET=${STRREPLACE(EXTEN,#,%23)})
 {% if invite_uri_params %}
 ; This line's carrier routes a call only with these request-URI parameters (T-Mobile US: 500
 ; "CC_IMS_TRY_NEXT_MGCF_FAIL" without user=phone), so the URI is spelled out here rather than
-; letting the endpoint build it. Only the INVITE carries them: SMS leaves through the endpoint
-; unchanged. ';' starts a comment in Asterisk configuration, hence the escaping.
+; letting the endpoint build it. ';' starts a comment in Asterisk configuration, hence the
+; escaping.
 same => n,Dial(PJSIP/volte_ims/sip:${DIALTARGET}@{{ realm }}\;{{ invite_uri_params | replace(";", "\\;") }},{{ ring_timeout }},b(ims-outbound-headers^s^1))
 {% else %}
 same => n,Dial(PJSIP/${DIALTARGET}@volte_ims,{{ ring_timeout }},b(ims-outbound-headers^s^1))
@@ -166,26 +154,9 @@ same => n,Return(${BY})
 
 [ims-outbound-headers]
 exten => s,1,Set(PJSIP_HEADER(add,P-Preferred-Identity)=<tel:{{ msisdn }}>)
-; A carrier answers a service code in the body of an in-dialog request — T-Mobile puts it on
-; the BYE — so ussd_body_capture.py writes USSD_RESPONSE onto THIS leg, the one talking to the
-; carrier. The 'h' handler runs on the CALLER's leg and cannot read another channel's
-; variables, which is why reporting it from there only ever produced an empty field. Push a
-; hangup handler onto this leg instead, so the payload is reported from where it lands.
-same => n,Set(CHANNEL(hangup_handler_push)=ussd-report,s,1)
 same => n,Return()
 
-[ussd-report]
-; Runs when the carrier leg is torn down, by which point the BYE that carried the payload has
-; already been processed. Ordinary calls reach here with USSD_RESPONSE empty and do nothing.
-exten => s,1,GotoIf($["${USSD_RESPONSE}" = ""]?done)
-same => n,TrySystem(/usr/local/bin/notify.py ussd "${USSDPEER}" "${BASE64_ENCODE(${USSD_RESPONSE})}" &)
-same => n(done),Return()
-
-; ===== Outgoing SMS from a local endpoint =====
+; ===== SIP MESSAGE from the browser softphone =====
+; Deliberately empty: this build sends no SMS. A MESSAGE from a local client finds no extension
+; here and is answered 404, instead of falling through to [from-local] and its Dial() logic.
 [msg-from-local]
-exten => {{ any_extension }},1,NoOp(Outgoing SMS to ${MESSAGE(to)})
-same => n,Set(NL=${BASE64_DECODE(Cg==)})
-same => n,Set(EXTEN=${CUT(CUT(MESSAGE(to),@,1),:,2)})
-same => n,Set(FILE(/logs/messages.txt,,,a)=OUT SMS to ${EXTEN} at ${STRFTIME(${EPOCH},,%Y-%m-%d %H:%M:%S)}:${NL}${MESSAGE(body)}${NL}=====${NL})
-same => n,TrySystem(/usr/local/bin/notify.py sms_out "${EXTEN}" "${BASE64_ENCODE(${MESSAGE(body)})}" &)
-same => n,MessageSend(pjsip:volte_ims/${EXTEN}@volte_ims,sip:{{ msisdn }}@{{ realm }},sip:${EXTEN}@volte_ims)

@@ -8,7 +8,7 @@ import { useI18n } from '../i18n.jsx'
 // Only lines whose physical reader is currently PRESENT are listed — a provisioned line
 // whose reader/card is unplugged is dropped from the list (its config stays under SIM
 // Config and it reappears when the reader returns).
-export default function SimSelector({ instances = [], cards = [], devices = [], selected, setSelected, unreadLines = {}, label = 'Active SIM / line' }) {
+export default function SimSelector({ instances = [], cards = [], devices = [], selected, setSelected, label = 'Active SIM / line' }) {
   const { t, language } = useI18n()
   // A modem can expose its physical SIM through ModemManager while its optional VoWiFi
   // PC/SC bridge has no card. Treat either source as live so 4G-only calls/SMS history
@@ -62,8 +62,7 @@ export default function SimSelector({ instances = [], cards = [], devices = [], 
           const active = String(i.id) === String(id)
           return <button key={i.id} type="button" className={`sim-picker-item${active ? ' active' : ''}`}
             aria-pressed={active} onClick={() => setSelected(i.id)}>
-            <span className="sim-picker-top"><strong>{name}</strong>
-              {!!unreadLines[i.id] && <i className="u-nav-dot critical" title={t('Unread messages')} aria-label={t('Unread messages')} />}</span>
+            <span className="sim-picker-top"><strong>{name}</strong></span>
             <span className="sim-picker-device">{model}</span>
             <span className="sim-picker-number">{i.msisdn || '—'}</span>
             {!!states.length && <span className="sim-picker-status">{states.map((state, index) =>

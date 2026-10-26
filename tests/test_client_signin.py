@@ -22,8 +22,7 @@ class ClientSignInTests(unittest.TestCase):
             patch.object(auth, "SESSIONS_PATH", path("sessions.json")),
             patch.object(clients, "CLIENTS_PATH", path("clients.json")),
             patch.object(main.cfg, "DATA_DIR", self.temp.name),
-            patch.multiple(store, DATA_DIR=self.temp.name, DB_PATH=path("history.sqlite"),
-                           PREVIOUS_DB_PATH=path("previous.sqlite")),
+            patch.multiple(store, DATA_DIR=self.temp.name, DB_PATH=path("history.sqlite")),
             patch.object(main.cfg, "get_settings", return_value={}),
             patch.object(main.cfg, "list_instances", return_value=[
                 {"id": "sim1", "name": "Work", "msisdn": "+61400000000", "enabled": True,

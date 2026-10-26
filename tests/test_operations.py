@@ -257,6 +257,8 @@ class OperationsTests(unittest.TestCase):
         events = "\n".join(json.dumps(r) for r in [
             {"instance": "sim1", "event": "call_result",
              "args": ["out", "+8615001007220", "CANCEL", "127"]},
+            {"instance": "sim1", "event": "call_out", "args": ["#225#"]},
+            # Written by an older engine; USSD is not part of this build.
             {"instance": "sim1", "event": "ussd", "args": ["#225#", "WW91ciBiYWxhbmNl"]},
             {"instance": "sim1", "event": "sms_in", "args": ["6700", "cHJpdmF0ZQ=="]},
         ])
@@ -274,6 +276,7 @@ class OperationsTests(unittest.TestCase):
         self.assertIn("<number>", captured)
         self.assertIn("#225#", captured)              # the code itself still diagnosable
         self.assertNotIn("sms_in", captured)          # message events are not call evidence
+        self.assertNotIn("ussd", captured)
 
     def test_support_bundle_keeps_the_hangup_side_but_nothing_else_in_its_slot(self):
         events = "\n".join(json.dumps(r) for r in [

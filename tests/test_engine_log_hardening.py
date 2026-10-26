@@ -91,7 +91,7 @@ class AsteriskModulePolicyTests(unittest.TestCase):
 
         self.assertIn("{% set any_extension = '_[!-~]!' %}", dialplan)
         self.assertNotIn("exten => _.,", dialplan)
-        self.assertEqual(dialplan.count("exten => {{ any_extension }},1"), 3)
+        self.assertEqual(dialplan.count("exten => {{ any_extension }},1"), 2)
 
     def test_private_resolve_fields_use_nodoc_registration(self):
         root = Path(__file__).resolve().parent.parent
@@ -182,114 +182,6 @@ class RegisteredIdentityLogTests(unittest.TestCase):
 
         self.assertEqual(first.returncode, 1)
         self.assertIn("prologue not found", first.stderr)
-
-
-class MoSubmitReportTests(unittest.TestCase):
-    """An RP-ACK/RP-ERROR is the SMSC reporting on a message we sent, not a message for us.
-
-    Both used to fall through to the "Unknown RP-DATA" branch and were then handed to the
-    messaging core with no TPDU, so every submitted segment filed one empty inbound SMS. They
-    must be answered (an unanswered report is repeated) and stop before the dialplan, while the
-    debug hex dump the control plane parses for the delivery verdict stays where it is.
-    """
-
-    PATCHER = (Path(__file__).resolve().parent.parent / "engine" / "patches" / "asterisk"
-               / "mo_submit_report.py")
-
-    SOURCE = (
-        "static void parse_rpdata(pjsip_rx_data *rdata, struct ast_msg *msg, int *ack_ref)\n"
-        "{\n"
-        "\tast_log(LOG_DEBUG, \"SMS RP-DATA '%s'.\\n\", buf2);\n"
-        "\tswitch (buf[0])\n"
-        "\t{\n"
-        "\tcase 0x01: {\n"
-        "\t\t*ack_ref = buf[1] & 0xff;\n"
-        "\t\treturn;\n"
-        "\t}\n"
-        "\tcase 0x03: /* RP-ACK */\n"
-        "\tcase 0x05: /* RP-ERROR */\n"
-        "\tdefault:\n"
-        "\t\tast_log(LOG_WARNING, \"Unknown RP-DATA 0x%02x. Dropping message\\n\", buf[0]);\n"
-        "\t\treturn;\n"
-        "\t}\n"
-        "}\n"
-        "\n"
-        "static pj_bool_t module_on_rx_request(pjsip_rx_data *rdata)\n"
-        "{\n"
-        "\tcode = rx_data_to_ast_msg(rdata, msg, is_sms, &ack_ref);\n"
-        "\tif (code != PJSIP_SC_OK) {\n"
-        "\t\tsend_response(rdata, code, NULL, NULL);\n"
-        "\t\tast_msg_destroy(msg);\n"
-        "\t\treturn PJ_TRUE;\n"
-        "\t}\n"
-        "\n"
-        "\tif (!ast_msg_has_destination(msg)) {\n"
-        "\t\treturn PJ_TRUE;\n"
-        "\t}\n"
-        "\n"
-        "\tif (!send_response(rdata, is_sms ? PJSIP_SC_OK : PJSIP_SC_ACCEPTED, NULL, NULL)) {\n"
-        "\t\tast_msg_queue(msg);\n"
-        "\t}\n"
-        "\n"
-        "\treturn PJ_TRUE;\n"
-        "}\n"
-    )
-
-    def _apply(self, source):
-        with tempfile.TemporaryDirectory() as temp:
-            target = Path(temp) / "res" / "res_pjsip_messaging.c"
-            target.parent.mkdir(parents=True)
-            target.write_text(source)
-            run = lambda: subprocess.run([sys.executable, str(self.PATCHER)],
-                                         env={**os.environ, "AST_SRC": temp},
-                                         capture_output=True, text=True)
-            first = run()
-            patched = target.read_text()
-            second = run()
-            return first, patched, target.read_text(), second
-
-    def test_a_submit_report_is_answered_but_never_reaches_the_dialplan(self):
-        first, patched, twice, second = self._apply(self.SOURCE)
-
-        self.assertEqual(first.returncode, 0, first.stderr)
-        # Both report types are recognised instead of sharing the unknown-type branch.
-        self.assertIn("SMS submit report: RP-ACK", patched)
-        self.assertIn("SMS submit report: RP-ERROR", patched)
-        # The refusal reason is only ever stated by the RP cause.
-        self.assertIn("RP cause %d", patched)
-        # Answered, then stopped: the messaging core never sees it.
-        self.assertIn("if (ack_ref == MDD_RP_SUBMIT_REPORT) {", patched)
-        report_at = patched.index("if (ack_ref == MDD_RP_SUBMIT_REPORT) {")
-        queue_at = patched.index("ast_msg_queue(msg);")
-        self.assertLess(report_at, queue_at,
-                        "the report must return before the message is queued")
-        self.assertLess(report_at, patched.index("ast_msg_has_destination"),
-                        "a report has no dialplan destination; it must leave before that check")
-        # It is answered rather than dropped, and its allocation is released.
-        stop = patched[report_at:patched.index("\n\tif (!ast_msg_has_destination", report_at)]
-        self.assertIn("send_response(rdata, PJSIP_SC_OK, NULL, NULL);", stop)
-        self.assertIn("ast_msg_destroy(msg);", stop)
-        # A genuinely unknown type keeps the original warning.
-        self.assertIn('Unknown RP-DATA 0x%02x. Dropping message', patched)
-        # Re-running the build must not stack a second copy.
-        self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(patched, twice)
-
-    def test_the_hex_dump_the_delivery_watcher_parses_is_left_alone(self):
-        # control/app/main.py turns 'sent' into 'delivered'/'failed' by parsing
-        # "parse_rpdata: SMS RP-DATA '<hex>'" out of the engine log. Removing or renaming it
-        # would silently strand every outbound message at 'sent'.
-        _, patched, _, _ = self._apply(self.SOURCE)
-        self.assertIn("static void parse_rpdata(", patched)
-        self.assertIn('ast_log(LOG_DEBUG, "SMS RP-DATA', patched)
-
-    def test_an_upstream_refactor_fails_the_build_instead_of_being_skipped(self):
-        first, patched, _, _ = self._apply(
-            self.SOURCE.replace("case 0x03: /* RP-ACK */\n", ""))
-
-        self.assertEqual(first.returncode, 1)
-        self.assertIn("not found", first.stderr)
-        self.assertNotIn("MDD_RP_SUBMIT_REPORT", patched)
 
 
 if __name__ == "__main__":
