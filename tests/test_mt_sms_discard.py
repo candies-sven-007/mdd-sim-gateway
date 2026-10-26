@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, patch
 from jinja2 import Environment, FileSystemLoader
 
 from control.app import main, store
+from tests.route_listing import api_routes
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES = ROOT / "engine" / "templates"
@@ -142,7 +143,7 @@ class ControlPlaneNeverSeesTheMessage(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(b"+447700900123", raw)
 
     def test_no_route_offers_messages(self):
-        paths = [getattr(route, "path", "") for route in main.app.routes]
+        paths = [getattr(route, "path", "") for route in api_routes(main.app)]
         for path in paths:
             self.assertIsNone(re.search(r"/(messages|sms|mms|ussd)(/|$)", path), path)
 

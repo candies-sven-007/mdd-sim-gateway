@@ -886,14 +886,6 @@ class ImeiSourceFollowsReaderTests(unittest.TestCase):
 class HardwareImeiRecoveryTests(unittest.TestCase):
     CARD = {"iccid": "8900000000000000001"}
 
-    def _resolve(self, inst):
-        with patch.object(main, "_device_for_card", return_value=("modem-a", "modem")), \
-                patch.object(main, "_device_identities",
-                             return_value={"modem-a": {"imei": ""}}), \
-                patch.object(main, "_match_instance_by_iccid", return_value=inst):
-            return main._hardware_imei_for_card(self.CARD, [self.CARD])
-
-
     def test_reader_rebuild_also_reuses_its_verified_line_snapshot(self):
         inst = {"imei": "123456789012345", "imei_source_device_id": "reader-a"}
         with patch.object(main, "_device_for_card", return_value=("reader-a", "reader")), \

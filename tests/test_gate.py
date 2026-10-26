@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from control.app import gate, main
+from control.app import auth
 
 SESSION = "valid-session-token"
 CSRF = "csrf-of-the-session"
@@ -23,7 +24,7 @@ def _headers(pairs):
 def http(path, method="GET", *, cookie=SESSION, headers=()):
     pairs = [("host", HOST)]
     if cookie:
-        pairs.append(("cookie", f"{main.auth.SESSION_COOKIE}={cookie}"))
+        pairs.append(("cookie", f"{auth.SESSION_COOKIE}={cookie}"))
     return {"type": "http", "path": path, "method": method, "client": ("192.0.2.10", 50000),
             "headers": _headers(pairs + list(headers))}
 
@@ -34,7 +35,7 @@ def websocket(path="/ws", *, cookie=SESSION, origin=ORIGIN, host=HOST, subprotoc
     if origin is not None:
         pairs.append(("origin", origin))
     if cookie:
-        pairs.append(("cookie", f"{main.auth.SESSION_COOKIE}={cookie}"))
+        pairs.append(("cookie", f"{auth.SESSION_COOKIE}={cookie}"))
     return {"type": "websocket", "path": path, "client": (peer, 50000),
             "subprotocols": list(subprotocols), "headers": _headers(pairs + list(headers))}
 
@@ -143,7 +144,7 @@ class HttpTests(GateTestCase):
                       "=nameless"):
             with self.subTest(other=other):
                 scope = http("/api/instances", cookie=None,
-                             headers=[("cookie", f"{other}; {main.auth.SESSION_COOKIE}={SESSION}")])
+                             headers=[("cookie", f"{other}; {auth.SESSION_COOKIE}={SESSION}")])
                 result = run(scope)
                 self.assertEqual(result.status, 200)
                 self.assertEqual(result.principal.kind, "admin")
@@ -196,7 +197,7 @@ class WebSocketTests(GateTestCase):
     def test_other_services_cookies_do_not_hide_the_sessions_socket(self):
         scope = websocket(cookie=None, headers=[
             ("cookie", f'other_app={{"x": 1}}; theme=dark mode; '
-                       f'{main.auth.SESSION_COOKIE}={SESSION}')])
+                       f'{auth.SESSION_COOKIE}={SESSION}')])
         self.assertEqual(run(scope).principal.kind, "admin")
 
     def test_signed_out_socket_is_closed_with_4401_after_accepting(self):

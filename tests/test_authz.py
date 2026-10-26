@@ -5,6 +5,7 @@ import unittest
 from starlette.routing import Route, WebSocketRoute
 
 from control.app import authz, gate, main
+from tests.route_listing import api_routes
 
 ADMIN = gate.Principal("admin", csrf="c", credential="session:k")
 # A kind of caller this build does not issue; it must get nothing.
@@ -14,7 +15,7 @@ CLIENT = gate.Principal("client", credential="client:3")
 def routes():
     """Every (method, example path) the application serves under /api/ or as a socket."""
     found = []
-    for route in main.app.routes:
+    for route in api_routes(main.app):
         # "1" fits a parameter whether a rule expects any segment or a numeric id.
         example = re.sub(r"\{[^}]+\}", "1", route.path)
         if isinstance(route, WebSocketRoute):
