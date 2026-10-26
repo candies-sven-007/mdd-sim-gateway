@@ -23,10 +23,11 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, usbreader, egress, device_state,
-               operations, sysinfo, failover, carrier_id, vowifi_support, gate, media, authz)
+               operations, sysinfo, carrier_id, vowifi_support, gate, media, authz)
 from . import state as app_state
 from .routers import auth as auth_routes
 from .routers import egress as egress_routes
+from .routers import engine as engine_routes
 from .routers import esim as esim_routes
 from .routers import logs as logs_routes
 from .routers import softphone as softphone_routes
@@ -35,15 +36,6 @@ from .routers import system as system_routes
 STATUS_OK_GRACE_SECONDS = 20
 STATUS_POLL_FAST_SECONDS = 4.0
 STATUS_POLL_HEALTHY_SECONDS = 15.0
-# Once Asterisk has completed its own bounded REGISTER transaction and explicitly reports no
-# response, another two minutes of same-session retries cannot repair the stale carrier-side
-# P-CSCF/ESP state.  Rebuild promptly, but leave enough time for the diagnostic worker to capture
-# and remove the expected container generation before auto-start runs.  Per-line rate limiting
-# prevents a broken carrier from turning this fast path into a rebuild loop.
-REG_UNANSWERED_RECOVERY_DELAY_SECONDS = float(
-    os.environ.get("MDD_REG_UNANSWERED_RECOVERY_DELAY", "10"))
-REG_UNANSWERED_MIN_INTERVAL_SECONDS = float(
-    os.environ.get("MDD_REG_UNANSWERED_MIN_INTERVAL", "300"))
 # Number portability is a rare administrative event. Verification re-reads the public identity
 # from the registrations the line makes anyway, so it costs one log read; a six-hour cadence
 # detects a change promptly without re-reading every healthy line's log every ten minutes.
@@ -195,28 +187,6 @@ async def _on_card_insert(name, idx):
         asyncio.create_task(app_state._auto_start_hotplugged_line(str(info["matched"])))
 
 
-def _line_auto_start_allowed(inst: dict) -> tuple[bool, str]:
-    """Whether background maintenance may create this line's engine right now.
-
-    A saved line is not proof that its SIM is inserted: offline lines deliberately remain in
-    config so their history and settings survive.  Every non-interactive start/recovery must
-    therefore re-check the live card monitor and the physical device's VoWiFi desired state.
-    Explicit user starts keep their existing PIN/card preflight and actionable API errors.
-    A reader's VoWiFi switch is the line's ``enabled`` flag.
-    """
-    if not inst.get("enabled", True):
-        return False, "line_disabled"
-    iid = str(inst.get("id") or "")
-    iccid = str(inst.get("iccid") or "")
-    cards = app_state.hub.cards_list()
-    card_info = next((item for item in cards if item.get("present") and (
-        (iccid and str(item.get("iccid") or "") == iccid)
-        or str(item.get("matched") or "") == iid)), None)
-    if card_info is None:
-        return False, "no_card"
-    return True, ""
-
-
 _DRAFT_FIELD_KEYS = {"IMSI": "imsi", "MCC/MNC": "mcc_mnc", "IMEI": "imei", "SIM PIN": "pin"}
 
 
@@ -346,7 +316,7 @@ async def _on_card_remove(entry: dict, reader_unplugged: bool = False) -> bool:
                                    else "No SIM card (removed)",
                           "reason_code": "no_card", "reason": "SIM card is not available.",
                           "detail": {}}
-        stopped_status = _with_status_activity(str(target["id"]), stopped_status)
+        stopped_status = app_state._with_status_activity(str(target["id"]), stopped_status)
         app_state.hub.status_cache[str(target["id"])] = stopped_status
         app_state.hub.status_sampled_at[str(target["id"])] = time.monotonic()
         await app_state.hub.broadcast({"type": "status", "instance": str(target["id"]),
@@ -971,189 +941,6 @@ def _sustained_alerts(alerts: list[dict], streaks: dict[str, int]) -> list[dict]
     return kept
 
 
-def _save_exit_ledgers() -> None:
-    path = app_state._exit_ledger_path()
-    try:
-        temporary = path + ".tmp"
-        with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(app_state.hub.exit_ledgers, handle)
-        os.replace(temporary, path)
-    except OSError as exc:
-        log.debug("cannot persist exit failover ledger: %r", exc)
-
-
-def _peer_line_registered(iid: str, country: str) -> bool:
-    """Whether another line of the same country is registered right now.
-
-    Lines of one country share one exit. A registered peer is living proof the exit can carry
-    IMS — and a tunnel that moving the exit would tear down, which is the disruption this
-    design exists to avoid. While one holds, eviction is off the table.
-    """
-    if not country:
-        return False
-    for other in cfg.list_instances():
-        oid = str(other.get("id") or "")
-        if oid == str(iid) or not other.get("enabled", True):
-            continue
-        if egress.line_country(other) != country:
-            continue
-        if (app_state.hub.status_cache.get(oid) or {}).get("state") == "OK":
-            return True
-    return False
-
-
-def _distinct_cards_present() -> int:
-    """How many different SIMs this host can currently see.
-
-    Decides only how a SW=9862 is worded, so an unreadable cache falls back to the cautious
-    plural reading rather than asserting a single-SIM host that may not be one.
-    """
-    try:
-        return len({str(entry.get("iccid") or "")
-                    for entry in app_state.hub.cards.values() if entry.get("iccid")}) or 2
-    except Exception:  # noqa - the card cache is a hint here, never the decision itself
-        return 2
-
-
-def _local_card_fault(iid: str, inst: dict) -> str:
-    """Why this line's own reader binding, not its exit, explains the freeze — or "".
-
-    No exit node can make a line open the wrong SIM, yet that failure arrives looking exactly
-    like one the exit caused: the tunnel comes up, IMS registration is rejected, and the freeze
-    lands on the failover path. Attributed to the exit it walks the whole candidate pool and
-    tears down sibling lines' working tunnels, while the real fault — a reader binding pointing
-    at another line's card — sits untouched and unmentioned for as long as anyone is willing to
-    watch containers rebuild. Checked before classify() so the exit is never blamed for it.
-    """
-    pin = engine.read_run_json(iid, "pin_status.json") or {}
-    swu = engine.read_run_json(iid, "swu_status.json") or {}
-    usim = engine.read_run_json(iid, "usim_status.json") or {}
-    # pin_keeper, ami_usim and swu_ike each check the card they were handed, so any of the three
-    # can be the one that caught it.
-    if "WRONG_CARD" in (pin.get("state"), usim.get("state"), swu.get("state")):
-        detail = str(pin.get("detail") or usim.get("detail") or "").strip()
-        if not detail and swu.get("iccid"):
-            detail = f"the tunnel reader holds ICCID {swu['iccid']}"
-        return detail or "the bound reader holds another line's SIM"
-    # A reader NAME that differs from the stored one is not by itself a fault. The USB-port
-    # binding exists precisely so a line keeps opening the reader that physically holds its SIM
-    # after pcscd renames or re-enumerates it. When the card in that reader identified itself as
-    # this line's, the name is settled evidence of nothing and must not be second-guessed:
-    # treating it as a fault would hold the line forever and, worse, silently disable exit
-    # failover for a line whose real problem is its exit. The name only speaks when the card
-    # would not — which is exactly the case the check was added for.
-    card_iccid = str(pin.get("iccid") or "").strip()
-    line_iccid = str(inst.get("iccid") or "").strip()
-    card_confirmed = bool(card_iccid and line_iccid and card_iccid == line_iccid)
-    # Only full PC/SC names are comparable: legacy numeric indexes and imsi:/iccid: specs name
-    # a search, not a slot.
-    bound = str(inst.get("pin_reader") or "").strip()
-    opened = str(pin.get("reader") or "").strip()
-    comparable = bound and not bound.isdigit() and not bound.startswith(("imsi:", "iccid:"))
-    if not card_confirmed and comparable and opened and opened != bound:
-        return f"the engine opened {opened!r} but this line is bound to {bound!r}"
-    # SW=9862 is "incorrect MAC": the card computed a different response to the carrier's AKA
-    # challenge than the network expected. Which cause that points at depends on how many SIMs
-    # the host can even see — a mix-up is physically impossible with one, and naming it anyway
-    # sends the operator to the hardware when the answer is on the carrier's side.
-    if "9862" in str(usim.get("detail") or ""):
-        if _distinct_cards_present() > 1:
-            return ("USIM AUTHENTICATE returned SW=9862 (incorrect MAC) — with more than one "
-                    "SIM on this host, the reader is most likely holding another line's SIM")
-        return ("USIM AUTHENTICATE returned SW=9862 (incorrect MAC) — the carrier rejected "
-                "this SIM's key material; on a single-SIM host that points at provisioning "
-                "or subscription, not at a reader mix-up")
-    return ""
-
-
-def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> str:
-    """Attribute one line freeze and act on it: hold, move the exit, back off, or stop.
-
-    Runs on the freeze path only, so reading the tunnel's own evidence here costs nothing in
-    the steady state. Both reads are deliberately cheap — the full diagnostic snapshot is
-    captured separately and must not be on this decision's critical path.
-    """
-    iid = str(iid)
-    local = _local_card_fault(iid, inst)
-    if local:
-        log.warning("line %s froze (%s): %s — a local binding fault, not evidence against "
-                    "this line's exit", iid, st.get("reason_code"), local)
-        return failover.HOLD
-    country = egress.line_country(inst)
-    exits = (egress.status().get("exits") or {}).get(country) or {}
-    if (not cfg.get_settings().get("proxy", {}).get("enabled", False)
-            or exits.get("mode") != "subscription"):
-        # Direct, single-node and disabled routes have no pool to walk, so a ledger for them
-        # is stale by definition.
-        if app_state.hub.exit_ledgers.pop(iid, None) is not None:
-            _save_exit_ledgers()
-        return failover.HOLD
-    if not exits.get("node"):
-        # A subscription exit whose node is momentarily unknown: the host blanks it on every
-        # status cycle until the Clash API answers, so a slow query or a sing-box restart
-        # leaves it empty for one cycle. That says nothing about the exit — keep the walk
-        # (tried, exhausted, given_up) intact and judge again on the next freeze.
-        return failover.HOLD
-    node = str(exits.get("node") or "")
-    candidates = [str(name) for name in (exits.get("candidates") or [])]
-    pinned = exits.get("selection") == "manual"
-    peer_registered = _peer_line_registered(iid, country)
-    swu, retransmits = "", None
-    try:
-        swu = (engine.read_run_json(iid, "swu_status.json") or {}).get("state") or ""
-    except Exception as exc:  # noqa
-        log.debug("cannot read tunnel evidence for line %s: %r", iid, exc)
-    try:
-        evidence = engine.ike_evidence(iid) or {}
-        if evidence.get("available", True) and evidence.get("retransmits") is not None:
-            retransmits = int(evidence["retransmits"])
-    except Exception as exc:
-        log.debug("cannot read IKE evidence for line %s: %r", iid, exc)
-    verdict = failover.classify(swu, retransmits, stable_for,
-                                egress.RESELECT_MIN_STABLE_SECONDS,
-                                reason_code=st.get("reason_code") or "unknown")
-    was_backing_off = bool((app_state.hub.exit_ledgers.get(iid) or {}).get("exhausted"))
-    action, ledger = failover.record(app_state.hub.exit_ledgers.get(iid), verdict, node,
-                                     pinned, candidates, peer_registered=peer_registered)
-    app_state.hub.exit_ledgers[iid] = ledger
-    _save_exit_ledgers()
-    log.info("line %s froze (%s) after %.0fs healthy; tunnel=%s ike_retransmits=%s "
-             "-> blames %s, action %s (node=%s strikes=%d tried=%d/%d peer=%s)",
-             iid, st.get("reason_code"), stable_for, swu or "unknown", retransmits,
-             verdict, action, node or "unknown", ledger.get("strikes") or 0,
-             len(ledger.get("tried") or []), len(candidates), peer_registered)
-    if action == failover.SWITCH:
-        try:
-            egress.request_reselect(inst, f"health-freeze:{st['reason_code']}",
-                                    stable_for=stable_for)
-        except Exception as exc:  # noqa
-            log.warning("exit reselect request failed for line %s: %s", iid, exc)
-    elif verdict == failover.BLAMES_EXIT and not peer_registered and country:
-        # The exit is at fault and we are NOT moving off it — either the strike count is still
-        # short, the pool is exhausted, or the node is pinned. Holding is right, but it leaves
-        # one recoverable failure unattended: a sing-box session whose outbound died is kept
-        # alive by this line's own IKE retransmits (each one refreshes the idle timer), so the
-        # rebuild loop feeds packets to a connection that can never answer and the line never
-        # recovers on its own. Ask the host to close that country's sessions so the next
-        # attempt dials afresh.
-        #
-        # Safe by construction against the failover principles: it changes no node, respects a
-        # pin, and the peer check above means no sibling line is registered over this exit, so
-        # nothing that currently works is torn down.
-        try:
-            egress.report_stalled_exit(country, node, f"health-freeze:{st['reason_code']}", iid)
-        except Exception as exc:  # noqa
-            log.debug("stalled-exit report failed for line %s: %r", iid, exc)
-    # Independent of the branch above, not an alternative to it: closing dead sessions and
-    # telling the operator the line is stuck are different jobs, and a backed-off line needs
-    # both. (Chaining this onto the same if/elif silently swallowed the notification.)
-    if action in (failover.GIVE_UP, failover.REPORT) or (
-            action == failover.BACK_OFF and not was_backing_off):
-        text = failover.summarise(ledger, action, country, pinned)
-        log.warning("line %s: %s", iid, text)
-    return action
-
-
 async def _poll_instance_status(inst: dict) -> None:
     """Sample one line in the background; slow carrier state never blocks HTTP pages."""
     iid = str(inst["id"])
@@ -1177,7 +964,7 @@ async def _poll_instance_status(inst: dict) -> None:
                     await asyncio.to_thread(engine.stop, iid)
                     await app_state.hub.drop_ami(iid)
                 app_state.hub.reset_health(iid, "line_disabled")
-                stopped = _with_status_activity(iid, {
+                stopped = app_state._with_status_activity(iid, {
                     "state": "STOPPED", "label": status_mod.LABELS["STOPPED"],
                     "reason_code": "stopped", "reason": "Stopped.", "detail": {},
                     "retry": {"count": 0, "max": 0}})
@@ -1210,8 +997,8 @@ async def _poll_instance_status(inst: dict) -> None:
         elif st["state"] == "OK":
             asyncio.create_task(_verify_ims_msisdn(iid, inst))
 
-        st = _with_status_activity(
-            iid, apply_health(iid, inst, st, runtime.get("container_id")))
+        st = app_state._with_status_activity(
+            iid, app_state.apply_health(iid, inst, st, runtime.get("container_id")))
         app_state.hub.status_cache[iid] = st
         if held_previous and previous_sampled_at is not None:
             # apply_health(OK) clears health and its related cache bookkeeping. Restore the
@@ -1236,349 +1023,12 @@ def _cached_line_status(inst: dict) -> dict:
     if cached and (inst.get("enabled", True) or cached.get("state") == "STOPPED"):
         return dict(cached)
     if not inst.get("enabled", True):
-        return _with_status_activity(iid, {
+        return app_state._with_status_activity(iid, {
             "state": "STOPPED", "label": status_mod.LABELS["STOPPED"],
             "reason_code": "stopped", "reason": "Stopped.", "detail": {}})
-    return _with_status_activity(iid, {
+    return app_state._with_status_activity(iid, {
         "state": "REGISTERING", "label": status_mod.LABELS["REGISTERING"],
         "reason_code": "registering", "reason": "Refreshing line status…", "detail": {}})
-
-
-def _with_status_activity(iid: str, st: dict) -> dict:
-    """Explain the status machine in user terms: now, why, and what happens next."""
-    st = dict(st)
-    state = str(st.get("state") or "").upper()
-    detail = st.get("detail") or {}
-    retry = st.get("retry") or {}
-    health = app_state.hub.health_for(str(iid))
-    retrying = bool(health.get("auto_retrying"))
-    remaining = st.get("automatic_retry_in")
-
-    if retrying:
-        current = "Rebuilding the VoWiFi line automatically"
-        next_action = "The SIM will be read again, then ePDG and IMS will reconnect."
-    elif st.get("frozen") and remaining:
-        current = "Automatic recovery is waiting"
-        next_action = "The VoWiFi line will be rebuilt in {seconds} seconds."
-    elif st.get("frozen"):
-        current = st.get("reason") or "Waiting for manual attention"
-        next_action = ("Verify the SIM PIN before automatic setup can continue."
-                       if str(st.get("reason_code") or "").startswith("pin_")
-                       else "Restart the line after resolving the reported problem.")
-    elif state == "OK":
-        current = "IMS is registered and the line is being monitored"
-        next_action = "Automatic recovery will run if the connection is lost."
-    elif state == "STOPPED":
-        current = "The VoWiFi line is stopped"
-        next_action = "Enable VoWiFi to start the line."
-    elif state == "NO_CARD":
-        current = "Waiting for the SIM card"
-        next_action = "Insert the SIM card to continue automatically."
-    elif state == "PIN_PROBLEM":
-        current = "Waiting for SIM PIN attention"
-        next_action = "Verify the SIM PIN before automatic setup can continue."
-    elif state == "EPDG_UNRESOLVED":
-        current = "Resolving the carrier ePDG gateway"
-        next_action = "The backend will retry automatically."
-    elif state == "TUNNEL_DOWN":
-        current = "Establishing the secure ePDG tunnel"
-        next_action = "If the tunnel remains unavailable, the line will be rebuilt automatically."
-    elif state == "REGISTERING" and detail.get("pcscf"):
-        current = "Contacting the carrier IMS through P-CSCF"
-        next_action = "If IMS remains unavailable, the ePDG session will be rebuilt automatically."
-    elif state == "REGISTERING":
-        current = "Waiting for carrier P-CSCF discovery"
-        next_action = "IMS registration starts automatically after discovery."
-    else:
-        current = st.get("label") or "Checking the VoWiFi line"
-        next_action = "The backend will keep monitoring the line."
-
-    st["activity"] = {
-        "current": current,
-        "next": next_action,
-        "automatic": (state not in {"STOPPED", "NO_CARD", "PIN_PROBLEM"}
-                      and not (st.get("frozen") and not remaining)),
-        "retry_count": int(retry.get("count") or 0),
-        "retry_max": int(retry.get("max") or 0),
-        "seconds": int(remaining or 0),
-    }
-    return st
-
-
-def _frozen(h, st, rmax):
-    remaining = max(0, int((h.get("next_retry_at") or 0) - time.monotonic()))
-    return {"state": "ERROR", "label": status_mod.LABELS["ERROR"],
-            "reason_code": h["frozen_code"], "reason": h["frozen_reason"],
-            "detail": st.get("detail", {}), "retry": {"count": rmax, "max": rmax},
-            "frozen": True, "automatic_retry_in": remaining or None}
-
-
-def _recovery_failure_code(exc: Exception) -> str:
-    """Reduce arbitrary start errors to a support-safe closed reason code."""
-    detail = getattr(exc, "detail", None)
-    if isinstance(detail, dict):
-        code = str(detail.get("code") or "")
-        if engine.valid_lifecycle_reason(code):
-            return code
-    if isinstance(exc, egress.EgressError):
-        return "egress_unavailable"
-    return "engine_start_failed"
-
-
-async def _auto_recover_instance(iid: str, inst: dict, delay: int):
-    h = app_state.hub.health_for(iid)
-    try:
-        allowed, blocked_reason = _line_auto_start_allowed(inst)
-        if not allowed:
-            no_card = blocked_reason == "no_card"
-            if no_card:
-                # Card discovery is a sampled cache, not an authoritative removal event. A
-                # native reader can briefly lose its ICCID/match while pcscd settles after the
-                # health policy removes the old container. Clearing the frozen state here made
-                # that one missed sample terminal: the ordinary poller then saw only STOPPED
-                # and had no recovery timer left to recreate the line. A real card-removal
-                # event still cancels recovery in _on_card_remove(); this path merely re-arms
-                # the cheap eligibility check until the cache identifies the card again.
-                h["auto_retrying"] = False
-                h["next_retry_at"] = time.monotonic() + delay
-                h["frozen_reason"] = (
-                    "The SIM card is temporarily unavailable; automatic recovery will retry.")
-                if h.get("last_blocked_reason") != "no_card":
-                    app_state._record_lifecycle(
-                        iid, "recovery_blocked", "no_card", retry_count=h.get("retry_count"),
-                        delay_seconds=delay, card_present=False)
-                h["last_blocked_reason"] = "no_card"
-            else:
-                # A disabled line or VoWiFi switch is durable user intent, unlike a transient
-                # card-cache miss. It must cancel a pending automatic start.
-                app_state._record_lifecycle(
-                    iid, "recovery_cancelled", blocked_reason,
-                    retry_count=h.get("retry_count"), card_present=True)
-                app_state.hub.reset_health(iid, None)
-            stopped = _with_status_activity(iid, {
-                "state": "NO_CARD" if no_card else "STOPPED",
-                "label": "No SIM card" if no_card else status_mod.LABELS["STOPPED"],
-                "reason_code": blocked_reason,
-                "reason": ("SIM card is not available." if no_card
-                           else "The line or its device VoWiFi switch is disabled."),
-                "detail": {}, "retry": {
-                    "count": h.get("retry_count", 0) if no_card else 0,
-                    "max": h.get("retry_count", 0) if no_card else 0,
-                }})
-            app_state.hub.status_cache[str(iid)] = stopped
-            app_state.hub.status_sampled_at[str(iid)] = time.monotonic()
-            await app_state.hub.broadcast({"type": "status", "instance": str(iid), **stopped})
-            return
-        h["last_blocked_reason"] = None
-        app_state._record_lifecycle(
-            iid, "recovery_started", h.get("frozen_code") or "unhealthy",
-            retry_count=h.get("retry_count"), card_present=True)
-        recovering = _with_status_activity(iid, {
-            "state": "REGISTERING", "label": status_mod.LABELS["REGISTERING"],
-            "reason_code": h.get("frozen_code") or "registering",
-            "reason": h.get("frozen_reason") or "Automatic recovery is rebuilding the line.",
-            "detail": {}, "retry": {"count": 0, "max": 0}})
-        app_state.hub.status_cache[str(iid)] = recovering
-        app_state.hub.status_sampled_at[str(iid)] = time.monotonic()
-        await app_state.hub.broadcast({"type": "status", "instance": str(iid), **recovering})
-        await asyncio.to_thread(
-            app_state._start_engine_checked, inst, cfg.get_settings(),
-            os.environ.get("MDD_DEV_MOUNTS", "") == "1",
-            # Records why the health policy gave up on the previous container, so the captured
-            # snapshot explains itself without cross-referencing the journal.
-            f"auto-recover:{h.get('frozen_code') or 'unhealthy'}")
-        recovered_reason = h.get("frozen_code") or "unhealthy"
-        app_state.hub.reset_health(iid, None)
-        app_state._record_lifecycle(iid, "recovery_succeeded", recovered_reason, card_present=True)
-        starting = _with_status_activity(iid, {
-            "state": "REGISTERING", "label": status_mod.LABELS["REGISTERING"],
-            "reason_code": "registering", "reason": "The line was rebuilt successfully.",
-            "detail": {}, "retry": {"count": 0, "max": 0}})
-        app_state.hub.status_cache[str(iid)] = starting
-        app_state.hub.status_sampled_at[str(iid)] = time.monotonic()
-        await app_state.hub.broadcast({"type": "status", "instance": str(iid), **starting})
-    except Exception as exc:
-        h["auto_retrying"] = False
-        h["next_retry_at"] = time.monotonic() + delay
-        h["frozen_reason"] = str(getattr(exc, "detail", exc))
-        code = _recovery_failure_code(exc)
-        detail = getattr(exc, "detail", None)
-        source_matches = None
-        if code == "hardware_imei_required" and isinstance(detail, dict):
-            saved_source = str(inst.get("imei_source_device_id") or "")
-            failed_source = str(detail.get("device_id") or "")
-            source_matches = bool(saved_source and failed_source
-                                  and saved_source == failed_source)
-        h["last_blocked_reason"] = None
-        app_state._record_lifecycle(
-            iid, "recovery_failed", code, retry_count=h.get("retry_count"),
-            delay_seconds=delay, card_present=True, imei_valid=False
-            if code == "hardware_imei_required" else None,
-            imei_source_matches=source_matches)
-
-
-def apply_health(iid, inst, st, container_id: str | None = None):
-    """Overlay bounded auto-retry state. After max attempts of continuous failure (with the
-    SIM still present) the engine is stopped and the status frozen to ERROR + reason, until
-    the user retries/re-provisions or the card is re-inserted."""
-    rcfg = inst.get("retry") or cfg.get_settings().get("retry", {})
-    rmax = max(1, int(rcfg.get("max", 3)))
-    rint = max(5, int(rcfg.get("interval", 40)))
-    h = app_state.hub.health_for(iid)
-    state = st["state"]
-    now = time.monotonic()
-
-    if not inst.get("enabled", True):
-        app_state.hub.reset_health(iid, "line_disabled")
-        return {"state": "STOPPED", "label": status_mod.LABELS["STOPPED"],
-                "reason_code": "stopped", "reason": "Stopped.", "detail": {},
-                "retry": {"count": 0, "max": rmax}}
-
-    if state == "OK":
-        # Set once per healthy stretch: this is when the current exit last proved it can
-        # carry IMS, and reset_health() below would otherwise lose it.
-        app_state.hub.ok_since.setdefault(str(iid), time.monotonic())
-        # A registration proves the current exit works, so nothing the ledger holds against it
-        # still stands. Clearing here is also what lets a reported line report again later.
-        if app_state.hub.exit_ledgers.pop(str(iid), None) is not None:
-            _save_exit_ledgers()
-        app_state.hub.reset_health(iid, "line_recovered")
-        st["retry"] = {"count": 0, "max": rmax}
-        return st
-    if h.get("frozen_code"):
-        # PIN/PUK failures require a person. Network, tunnel and IMS failures recover after a
-        # cooldown so a brief carrier rejection never leaves WiFi Calling stopped forever.
-        if (h.get("frozen_code") not in {"pin_wrong", "pin_blocked", "pin_required"}
-                and time.monotonic() >= (h.get("next_retry_at") or float("inf"))
-                and not h.get("auto_retrying")):
-            h["auto_retrying"] = True
-            asyncio.create_task(_auto_recover_instance(iid, inst, max(60, rint * 4)))
-        return _frozen(h, st, rmax)
-    if state == "STOPPED":
-        st["retry"] = {"count": 0, "max": rmax}
-        return st
-    if state == "NO_CARD":
-        # SIM removed/absent -> handled by the card monitor; don't count as a retry.
-        h["fail_start"] = None
-        h["retry_count"] = 0
-        st["retry"] = {"count": 0, "max": rmax}
-        return st
-    if state == "EPDG_UNRESOLVED":
-        support = vowifi_support.for_instance(inst)
-        if support["source"] == "carrier_table":
-            # The user chose to try a carrier that does not offer Wi-Fi Calling. Retrying on
-            # a timer only repeats the same DNS answer; stop and say why. Only the carrier
-            # table is trusted this far: a missing DNS answer can also be an outage.
-            h["frozen_code"] = st["reason_code"]
-            h["frozen_reason"] = support["reason"]
-            h["next_retry_at"] = None
-            app_state._record_lifecycle(iid, "recovery_cancelled", "carrier_unsupported",
-                              retry_count=h.get("retry_count"), card_present=True)
-            asyncio.create_task(asyncio.to_thread(
-                engine.capture_and_stop, iid, inst, "health-freeze:carrier_unsupported",
-                container_id))
-            asyncio.create_task(app_state.hub.drop_ami(str(iid)))
-            return _frozen(h, st, rmax)
-    if state == "PIN_PROBLEM":
-        # wrong/blocked PIN won't recover by retrying — surface immediately.
-        h["frozen_code"] = st["reason_code"]
-        h["frozen_reason"] = st["reason"]
-        h["next_retry_at"] = None
-        app_state._record_lifecycle(
-            iid, "recovery_cancelled", st["reason_code"],
-            retry_count=h.get("retry_count"), card_present=True)
-        return _frozen(h, st, rmax)
-
-    # Asterisk has already spent a complete SIP transaction proving that this established
-    # P-CSCF session no longer answers.  If AMI also proves no call is active, skip the generic
-    # retry budget and rebuild the exact container generation.  Missing logs, missing AMI, an
-    # active call, a missing generation, or the rate limiter all fall through unchanged.
-    fast_unanswered = False
-    if (st.get("reason_code") == "reg_unanswered"
-            and (st.get("detail") or {}).get("active_channels") == 0
-            and container_id):
-        last_fast = app_state.hub.reg_unanswered_recovery_at.get(str(iid), float("-inf"))
-        if now - last_fast >= REG_UNANSWERED_MIN_INTERVAL_SECONDS:
-            fast_unanswered = True
-            app_state.hub.reg_unanswered_recovery_at[str(iid)] = now
-            # Reuse the established freeze/capture/failover path below.  Backdating fail_start
-            # makes this observation exhaust only this reason's retry budget immediately.
-            h["fail_start"] = now - (rmax * rint)
-            log.warning("line %s IMS registration is unanswered with no active channels; "
-                        "fast recovery will rebuild container generation %s", iid,
-                        str(container_id)[:12])
-
-    # EPDG_UNRESOLVED / TUNNEL_DOWN / REGISTERING -> the engine keeps retrying internally;
-    # we bound the total time and then give up.
-    if h["fail_start"] is None:
-        h["fail_start"] = now
-    elapsed = now - h["fail_start"]
-    count = min(rmax, int(elapsed // rint) + 1)
-    h["retry_count"] = count
-    if elapsed >= rmax * rint:
-        h["frozen_code"] = st["reason_code"]
-        h["frozen_reason"] = st["reason"]
-        # A connected tunnel with an unresponsive IMS/P-CSCF is commonly one bad carrier
-        # session or endpoint. Re-establish it after one normal retry interval so discovery can
-        # return a healthy P-CSCF; keep the long cooldown for auth/network/provisioning failures
-        # to avoid hammering the carrier.
-        if fast_unanswered:
-            cooldown = max(1.0, REG_UNANSWERED_RECOVERY_DELAY_SECONDS)
-        else:
-            cooldown = (max(20, rint) if st["reason_code"] == "registering"
-                        else max(60, rint * 4))
-        h["next_retry_at"] = now + cooldown
-        # Capture before removal, off the event loop: reading the container's logs and asking
-        # Asterisk for its registration state both block, and the cooldown leaves ample time
-        # before the rebuild. Any failure here still leaves the container for stop() to remove.
-        asyncio.create_task(asyncio.to_thread(
-            engine.capture_and_stop, iid, inst, f"health-freeze:{st['reason_code']}",
-            container_id))
-        # Giving up on a line is a signal that its exit node may be the problem — but only
-        # when the line never worked on it. A node that carried a registered line for a long
-        # time and then broke is being blamed for something else (a carrier-side problem, or
-        # a rekey that a marginal path failed to survive), and moving the exit costs another
-        # tunnel teardown while changing nothing. Blaming it also evicts a node the operator
-        # deliberately pinned.
-        stable_for = max(0.0, time.monotonic() - app_state.hub.ok_since.pop(str(iid), time.monotonic()))
-        try:
-            action = _judge_exit_failure(str(iid), inst, st, stable_for)
-        except Exception as exc:  # noqa
-            log.warning("exit failover judgement failed for line %s: %s", iid, exc)
-            action = failover.HOLD
-        exit_gave_up = (action == failover.GIVE_UP
-                        or bool((app_state.hub.exit_ledgers.get(str(iid)) or {}).get("given_up")))
-        if exit_gave_up:
-            # Stop the automatic rebuild the same way a PIN problem does: the operator pinned
-            # this exit and it has had its chances, so rebuilding again is pure churn. A
-            # person (or a successful start) clears this.
-            h["next_retry_at"] = None
-        elif action == failover.BACK_OFF:
-            # Every exit failed the same way, which points upstream of the nodes — a host-side
-            # outage, a dead subscription. Those pass, so instead of stopping (or churning
-            # every few minutes) the line re-tests its exit on a slow cadence and registers
-            # by itself when the outside world comes back.
-            h["next_retry_at"] = now + failover.EXHAUSTED_RETRY_SECONDS
-        # The SIP code that condemned a reg_rejected line (403 vs 5xx points at completely
-        # different fixes) is only in the status detail at this moment; issue #33 shipped a
-        # bundle where it had already rotated out of every log, so persist it with the record.
-        frozen_sip_status = (st.get("detail") or {}).get("sip_status")
-        if h.get("next_retry_at") is not None:
-            app_state._record_lifecycle(
-                iid, "recovery_scheduled", h.get("frozen_code") or "unhealthy",
-                retry_count=h.get("retry_count"),
-                delay_seconds=max(0, int(h["next_retry_at"] - now)),
-                sip_status=frozen_sip_status)
-        else:
-            app_state._record_lifecycle(
-                iid, "recovery_cancelled", "exit_give_up" if exit_gave_up else
-                (h.get("frozen_code") or "unhealthy"),
-                retry_count=h.get("retry_count"),
-                sip_status=frozen_sip_status)
-        asyncio.create_task(app_state.hub.drop_ami(str(iid)))
-        return _frozen(h, st, rmax)
-    st["retry"] = {"count": count, "max": rmax}
-    return st
 
 
 @asynccontextmanager
@@ -1624,6 +1074,7 @@ app = FastAPI(title="MDD Sim Gateway", lifespan=lifespan)
 # Authentication for every API request and WebSocket handshake; see gate.py.
 app.add_middleware(gate.Gate)
 app.include_router(auth_routes.router)
+app.include_router(engine_routes.router)
 app.include_router(softphone_routes.router)
 app.include_router(esim_routes.router)
 app.include_router(egress_routes.router)
@@ -2451,7 +1902,7 @@ async def api_device_hardware(device_id: str, body: dict):
             app_state.hub.reset_health(iid, "configuration_restart")
             applied = True
         elif inst.get("provisioning_state") != "draft":
-            allowed, _reason = _line_auto_start_allowed(inst)
+            allowed, _reason = app_state._line_auto_start_allowed(inst)
             if allowed:
                 await asyncio.to_thread(app_state._start_engine_checked, inst, cfg.get_settings(),
                                         dev_mounts=os.environ.get("MDD_DEV_MOUNTS", "") == "1")
@@ -2636,7 +2087,7 @@ async def api_instance_upsert(body: dict):
             await asyncio.to_thread(app_state._start_engine_checked, inst, cfg.get_settings(),
                                     dev_mounts=os.environ.get("MDD_DEV_MOUNTS", "") == "1")
             applied = True
-            asyncio.create_task(push_status(iid))
+            asyncio.create_task(app_state.push_status(iid))
         except Exception as e:  # noqa
             log.warning("apply-on-save restart failed for %s: %r", iid, e)
     elif name_only_change:
@@ -2785,7 +2236,7 @@ async def api_instance_start(iid: str, body: dict | None = None):
     app_state.hub.reset_health(iid, "user_requested")
     await app_state.hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client
     cid = await asyncio.to_thread(app_state._start_engine_checked, inst, settings, dev_mounts=dev)
-    asyncio.create_task(push_status(str(iid)))
+    asyncio.create_task(app_state.push_status(str(iid)))
     return {"ok": True, "container": cid}
 
 
@@ -2812,7 +2263,7 @@ async def api_reprovision(iid: str, body: dict | None = None):
     await app_state.hub.drop_ami(iid)      # engine.start recreates the container (maybe new IP) -> stale client
     dev = os.environ.get("MDD_DEV_MOUNTS", "") == "1"
     cid = await asyncio.to_thread(app_state._start_engine_checked, inst, cfg.get_settings(), dev_mounts=dev)
-    asyncio.create_task(push_status(str(iid)))
+    asyncio.create_task(app_state.push_status(str(iid)))
     return {"ok": True, "container": cid}
 
 
@@ -2828,7 +2279,7 @@ async def api_clear_pin(iid: str):
     if await asyncio.to_thread(engine.is_running, str(iid)):
         await asyncio.to_thread(engine.stop, str(iid))
         await app_state.hub.drop_ami(str(iid))
-        asyncio.create_task(push_status(str(iid)))
+        asyncio.create_task(app_state.push_status(str(iid)))
     return {"ok": True, "had_pin": had}
 
 
@@ -2846,7 +2297,7 @@ async def _stop_instance(iid: str, cancel_reason: str) -> dict:
     # Tear down the AMI client too — otherwise its Manager keeps auto-reconnecting to the
     # now-removed container (and floods a container that later reuses the docker IP).
     await app_state.hub.drop_ami(iid)
-    app_state.hub.status_cache[str(iid)] = _with_status_activity(str(iid), {
+    app_state.hub.status_cache[str(iid)] = app_state._with_status_activity(str(iid), {
         "state": "STOPPED", "label": status_mod.LABELS["STOPPED"],
         "reason_code": "stopped", "reason": "Stopped.", "detail": {}})
     app_state.hub.status_sampled_at[str(iid)] = time.monotonic()
@@ -2896,191 +2347,6 @@ def _local_tz() -> ZoneInfo:
         return ZoneInfo(str(cfg.get_settings().get("timezone") or "Asia/Shanghai"))
     except (ZoneInfoNotFoundError, ValueError):
         return ZoneInfo("UTC")
-
-
-# ----------------------------- engine event hook -----------------------------
-# Q.850 causes that mean "the network would not act on this request" rather than "the call
-# did not connect". Grouped rather than mapped one-to-one from SIP: Asterisk's SIP -> Q.850
-# translation differs per response, but every cause here arrives from a 4xx/5xx saying the
-# destination is unknown, malformed or unimplemented — which for a service code all mean the
-# same thing to the operator, namely that this carrier will not serve the code.
-SERVICE_CODE_UNSUPPORTED_CAUSES = {
-    1,    # unallocated number          <- 404 Not Found: the carrier does not know this code
-    28,   # invalid number format       <- 484 Address Incomplete
-    58,   # bearer capability not available
-    63,   # service or option not available
-    79,   # service or option not implemented   <- 501 Not Implemented
-    88,   # incompatible destination            <- 488 Not Acceptable Here
-}
-
-
-def _is_service_code(peer: str) -> bool:
-    """A dialled string carrying '*' or '#' is supplementary-service or USSD signalling."""
-    return any(ch in str(peer or "") for ch in "*#")
-
-
-def _service_code_disposition(dialstatus: str, cause: int) -> str:
-    """Score a service code (*21*<number>#, #225#) on its own scale rather than a call's.
-
-    These are signalling, not conversation: there is no audio in either direction, so the
-    call-shaped outcomes ('busy', 'no answer') would all misdescribe what happened. What is
-    knowable here is only whether the carrier acted on the request. The response CONTENT — a
-    balance, a divert status — rides in a USSD payload this gateway does not parse, so even an
-    accepted code shows no text; see the USSI note in the changelog.
-    """
-    if dialstatus == "ANSWER":
-        return "code accepted"
-    if cause in SERVICE_CODE_UNSUPPORTED_CAUSES:
-        return "code unsupported"
-    if cause == 21:                     # 403/603 — the carrier got it and refused it
-        return "code rejected"
-    if dialstatus == "CANCEL":
-        return "cancelled"
-    # Everything else: the carrier reacted but said nothing decisive. Observed in the field are
-    # cause 38 (network out of order, from SIP 503) and cause 127 (interworking, unspecified —
-    # Asterisk's fallback when a response has no Q.850 mapping), plus cause 0 when nothing came
-    # back at all. None of these distinguish "this carrier does not offer the code" from "it
-    # could not serve it right now", so do NOT report them as unsupported — that would send the
-    # operator chasing a permanent limitation that may just be a transient failure.
-    return "code failed"
-
-
-def _call_disposition(dialstatus: str, cause: int, direction: str = "out",
-                      peer: str = "") -> str:
-    """Map Asterisk DIALSTATUS + Q.850 hangupcause to a friendly outcome. No retry — a
-    rejected/busy/no-answer call is simply recorded as such. Incoming and outgoing read the
-    same DIALSTATUS differently: for an inbound call the Dial targets our local softphone, so
-    BUSY/decline means WE declined and CANCEL/NOANSWER means we missed it. An outgoing service
-    code is not a call and is scored separately."""
-    if direction == "out" and _is_service_code(peer):
-        return _service_code_disposition(dialstatus, cause)
-    if dialstatus == "ANSWER":
-        return "answered"
-    if direction == "in":
-        if dialstatus == "BUSY" or cause == 21:
-            return "rejected"        # local softphone actively declined
-        return "missed"              # remote hung up first, no answer, or rang out
-    # outgoing
-    if cause == 21:                     # 603 Decline — far end actively rejected
-        return "rejected"
-    if cause == 17 or dialstatus == "BUSY":
-        return "busy"
-    if dialstatus == "NOANSWER" or cause == 19:
-        return "no answer"
-    if dialstatus == "CANCEL":
-        return "cancelled"
-    if dialstatus in ("CONGESTION", "CHANUNAVAIL"):
-        return "failed"
-    # empty DIALSTATUS in the hangup handler => caller hung up before/while dialing.
-    return (dialstatus.lower() if dialstatus else "cancelled")
-
-
-@app.post("/api/engine/event")
-async def api_engine_event(payload: dict):
-    """Receives notify.py callbacks from engine containers."""
-    iid = str(payload.get("instance", ""))
-    event = payload.get("event", "")
-    args = payload.get("args", [])
-    if event in ("sms_in", "sms_out", "ussd", "voicemail_new"):
-        # Messaging, USSD and voicemail are not part of this build. The network's SMS is
-        # acknowledged inside Asterisk and its content discarded there; an event that still
-        # arrives (an older engine) is dropped here and never stored or broadcast.
-        return {"ok": True, "ignored": True}
-    if event == "call_in":
-        # Log inbound calls even when the caller withholds/omits their number (peer "") so an
-        # anonymous call still gets a record that the 'h' disposition can finalize. The IMS
-        # delivers one INVITE several times (VoLTE preconditions / GRUU fork / retransmit),
-        # firing call_in more than once per call — both while the record is still open AND as a
-        # trailing retransmit a few seconds AFTER it was finalized. add_call_deduped coalesces
-        # both into the single record so no ghost 'ringing' row is left behind.
-        peer = args[0] if args else ""
-        rec = store.add_call_deduped(iid, "in", peer, status="ringing")
-        await app_state.hub.broadcast({"type": "call", "instance": iid, "call": rec})
-    elif event == "call_out" and args:
-        rec = store.add_call(iid, "out", args[0], status="dialing")
-        await app_state.hub.broadcast({"type": "call", "instance": iid, "call": rec})
-    elif event == "call_result" and args:
-        # New form: call_result <direction> <peer> <dialstatus> <cause> (fired from the 'h'
-        # hangup handler for BOTH directions). Legacy form: call_result <peer> <dialstatus>
-        # <cause> (outgoing only) — kept for engines running an older dialplan.
-        if args[0] in ("in", "out"):
-            direction = args[0]
-            to = args[1] if len(args) > 1 else ""
-            dialstatus = (args[2] if len(args) > 2 else "").upper()
-            cause = int(args[3]) if len(args) > 3 and str(args[3]).isdigit() else 0
-        else:
-            direction = "out"
-            to = args[0]
-            dialstatus = (args[1] if len(args) > 1 else "").upper()
-            cause = int(args[2]) if len(args) > 2 and str(args[2]).isdigit() else 0
-        disp = _call_disposition(dialstatus, cause, direction, to)
-        rec = store.update_last_call(iid, direction, to, disp)
-        if not rec and to:
-            # The dialplan fires call_out and call_result from separate backgrounded
-            # notify.py processes ('&'), so nothing orders them. On a call that lasts under a
-            # second — a dialled service code answered on the BYE does exactly that — the
-            # result can land BEFORE the record it is meant to close, and used to be dropped
-            # silently, stranding the call on 'dialing' forever. call_out is already on its
-            # way, so wait for it.
-            #
-            # Match the EXACT peer while waiting. Falling back to "the latest open call" in
-            # here would attach this verdict to a DIFFERENT call that merely happens to be
-            # open — dialling two codes in quick succession made a #225# record carry a
-            # *#21# outcome, because #225# was the only open record when *#21#'s result
-            # overtook its own call_out.
-            for _ in range(15):
-                await asyncio.sleep(0.2)
-                rec = store.update_last_call(iid, direction, to, disp)
-                if rec:
-                    log.info("call_result for %s arrived before its record; applied on retry",
-                             to)
-                    break
-        if not rec and to:
-            # Only now, with the ordering window spent: 'h' can lose the number to a
-            # masquerade, so finalize the latest open call of this direction rather than
-            # leaving it stuck on dialing forever.
-            rec = store.update_last_call(iid, direction, None, disp)
-        if rec:
-            await app_state.hub.broadcast({"type": "call", "instance": iid, "call": rec})
-    elif event == "cp_mode_resolved" and args:
-        # CP auto-discovery success: the engine found the address family (v6/v4/dual) that yields a
-        # usable PDN on this carrier. Repin the line from 'auto' to the resolved family so it stops
-        # re-walking the ladder on future starts (fast, deterministic), and record that it was
-        # auto-detected. Only acts on an auto line; a pinned line ignores a stray report.
-        resolved = (args[0] or "").strip().lower()
-        if resolved in ("v6", "v4", "dual"):
-            inst = cfg.get_instance(iid)
-            if inst and cfg.normalize_cp_mode(inst.get("cp_mode", "")) == "auto":
-                try:
-                    cfg.upsert_instance({"id": iid, "cp_mode": resolved, "cp_mode_source": "auto"})
-                    log.info("instance %s: CP auto-discovery resolved to %s (repinned)", iid, resolved)
-                except Exception as e:  # noqa
-                    log.warning("cp_mode_resolved persist failed for %s: %r", iid, e)
-            await app_state.hub.broadcast({"type": "engine", "instance": iid, "event": event, "args": args})
-    else:
-        await app_state.hub.broadcast({"type": "engine", "instance": iid, "event": event, "args": args})
-    # real-time: any tunnel/registration transition triggers an immediate status push
-    if event in ("tunnel_up", "tunnel_down", "pcscf", "registered", "unregistered"):
-        asyncio.create_task(push_status(iid))
-    return {"ok": True}
-
-
-async def push_status(iid: str):
-    """Compute + broadcast status for a single instance immediately (event-driven)."""
-    inst = cfg.get_instance(iid)
-    if not inst:
-        return
-    try:
-        runtime = await app_state.hub.runtime.get(iid)
-        ami = await app_state.hub.ami_for(iid, runtime)
-        st = await status_mod.compute(inst, ami, runtime)
-        st = _with_status_activity(
-            iid, apply_health(iid, inst, st, runtime.get("container_id")))
-        app_state.hub.status_cache[str(iid)] = st
-        app_state.hub.status_sampled_at[str(iid)] = time.monotonic()
-        await app_state.hub.broadcast({"type": "status", "instance": str(iid), **st})
-    except Exception as e:  # noqa
-        log.debug("push_status error: %r", e)
 
 
 # ----------------------------- static WebUI -----------------------------

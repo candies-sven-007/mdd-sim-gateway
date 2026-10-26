@@ -226,7 +226,7 @@ class ReaderImeiCompletionTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(app_state.hub, "cards_list", return_value=[card]), \
                 patch.object(app_state, "_auto_promote_card_draft", return_value=ready) as promote, \
                 patch.object(main.engine, "is_running", return_value=False), \
-                patch.object(main, "_line_auto_start_allowed", return_value=(True, "")), \
+                patch.object(app_state, "_line_auto_start_allowed", return_value=(True, "")), \
                 patch.object(app_state, "_start_engine_checked") as start, \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()):
             result = await main.api_device_hardware(

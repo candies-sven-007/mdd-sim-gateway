@@ -25,8 +25,8 @@ class LocalCardFaultTests(unittest.TestCase):
                  "usim_status.json": usim or {}}
         with patch.object(main.engine, "read_run_json",
                           side_effect=lambda iid, name: files.get(name)), \
-                patch.object(main, "_distinct_cards_present", return_value=cards):
-            return main._local_card_fault("1", inst or {})
+                patch.object(app_state, "_distinct_cards_present", return_value=cards):
+            return app_state._local_card_fault("1", inst or {})
 
     def test_a_healthy_line_reports_no_local_fault(self):
         self.assertEqual(
@@ -117,44 +117,44 @@ class CardCountTests(unittest.TestCase):
                 "VoWiFi Modem A 00 00": {"iccid": OURS},
                 "VoWiFi Modem A 00 01": {"iccid": OURS},
                 "VoWiFi Modem A 00 02": {"iccid": OURS}}):
-            self.assertEqual(main._distinct_cards_present(), 1)
+            self.assertEqual(app_state._distinct_cards_present(), 1)
 
     def test_two_modems_count_as_two(self):
         with patch.object(app_state.hub, "cards", {
                 "VoWiFi Modem A 00 00": {"iccid": OURS},
                 "VoWiFi Modem B 00 00": {"iccid": THEIRS}}):
-            self.assertEqual(main._distinct_cards_present(), 2)
+            self.assertEqual(app_state._distinct_cards_present(), 2)
 
     def test_an_empty_or_unreadable_cache_does_not_claim_a_single_sim_host(self):
         with patch.object(app_state.hub, "cards", {}):
-            self.assertGreater(main._distinct_cards_present(), 1)
+            self.assertGreater(app_state._distinct_cards_present(), 1)
 
 
 class ExitAttributionTests(unittest.TestCase):
     def test_a_local_card_fault_holds_and_never_reaches_the_exit_policy(self):
-        with patch.object(main, "_local_card_fault", return_value="the reader holds 894430…"), \
-                patch.object(main, "egress", MagicMock()) as egress, \
-                patch.object(main, "failover", MagicMock(HOLD=failover.HOLD)) as policy:
-            action = main._judge_exit_failure("1", {}, {"reason_code": "reg_rejected"}, 0.0)
+        with patch.object(app_state, "_local_card_fault", return_value="the reader holds 894430…"), \
+                patch.object(app_state, "egress", MagicMock()) as egress, \
+                patch.object(app_state, "failover", MagicMock(HOLD=failover.HOLD)) as policy:
+            action = app_state._judge_exit_failure("1", {}, {"reason_code": "reg_rejected"}, 0.0)
         self.assertEqual(action, failover.HOLD)
         egress.status.assert_not_called()
         policy.classify.assert_not_called()
         policy.record.assert_not_called()
 
     def test_without_a_local_fault_the_exit_policy_still_decides(self):
-        with patch.object(main, "_local_card_fault", return_value=""), \
-                patch.object(main, "egress", MagicMock()) as egress, \
-                patch.object(main, "engine", MagicMock()), \
-                patch.object(main, "_peer_line_registered", return_value=False), \
-                patch.object(main, "_save_exit_ledgers"), \
+        with patch.object(app_state, "_local_card_fault", return_value=""), \
+                patch.object(app_state, "egress", MagicMock()) as egress, \
+                patch.object(app_state, "engine", MagicMock()), \
+                patch.object(app_state, "_peer_line_registered", return_value=False), \
+                patch.object(app_state, "_save_exit_ledgers"), \
                 patch.object(main.cfg, "get_settings", return_value={"proxy": {"enabled": True}}), \
-                patch.object(main, "failover", MagicMock(
+                patch.object(app_state, "failover", MagicMock(
                     HOLD=failover.HOLD, SWITCH=failover.SWITCH, GIVE_UP=failover.GIVE_UP,
                     REPORT=failover.REPORT, BACK_OFF=failover.BACK_OFF)) as policy:
             egress.line_country.return_value = "us"
             egress.status.return_value = {"exits": {"us": {"mode": "subscription", "node": "a"}}}
             policy.record.return_value = (failover.HOLD, {})
-            main._judge_exit_failure("1", {}, {"reason_code": "reg_rejected"}, 0.0)
+            app_state._judge_exit_failure("1", {}, {"reason_code": "reg_rejected"}, 0.0)
         policy.classify.assert_called_once()
 
 

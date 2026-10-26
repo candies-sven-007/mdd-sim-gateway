@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from control.app import status as status_mod
+from tests.control_source import control_plane_source
 
 ROOT = Path(__file__).resolve().parent.parent
 I18N = ROOT / "webui" / "src" / "i18n.jsx"
@@ -37,7 +38,7 @@ class BackendStringCoverageTests(unittest.TestCase):
     def test_every_device_capability_reason_is_translated(self):
         """`reason="..."` on a device capability is shown through t() on the device page.
         The draft line's IMEI hint shipped in English in the Chinese UI for this reason."""
-        source = (ROOT / "control" / "app" / "main.py").read_text(encoding="utf-8")
+        source = control_plane_source()
         reasons = set(re.findall(r'reason=\(?\s*"([^"{}]+)"', source))
         self.assertTrue(reasons)
         block = zh_block()

@@ -5,12 +5,13 @@ minutes" — indistinguishable from a misconfiguration.
 import re
 import unittest
 from pathlib import Path
+from tests.control_source import control_plane_source
 
 ROOT = Path(__file__).resolve().parent.parent
 PAGES = (ROOT / "webui" / "src" / "views" / "UnifiedPages.jsx").read_text(encoding="utf-8")
 I18N = (ROOT / "webui" / "src" / "i18n.jsx").read_text(encoding="utf-8")
 ZH = I18N[I18N.index("const zh"):I18N.index("const en")]
-MAIN = (ROOT / "control" / "app" / "main.py").read_text(encoding="utf-8")
+MAIN = control_plane_source()
 
 LABELS = [
     "Data channel rekey",

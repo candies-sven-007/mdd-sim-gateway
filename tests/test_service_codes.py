@@ -7,6 +7,7 @@ again, and the failure looks identical to a carrier rejection.
 """
 import unittest
 from pathlib import Path
+from control.app.routers import engine as engine_routes
 
 try:
     from control.app import main
@@ -113,29 +114,29 @@ class ServiceCodeOutcomeTests(unittest.TestCase):
 
     def test_accepted_code_is_reported_as_accepted(self):
         self.assertEqual(
-            main._call_disposition("ANSWER", 0, "out", "#225#"), "code accepted")
+            engine_routes._call_disposition("ANSWER", 0, "out", "#225#"), "code accepted")
 
     def test_unknown_code_reads_as_unsupported(self):
         # 404 Not Found -> Q.850 1: this carrier has no such code.
         self.assertEqual(
-            main._call_disposition("CONGESTION", 1, "out", "#225#"), "code unsupported")
+            engine_routes._call_disposition("CONGESTION", 1, "out", "#225#"), "code unsupported")
         # 484 Address Incomplete -> Q.850 28, and 501 Not Implemented -> Q.850 79.
         self.assertEqual(
-            main._call_disposition("CHANUNAVAIL", 28, "out", "*#21#"), "code unsupported")
+            engine_routes._call_disposition("CHANUNAVAIL", 28, "out", "*#21#"), "code unsupported")
         self.assertEqual(
-            main._call_disposition("CONGESTION", 79, "out", "#225#"), "code unsupported")
+            engine_routes._call_disposition("CONGESTION", 79, "out", "#225#"), "code unsupported")
 
     def test_refusal_is_distinguished_from_lack_of_support(self):
         # 403/603 -> Q.850 21. The code reached the carrier, which declined to serve it —
         # an account-policy restriction, not a missing feature. Conflating the two would
         # send the operator looking for the wrong fix.
         self.assertEqual(
-            main._call_disposition("BUSY", 21, "out", "*21*13800138000#"), "code rejected")
+            engine_routes._call_disposition("BUSY", 21, "out", "*21*13800138000#"), "code rejected")
 
     def test_silence_is_never_reported_as_unsupported(self):
         # Nothing came back at all; asserting the carrier lacks the code would be invention.
         self.assertEqual(
-            main._call_disposition("NOANSWER", 0, "out", "#225#"), "code failed")
+            engine_routes._call_disposition("NOANSWER", 0, "out", "#225#"), "code failed")
 
     def test_ambiguous_causes_seen_in_the_field_are_not_called_unsupported(self):
         # Observed on real carriers: Vodafone UK returned cause 38 (network out of order,
@@ -143,24 +144,24 @@ class ServiceCodeOutcomeTests(unittest.TestCase):
         # fallback when a response has no Q.850 mapping). Neither says the code is absent
         # from the network, so neither may be reported as unsupported.
         self.assertEqual(
-            main._call_disposition("CHANUNAVAIL", 38, "out", "*#21#"), "code failed")
+            engine_routes._call_disposition("CHANUNAVAIL", 38, "out", "*#21#"), "code failed")
         self.assertEqual(
-            main._call_disposition("CHANUNAVAIL", 127, "out", "*#21#"), "code failed")
+            engine_routes._call_disposition("CHANUNAVAIL", 127, "out", "*#21#"), "code failed")
 
     def test_ordinary_numbers_keep_call_shaped_outcomes(self):
-        self.assertEqual(main._call_disposition("ANSWER", 0, "out", "+441234567890"), "answered")
-        self.assertEqual(main._call_disposition("BUSY", 17, "out", "+441234567890"), "busy")
-        self.assertEqual(main._call_disposition("NOANSWER", 19, "out", "611"), "no answer")
+        self.assertEqual(engine_routes._call_disposition("ANSWER", 0, "out", "+441234567890"), "answered")
+        self.assertEqual(engine_routes._call_disposition("BUSY", 17, "out", "+441234567890"), "busy")
+        self.assertEqual(engine_routes._call_disposition("NOANSWER", 19, "out", "611"), "no answer")
 
     def test_incoming_calls_are_never_scored_as_service_codes(self):
         # An inbound caller ID can contain '*'; only what we dialled out can be a code.
-        self.assertEqual(main._call_disposition("BUSY", 21, "in", "*67"), "rejected")
+        self.assertEqual(engine_routes._call_disposition("BUSY", 21, "in", "*67"), "rejected")
 
     def test_service_code_detection(self):
         for code in ("#225#", "*#06#", "*21*13800138000#", "*#21#"):
-            self.assertTrue(main._is_service_code(code), code)
+            self.assertTrue(engine_routes._is_service_code(code), code)
         for number in ("+441234567890", "611", "13800138000", ""):
-            self.assertFalse(main._is_service_code(number), number)
+            self.assertFalse(engine_routes._is_service_code(number), number)
 
 
 if __name__ == "__main__":

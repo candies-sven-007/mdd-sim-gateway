@@ -20,6 +20,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from control.app import egress, failover
+from tests.control_source import control_plane_source
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -160,7 +161,7 @@ class PrincipleTests(unittest.TestCase):
             failover.BLAMES_ELSEWHERE)
 
     def test_the_call_site_is_guarded_by_the_peer_shield_and_the_verdict(self):
-        source = (ROOT / "control" / "app" / "main.py").read_text()
+        source = control_plane_source()
         body = source[source.index("def _judge_exit_failure("):]
         body = body[:body.index("\ndef ")]
         guard = "elif verdict == failover.BLAMES_EXIT and not peer_registered and country:"
@@ -177,7 +178,7 @@ class PrincipleTests(unittest.TestCase):
         (exit blamed, pool exhausted, no peer) quietly stopped telling anyone it was stuck —
         it took the report branch and never reached the notify one.
         """
-        source = (ROOT / "control" / "app" / "main.py").read_text()
+        source = control_plane_source()
         body = source[source.index("def _judge_exit_failure("):]
         body = body[:body.index("\ndef ")]
         notify = "    if action in (failover.GIVE_UP, failover.REPORT) or ("

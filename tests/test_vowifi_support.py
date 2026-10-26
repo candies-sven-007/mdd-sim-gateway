@@ -59,7 +59,7 @@ class UnsupportedCarrierHealthTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main.engine, "capture_and_stop") as capture_and_stop, \
                 patch.object(app_state, "_record_lifecycle") as lifecycle, \
                 patch.object(app_state.hub, "drop_ami", new=AsyncMock()):
-            result = main.apply_health("9", inst, st, "generation-1")
+            result = app_state.apply_health("9", inst, st, "generation-1")
             for _ in range(20):
                 await __import__("asyncio").sleep(0.01)
                 if capture_and_stop.called:
@@ -78,7 +78,7 @@ class UnsupportedCarrierHealthTests(unittest.IsolatedAsyncioTestCase):
         app_state.hub.reset_health("10", None)
         vowifi_support._cache.clear()
         with patch.object(vowifi_support, "probe_in_background"):
-            result = main.apply_health("10", inst, st, "generation-1")
+            result = app_state.apply_health("10", inst, st, "generation-1")
         self.assertNotIn("frozen", result)
         self.assertEqual(result["retry"], {"count": 1, "max": 3})
 

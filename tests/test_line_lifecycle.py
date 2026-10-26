@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 from control.app import config, engine, main
 from control.app import state as app_state
 from control.app.routers import system as system_routes
+from control.app import failover
 
 
 _lifecycle_patcher = None
@@ -181,7 +182,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
     def test_saved_line_without_a_live_card_is_not_eligible(self):
         inst = {"id": "offline", "iccid": "saved-card", "enabled": True}
         with patch.object(app_state.hub, "cards_list", return_value=[]):
-            self.assertEqual(main._line_auto_start_allowed(inst), (False, "no_card"))
+            self.assertEqual(app_state._line_auto_start_allowed(inst), (False, "no_card"))
 
 
     async def test_auto_recovery_rechecks_a_transiently_absent_card(self):
@@ -191,12 +192,12 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
             "auto_retrying": True, "retry_count": 3,
         })
         started = main.time.monotonic()
-        with patch.object(main, "_line_auto_start_allowed",
+        with patch.object(app_state, "_line_auto_start_allowed",
                           return_value=(False, "no_card")), \
                 patch.object(app_state, "_start_engine_checked") as start, \
                 patch.object(app_state, "_record_lifecycle") as lifecycle, \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()):
-            await main._auto_recover_instance("offline", inst, 60)
+            await app_state._auto_recover_instance("offline", inst, 60)
 
         start.assert_not_called()
         self.assertEqual(app_state.hub.status_cache["offline"]["state"], "NO_CARD")
@@ -211,7 +212,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
         # The sampled cache can remain absent for hours. Rechecks re-arm recovery but must not
         # fill the bounded audit with an identical blocked record every cooldown.
         health["auto_retrying"] = True
-        await main._auto_recover_instance("offline", inst, 60)
+        await app_state._auto_recover_instance("offline", inst, 60)
         lifecycle.assert_called_once()
 
     async def test_disabled_vowifi_still_cancels_pending_recovery(self):
@@ -220,12 +221,12 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
             "frozen_code": "tunnel_network", "frozen_reason": "failed",
             "auto_retrying": True, "next_retry_at": 12345,
         })
-        with patch.object(main, "_line_auto_start_allowed",
+        with patch.object(app_state, "_line_auto_start_allowed",
                           return_value=(False, "vowifi_disabled")), \
                 patch.object(app_state, "_start_engine_checked") as start, \
                 patch.object(app_state, "_record_lifecycle") as lifecycle, \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()):
-            await main._auto_recover_instance("offline", inst, 60)
+            await app_state._auto_recover_instance("offline", inst, 60)
 
         start.assert_not_called()
         health = app_state.hub.health["offline"]
@@ -248,11 +249,11 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
             "message": "private path /dev/ttyUSB2 and 123456789012345",
             "device_id": "modem-a",
         })
-        with patch.object(main, "_line_auto_start_allowed", return_value=(True, "")), \
+        with patch.object(app_state, "_line_auto_start_allowed", return_value=(True, "")), \
                 patch.object(app_state, "_start_engine_checked", side_effect=failure), \
                 patch.object(app_state, "_record_lifecycle") as lifecycle, \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()):
-            await main._auto_recover_instance("offline", inst, 60)
+            await app_state._auto_recover_instance("offline", inst, 60)
 
         self.assertEqual(lifecycle.call_count, 2)
         failed = lifecycle.call_args_list[-1]
@@ -341,7 +342,7 @@ class StatusActivityTests(unittest.TestCase):
             "frozen_code": "registering", "frozen_reason": "IMS unavailable",
             "next_retry_at": None, "last_state": None,
         }
-        status = main._with_status_activity("activity-test", {
+        status = app_state._with_status_activity("activity-test", {
             "state": "ERROR", "label": "Failed", "reason": "IMS unavailable",
             "detail": {}, "frozen": True, "automatic_retry_in": 18,
             "retry": {"count": 3, "max": 3},
@@ -356,7 +357,7 @@ class StatusActivityTests(unittest.TestCase):
             "frozen_code": "pin_wrong", "frozen_reason": "SIM PIN is incorrect.",
             "next_retry_at": None, "last_state": None,
         }
-        status = main._with_status_activity("pin-test", {
+        status = app_state._with_status_activity("pin-test", {
             "state": "ERROR", "label": "Failed", "reason_code": "pin_wrong",
             "reason": "SIM PIN is incorrect.", "detail": {}, "frozen": True,
             "automatic_retry_in": None, "retry": {"count": 3, "max": 3},
@@ -396,9 +397,9 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         inst = {"id": iid, "enabled": True, "retry": {"max": 3, "interval": 30}}
         started = main.time.monotonic()
         with patch.object(main.engine, "capture_and_stop") as capture_and_stop, \
-                patch.object(main, "_judge_exit_failure", return_value=main.failover.HOLD), \
+                patch.object(app_state, "_judge_exit_failure", return_value=failover.HOLD), \
                 patch.object(app_state.hub, "drop_ami", new=AsyncMock()) as drop_ami:
-            result = main.apply_health(iid, inst, unanswered, "generation-1")
+            result = app_state.apply_health(iid, inst, unanswered, "generation-1")
             for _ in range(20):
                 await __import__("asyncio").sleep(0.01)
                 if capture_and_stop.called and drop_ami.await_count:
@@ -428,7 +429,7 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
                     "detail": {"registration": "Rejected", "active_channels": channels},
                 }
                 with patch.object(main.engine, "capture_and_stop") as capture:
-                    result = main.apply_health("guarded", inst, st, "generation-1")
+                    result = app_state.apply_health("guarded", inst, st, "generation-1")
                 self.assertNotIn("frozen", result)
                 self.assertEqual(result["retry"], {"count": 1, "max": 3})
                 capture.assert_not_called()
@@ -446,7 +447,7 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         }
         inst = {"id": iid, "enabled": True, "retry": {"max": 3, "interval": 30}}
         with patch.object(main.engine, "capture_and_stop") as capture:
-            result = main.apply_health(iid, inst, st, "generation-2")
+            result = app_state.apply_health(iid, inst, st, "generation-2")
         self.assertNotIn("frozen", result)
         capture.assert_not_called()
         app_state.hub.reset_health(iid)
@@ -467,13 +468,13 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.engine, "read_run_json",
                              return_value={"state": "CONNECTED"}), \
                 patch.object(main.engine, "ike_evidence", return_value={"retransmits": 0}), \
-                patch.object(main, "_save_exit_ledgers"), \
+                patch.object(app_state, "_save_exit_ledgers"), \
                 patch.object(app_state.hub, "drop_ami", new=AsyncMock()) as drop_ami:
             inst = {"id": "3", "enabled": True,
                     "retry": {"max": 3, "interval": 30}}
-            first = main.apply_health("3", inst, rejected)
+            first = app_state.apply_health("3", inst, rejected)
             app_state.hub.health["3"]["fail_start"] = started - 91
-            exhausted = main.apply_health("3", inst, rejected)
+            exhausted = app_state.apply_health("3", inst, rejected)
             for _ in range(20):
                 await __import__("asyncio").sleep(0.01)
                 if capture_and_stop.called:
@@ -975,18 +976,18 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.engine, "read_run_json", return_value={"state": swu}), \
                 patch.object(main.engine, "ike_evidence",
                              return_value={"retransmits": retransmits}, side_effect=evidence_error), \
-                patch.object(main, "_save_exit_ledgers"), \
+                patch.object(app_state, "_save_exit_ledgers"), \
                 patch.object(main.egress, "request_reselect") as reselect, \
                 patch.object(main.asyncio, "to_thread", new=AsyncMock()) as to_thread:
-            action = main._judge_exit_failure("9", self.INST, st, stable_for)
+            action = app_state._judge_exit_failure("9", self.INST, st, stable_for)
         # dispatch is handed to to_thread(), which is called synchronously to build the
         # awaitable — so its arguments are visible without waiting for the task to run.
         return action, reselect, to_thread
 
     async def test_missing_tunnel_evidence_never_switches_or_cleans_sessions(self):
-        for attempt in range(main.failover.FAILURES_BEFORE_REPORT):
+        for attempt in range(failover.FAILURES_BEFORE_REPORT):
             action, reselect, _ = self._judge(None, 0)
-            self.assertIn(action, (main.failover.HOLD, main.failover.REPORT))
+            self.assertIn(action, (failover.HOLD, failover.REPORT))
             reselect.assert_not_called()
         self.stalled.assert_not_called()
         self.assertEqual(app_state.hub.exit_ledgers["9"]["strikes"], 0)
@@ -994,7 +995,7 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
     async def test_retransmit_read_failure_preserves_connected_evidence(self):
         for attempt in range(3):
             action, reselect, _ = self._judge("CONNECTED", 0, evidence_error=OSError("unreadable"))
-            self.assertEqual(action, main.failover.HOLD)
+            self.assertEqual(action, failover.HOLD)
             reselect.assert_not_called()
         self.stalled.assert_not_called()
         self.assertEqual(app_state.hub.exit_ledgers["9"]["strikes"], 0)
@@ -1002,7 +1003,7 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
     async def test_dns_failure_never_strikes_or_cleans_an_exit(self):
         for attempt in range(3):
             action, reselect, _ = self._judge("DOWN", 10, reason="epdg_unresolved")
-            self.assertEqual(action, main.failover.HOLD)
+            self.assertEqual(action, failover.HOLD)
             reselect.assert_not_called()
         self.stalled.assert_not_called()
 
@@ -1012,7 +1013,7 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
             app_state.hub.exit_ledgers["9"] = {"exhausted": True, "given_up": True}
             for attempt in range(4):
                 action, reselect, notify = self._judge("DOWN", 0, exits=exits)
-                self.assertEqual(action, main.failover.HOLD)
+                self.assertEqual(action, failover.HOLD)
                 reselect.assert_not_called()
                 notify.assert_not_called()
                 self.assertNotIn("9", app_state.hub.exit_ledgers)
@@ -1021,7 +1022,7 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
     async def test_disabled_proxy_ignores_stale_subscription_status(self):
         with patch.object(main.cfg, "get_settings", return_value={"proxy": {"enabled": False}}):
             action, reselect, _ = self._judge("DOWN", 0)
-        self.assertEqual(action, main.failover.HOLD)
+        self.assertEqual(action, failover.HOLD)
         self.assertNotIn("9", app_state.hub.exit_ledgers)
         reselect.assert_not_called()
         self.stalled.assert_not_called()
@@ -1031,14 +1032,14 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
         # freeze can land on a cycle where the exit is known to be a subscription pool but
         # its current member is not. That is no evidence: a backed-off or given-up walk must
         # survive it unchanged, or the line re-walks the pool and notifies all over again.
-        ledger = {**main.failover.blank_ledger(), "node": "node-b", "strikes": 1,
+        ledger = {**failover.blank_ledger(), "node": "node-b", "strikes": 1,
                   "tried": ["node-a", "node-b"], "exhausted": True, "given_up": True,
                   "failures": 7, "reported": True}
         app_state.hub.exit_ledgers["9"] = dict(ledger)
         unknown = {"exits": {"us": {"node": "", "candidates": ["node-a", "node-b"],
                                     "selection": "auto", "mode": "subscription"}}}
         action, reselect, notify = self._judge("DOWN", 0, exits=unknown)
-        self.assertEqual(action, main.failover.HOLD)
+        self.assertEqual(action, failover.HOLD)
         self.assertEqual(app_state.hub.exit_ledgers["9"], ledger)
         reselect.assert_not_called()
         notify.assert_not_called()
@@ -1047,8 +1048,8 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
     async def test_direct_freezes_keep_normal_retry_cadence(self):
         st = {"state": "TUNNEL_DOWN", "reason_code": "tunnel_network", "reason": "x"}
         with patch.object(main.egress, "status", return_value={"exits": {"us": {"mode": "direct"}}}), \
-                patch.object(main, "_local_card_fault", return_value=""), \
-                patch.object(main, "_save_exit_ledgers"), \
+                patch.object(app_state, "_local_card_fault", return_value=""), \
+                patch.object(app_state, "_save_exit_ledgers"), \
                 patch.object(main.asyncio, "to_thread", new=AsyncMock()), \
                 patch.object(app_state.hub, "drop_ami", new=AsyncMock()):
             for attempt in range(4):
@@ -1056,7 +1057,7 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
                 health = app_state.hub.health_for("9")
                 health["fail_start"] = main.time.monotonic() - 10000
                 before = main.time.monotonic()
-                main.apply_health("9", self.INST, dict(st))
+                app_state.apply_health("9", self.INST, dict(st))
                 self.assertGreaterEqual(health["next_retry_at"], before + 160)
                 self.assertLess(health["next_retry_at"], before + 170)
                 self.assertNotIn("9", app_state.hub.exit_ledgers)
@@ -1076,17 +1077,17 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_healthy_tunnel_neither_moves_the_exit_nor_notifies(self):
         action, reselect, to_thread = self._judge("CONNECTED", 0)
-        self.assertEqual(action, main.failover.HOLD)
+        self.assertEqual(action, failover.HOLD)
         reselect.assert_not_called()
         to_thread.assert_not_called()
 
     async def test_the_exit_moves_once_the_node_has_had_its_chances(self):
-        for _ in range(main.failover.STRIKES_PER_NODE - 1):
+        for _ in range(failover.STRIKES_PER_NODE - 1):
             action, reselect, _ = self._judge("CONNECTING", 14)
-            self.assertEqual(action, main.failover.HOLD)
+            self.assertEqual(action, failover.HOLD)
             reselect.assert_not_called()
         action, reselect, _ = self._judge("CONNECTING", 14)
-        self.assertEqual(action, main.failover.SWITCH)
+        self.assertEqual(action, failover.SWITCH)
         reselect.assert_called_once()
 
     async def test_an_exhausted_pool_notifies_once_and_backs_off(self):
@@ -1094,15 +1095,15 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
         for node in ("node-a", "node-b"):
             exits = {"exits": {"us": {"node": node, "candidates": ["node-a", "node-b"],
                                       "selection": "auto", "mode": "subscription"}}}
-            for _ in range(main.failover.STRIKES_PER_NODE):
+            for _ in range(failover.STRIKES_PER_NODE):
                 action, _reselect, to_thread = self._judge("DOWN", 0, exits)
                 seen.append((action, to_thread))
         action, to_thread = seen[-1]
-        self.assertEqual(action, main.failover.BACK_OFF)
+        self.assertEqual(action, failover.BACK_OFF)
         self.assertTrue(app_state.hub.exit_ledgers["9"]["exhausted"])
         # The slow retries that follow keep backing off without announcing again.
         action, _reselect, to_thread = self._judge("DOWN", 0)
-        self.assertEqual(action, main.failover.BACK_OFF)
+        self.assertEqual(action, failover.BACK_OFF)
         to_thread.assert_not_called()
 
     async def test_a_registered_sibling_keeps_the_exit_where_it_is(self):
@@ -1110,26 +1111,26 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
         app_state.hub.status_cache["7"] = {"state": "OK"}
         actions = []
         try:
-            for _ in range(main.failover.FAILURES_BEFORE_REPORT):
+            for _ in range(failover.FAILURES_BEFORE_REPORT):
                 action, reselect, _ = self._judge("DOWN", 0, peers=[peer])
                 actions.append(action)
                 reselect.assert_not_called()
         finally:
             app_state.hub.status_cache.pop("7", None)
         # Never a switch — but the operator is still told, once, that the line is stuck.
-        self.assertNotIn(main.failover.SWITCH, actions)
-        self.assertEqual(actions[-1], main.failover.REPORT)
+        self.assertNotIn(failover.SWITCH, actions)
+        self.assertEqual(actions[-1], failover.REPORT)
 
     async def test_giving_up_stops_the_automatic_rebuild(self):
         h = app_state.hub.health_for("9")
         h["fail_start"] = main.time.monotonic() - 10_000    # past the retry budget
         st = {"state": "TUNNEL_DOWN", "label": "x", "reason_code": "tunnel_network",
               "reason": "x", "detail": {}}
-        with patch.object(main, "_judge_exit_failure",
-                          return_value=main.failover.GIVE_UP), \
+        with patch.object(app_state, "_judge_exit_failure",
+                          return_value=failover.GIVE_UP), \
                 patch.object(main.engine, "capture_and_stop"), \
                 patch.object(main.cfg, "get_settings", return_value={}):
-            main.apply_health("9", self.INST, st)
+            app_state.apply_health("9", self.INST, st)
         # None reads as "never" in the recovery check, the same mechanism a blocked PIN uses.
         self.assertIsNone(h["next_retry_at"])
         self.assertEqual(h["frozen_code"], "tunnel_network")
@@ -1143,10 +1144,10 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
         }
         st = {"state": "TUNNEL_DOWN", "label": "x", "reason_code": "tunnel_network",
               "reason": "x", "detail": {}}
-        with patch.object(main, "_judge_exit_failure", return_value=main.failover.HOLD), \
+        with patch.object(app_state, "_judge_exit_failure", return_value=failover.HOLD), \
                 patch.object(main.engine, "capture_and_stop"), \
                 patch.object(main.cfg, "get_settings", return_value={}):
-            main.apply_health("9", self.INST, st)
+            app_state.apply_health("9", self.INST, st)
         self.assertIsNone(h["next_retry_at"])
         app_state.hub.exit_ledgers.pop("9", None)
 
@@ -1155,25 +1156,25 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
         h["fail_start"] = main.time.monotonic() - 10_000
         st = {"state": "TUNNEL_DOWN", "label": "x", "reason_code": "tunnel_network",
               "reason": "x", "detail": {}}
-        with patch.object(main, "_judge_exit_failure",
-                          return_value=main.failover.BACK_OFF), \
+        with patch.object(app_state, "_judge_exit_failure",
+                          return_value=failover.BACK_OFF), \
                 patch.object(main.engine, "capture_and_stop"), \
                 patch.object(main.cfg, "get_settings", return_value={}):
-            main.apply_health("9", self.INST, st)
+            app_state.apply_health("9", self.INST, st)
         # An hour, not the ordinary cooldown: the line still retries by itself, but at a
         # pace that stops the churn while whatever broke every exit at once passes.
         remaining = h["next_retry_at"] - main.time.monotonic()
-        self.assertGreater(remaining, main.failover.EXHAUSTED_RETRY_SECONDS * 0.9)
+        self.assertGreater(remaining, failover.EXHAUSTED_RETRY_SECONDS * 0.9)
 
     async def test_a_freeze_that_still_has_options_keeps_its_retry_time(self):
         h = app_state.hub.health_for("9")
         h["fail_start"] = main.time.monotonic() - 10_000
         st = {"state": "TUNNEL_DOWN", "label": "x", "reason_code": "tunnel_network",
               "reason": "x", "detail": {}}
-        with patch.object(main, "_judge_exit_failure", return_value=main.failover.HOLD), \
+        with patch.object(app_state, "_judge_exit_failure", return_value=failover.HOLD), \
                 patch.object(main.engine, "capture_and_stop"), \
                 patch.object(main.cfg, "get_settings", return_value={}):
-            main.apply_health("9", self.INST, st)
+            app_state.apply_health("9", self.INST, st)
         self.assertIsNotNone(h["next_retry_at"])
 
     async def test_registering_clears_what_the_ledger_held_against_the_exit(self):
@@ -1181,9 +1182,9 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
                                       "failures": 2, "given_up": True, "reported": True}
         st = {"state": "OK", "label": "Working", "reason_code": "ok", "reason": "",
               "detail": {}}
-        with patch.object(main, "_save_exit_ledgers"), \
+        with patch.object(app_state, "_save_exit_ledgers"), \
                 patch.object(main.cfg, "get_settings", return_value={}):
-            main.apply_health("9", self.INST, st)
+            app_state.apply_health("9", self.INST, st)
         self.assertNotIn("9", app_state.hub.exit_ledgers)
 
 

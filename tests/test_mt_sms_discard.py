@@ -27,6 +27,7 @@ from jinja2 import Environment, FileSystemLoader
 from control.app import main, store
 from tests.route_listing import api_routes
 from control.app import state as app_state
+from control.app.routers import engine as engine_routes
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES = ROOT / "engine" / "templates"
@@ -130,7 +131,7 @@ class ControlPlaneNeverSeesTheMessage(unittest.IsolatedAsyncioTestCase):
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()) as broadcast:
             store.init()
             for event in ("sms_in", "sms_out", "ussd"):
-                result = await main.api_engine_event(
+                result = await engine_routes.api_engine_event(
                     {"instance": "1", "event": event, "args": ["+447700900123", body]})
                 self.assertEqual(result, {"ok": True, "ignored": True})
             broadcast.assert_not_awaited()
