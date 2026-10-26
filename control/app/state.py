@@ -12,8 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import WebSocket, HTTPException
 
 from . import config as cfg
-from . import (engine, status as status_mod, egress, device_state, failover, vowifi_support, gate,
-               authz)
+from . import (engine, status as status_mod, sim, card, egress, device_state, failover,
+               vowifi_support, gate, authz)
 from .ami import AmiClient
 from .runtime import RuntimeRegistry
 
@@ -29,6 +29,8 @@ REG_UNANSWERED_RECOVERY_DELAY_SECONDS = float(
     os.environ.get("MDD_REG_UNANSWERED_RECOVERY_DELAY", "10"))
 REG_UNANSWERED_MIN_INTERVAL_SECONDS = float(
     os.environ.get("MDD_REG_UNANSWERED_MIN_INTERVAL", "300"))
+
+_line_state_written: dict[str, tuple[str, float]] = {}
 
 
 def _carrier_identity(value) -> dict:
@@ -512,6 +514,63 @@ def _draft_missing(inst: dict, card_info: dict, cards: list[dict]) -> list[str]:
     if card_info.get("pin_enabled") is True and not inst.get("pin"):
         missing.append("SIM PIN")
     return missing
+
+
+# Draft fields that only a card read can supply; the rest come from the operator.
+_CARD_READ_FIELDS = {"IMSI", "MCC/MNC"}
+
+
+def _merge_card_read(entry: dict, card) -> bool:
+    """Fill what an earlier read of the same card left empty. Returns whether anything did.
+
+    Identity is only ever added, never replaced: a read that fails half way must not erase
+    what a better one found. PIN retry counters are live state and are always refreshed.
+    """
+    if not card.iccid or str(card.iccid) != str(entry.get("iccid") or ""):
+        return False
+    filled = False
+    for key, value in (("imsi", card.imsi), ("mcc", card.mcc), ("mnc", card.mnc),
+                       ("mnc_len", getattr(card, "mnc_len", None)), ("smsc", card.smsc)):
+        if value not in (None, "") and not entry.get(key):
+            entry[key] = value
+            filled = True
+    if filled:
+        entry["carrier_identity"] = entry.get("carrier_identity") or _carrier_identity(card)
+    for key in ("pin_enabled", "pin_tries"):
+        if getattr(card, key, None) is not None:
+            entry[key] = getattr(card, key)
+    return filled
+
+
+async def _reread_card(name: str) -> bool:
+    """Read the card in reader `name` again and merge what the first read missed."""
+    entry = hub.cards.get(name)
+    if not entry or not entry.get("present") or hub.lpa_busy.get(name):
+        return False
+    lock = hub.reader_lock(name)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=0.5)
+    except asyncio.TimeoutError:
+        return False
+    try:
+        card = await asyncio.to_thread(sim.read_card, entry["index"])
+    except Exception as exc:  # noqa: a failed read leaves the cache as it was
+        log.debug("card re-read failed for %s: %r", name, exc)
+        return False
+    finally:
+        lock.release()
+    return _merge_card_read(entry, card)
+
+
+def _draft_needs_card_read(name: str) -> str:
+    """The draft id behind reader `name` if a card read could still complete it, else ''."""
+    entry = hub.cards.get(name) or {}
+    iid = str(entry.get("matched") or "")
+    inst = cfg.get_instance(iid) if iid and entry.get("present") else None
+    if not inst or inst.get("provisioning_state") != "draft":
+        return ""
+    missing = _draft_missing(inst, entry, hub.cards_list())
+    return iid if set(missing) & _CARD_READ_FIELDS else ""
 
 
 def _auto_promote_card_draft(inst: dict, card_info: dict, cards: list[dict]) -> dict:

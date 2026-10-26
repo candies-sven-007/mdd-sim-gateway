@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from control.app import main
+from fastapi import HTTPException
 from control.app import state as app_state
 from control.app.routers import esim as esim_routes
 
@@ -13,8 +14,8 @@ class EsimRunCoroutineCloseTests(unittest.IsolatedAsyncioTestCase):
 
         coro = work()
         with patch.object(main.asyncio, "to_thread",
-                          side_effect=main.HTTPException(409, "busy")):
-            with self.assertRaises(main.HTTPException):
+                          side_effect=HTTPException(409, "busy")):
+            with self.assertRaises(HTTPException):
                 await esim_routes._esim_run("Reader-1", 0, coro)
         # close() ran: awaiting the coroutine again raises RuntimeError instead of
         # executing the body (and CPython's "never awaited" warning stays silent).

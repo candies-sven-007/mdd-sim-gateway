@@ -8,6 +8,9 @@ from control.app import config, engine, main
 from control.app import state as app_state
 from control.app.routers import system as system_routes
 from control.app import failover
+from control.app import device_state
+from control.app.routers import lines as lines_routes
+from fastapi import HTTPException
 
 
 _lifecycle_patcher = None
@@ -118,9 +121,9 @@ class LineDeleteApiTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.engine, "delete_instance_data") as delete_data, \
                 patch.object(main.store, "clear_calls", return_value=3) as clear_calls, \
                 patch.object(main.store, "clear_line_states", return_value=7) as clear_states, \
-                patch.object(main, "_refresh_card_matches"), \
+                patch.object(lines_routes, "_refresh_card_matches"), \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()):
-            result = await main.api_instance_delete("1", delete_history=True, confirm_id="1")
+            result = await lines_routes.api_instance_delete("1", delete_history=True, confirm_id="1")
 
         suppress.assert_called_once_with("test-iccid")
         delete_config.assert_called_once_with("1")
@@ -139,16 +142,16 @@ class LineDeleteApiTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.engine, "delete_instance_data"), \
                 patch.object(main.store, "clear_calls") as clear_calls, \
                 patch.object(main.store, "clear_line_states") as clear_states, \
-                patch.object(main, "_refresh_card_matches"), \
+                patch.object(lines_routes, "_refresh_card_matches"), \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()):
-            result = await main.api_instance_delete("1", delete_history=False, confirm_id="1")
+            result = await lines_routes.api_instance_delete("1", delete_history=False, confirm_id="1")
 
         clear_calls.assert_not_called()
         self.assertFalse(result["history_deleted"])
 
     async def test_delete_requires_exact_line_id_confirmation(self):
-        with self.assertRaises(main.HTTPException) as raised:
-            await main.api_instance_delete("line-2", confirm_id="line-1")
+        with self.assertRaises(HTTPException) as raised:
+            await lines_routes.api_instance_delete("line-2", confirm_id="line-1")
         self.assertEqual(raised.exception.status_code, 400)
 
     async def test_delete_duplicate_line_starts_surviving_owner(self):
@@ -164,10 +167,10 @@ class LineDeleteApiTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.cfg, "delete_instance"), \
                 patch.object(main.engine, "delete_instance_data"), \
                 patch.object(main.store, "clear_line_states"), \
-                patch.object(main, "_refresh_card_matches"), \
+                patch.object(lines_routes, "_refresh_card_matches"), \
                 patch.object(app_state, "_auto_start_hotplugged_line", new=AsyncMock()) as start, \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()):
-            await main.api_instance_delete("old", delete_history=False, confirm_id="old")
+            await lines_routes.api_instance_delete("old", delete_history=False, confirm_id="old")
             await __import__('asyncio').sleep(0)
 
         suppress.assert_not_called()
@@ -244,7 +247,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
             "frozen_code": "tunnel_network", "frozen_reason": "failed",
             "auto_retrying": True, "retry_count": 3,
         })
-        failure = main.HTTPException(409, {
+        failure = HTTPException(409, {
             "code": "hardware_imei_required",
             "message": "private path /dev/ttyUSB2 and 123456789012345",
             "device_id": "modem-a",
@@ -320,7 +323,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_build_cache_prune_failure_is_an_actionable_http_error(self):
         with patch.object(main.operations, "prune_dangling_build_cache",
                           side_effect=RuntimeError("Docker refused builder prune")):
-            with self.assertRaises(main.HTTPException) as raised:
+            with self.assertRaises(HTTPException) as raised:
                 await system_routes.api_system_maintenance({"action": "prune_build_cache"})
         self.assertEqual(raised.exception.status_code, 502)
         self.assertIn("Docker refused", raised.exception.detail)
@@ -561,12 +564,12 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
             order.append("start")
             return {"ok": True}
 
-        with patch.object(main, "_unified_devices", new=AsyncMock(return_value=[device])), \
+        with patch.object(lines_routes, "_unified_devices", new=AsyncMock(return_value=[device])), \
                 patch.object(main.cfg, "get_instance", return_value=line), \
                 patch.object(main.engine, "is_running", return_value=False), \
                 patch.object(main.cfg, "upsert_instance", side_effect=save), \
-                patch.object(main, "api_instance_start", new=AsyncMock(side_effect=start)):
-            await main.api_device_capabilities("reader-a", {"vowifi_enabled": True})
+                patch.object(lines_routes, "api_instance_start", new=AsyncMock(side_effect=start)):
+            await lines_routes.api_device_capabilities("reader-a", {"vowifi_enabled": True})
 
         self.assertEqual(order, ["save", "start"])
 
@@ -579,7 +582,7 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         app_state._record_lifecycle.reset_mock()
         with patch.object(main.engine, "stop") as stop, \
                 patch.object(app_state.hub, "drop_ami", new=AsyncMock()) as drop_ami:
-            await main.api_instance_stop("stop-test")
+            await lines_routes.api_instance_stop("stop-test")
 
         self.assertIsNone(app_state.hub.health["stop-test"]["frozen_code"])
         self.assertIsNone(app_state.hub.health["stop-test"]["next_retry_at"])
@@ -857,7 +860,7 @@ class ImeiSourceFollowsReaderTests(unittest.TestCase):
         saved = []
         with patch.object(main.cfg, "list_instances", return_value=instances), \
                 patch.object(main.cfg, "upsert_instance", side_effect=saved.append):
-            followed = main._follow_imei_source("reader-old", "reader-new")
+            followed = lines_routes._follow_imei_source("reader-old", "reader-new")
         return followed, saved
 
     def test_the_line_naming_the_retired_id_is_repointed(self):
@@ -892,7 +895,7 @@ class HardwareImeiRecoveryTests(unittest.TestCase):
     def test_reader_rebuild_also_reuses_its_verified_line_snapshot(self):
         inst = {"imei": "123456789012345", "imei_source_device_id": "reader-a"}
         with patch.object(app_state, "_device_for_card", return_value=("reader-a", "reader")), \
-                patch.object(main.device_state, "hardware", return_value={}), \
+                patch.object(device_state, "hardware", return_value={}), \
                 patch.object(app_state, "_match_instance_by_iccid", return_value=inst):
             resolved = app_state._hardware_imei_for_card(self.CARD, [self.CARD])
         self.assertEqual(resolved, ("123456789012345", "reader-a", "reader"))
@@ -1202,9 +1205,9 @@ class StaleStatusCacheTests(unittest.TestCase):
         self.addCleanup(app_state.hub.status_cache.pop, "line-stale", None)
 
     def test_a_disabled_line_is_not_reported_from_the_cache_it_left_behind(self):
-        status = main._cached_line_status({"id": "line-stale", "enabled": False})
+        status = lines_routes._cached_line_status({"id": "line-stale", "enabled": False})
         self.assertEqual(status["state"], "STOPPED")
 
     def test_a_running_line_still_reports_its_last_observation(self):
-        status = main._cached_line_status({"id": "line-stale", "enabled": True})
+        status = lines_routes._cached_line_status({"id": "line-stale", "enabled": True})
         self.assertEqual(status["state"], "NO_CARD")

@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 
-from control.app import main
+from control.app.routers import lines as lines_routes
 from control.app import state as app_state
 
 
@@ -20,38 +20,38 @@ class PinPreflightMessageTests(unittest.TestCase):
                    {"ok": False, "code": "pin_required", "tries": 3},
                    {"ok": False, "code": "pin_invalid", "clear": True, "tries": 2},
                    {"ok": False, "code": "card_unreadable", "error": "ADF.USIM select failed"}):
-            exc = main._pin_preflight_http(pf)
+            exc = lines_routes._pin_preflight_http(pf)
             self.assertEqual(exc.status_code, 409)
             self.assertEqual(exc.detail["code"], pf["code"])
             self.assertEqual(exc.detail.get("tries"), pf.get("tries"))
             self.assertTrue(exc.detail.get("message"), pf["code"])
 
     def test_tries_are_rendered_when_known(self):
-        exc = main._pin_preflight_http({"ok": False, "code": "pin_invalid", "tries": 1})
+        exc = lines_routes._pin_preflight_http({"ok": False, "code": "pin_invalid", "tries": 1})
         self.assertIn("1 tries left", exc.detail["message"])
-        exc = main._pin_preflight_http({"ok": False, "code": "pin_required"})
+        exc = lines_routes._pin_preflight_http({"ok": False, "code": "pin_required"})
         self.assertNotIn("tries left", exc.detail["message"])
 
     def test_unknown_code_still_readable(self):
-        exc = main._pin_preflight_http({"ok": False, "code": "mystery"})
+        exc = lines_routes._pin_preflight_http({"ok": False, "code": "mystery"})
         self.assertIn("mystery", exc.detail["message"])
 
     def test_card_unreadable_names_the_read_failure_and_rules_out_a_pin(self):
         """Issue #60: an unreadable card used to fall through to 'pin_required' with an
         unknown retry counter, so the UI asked for a PIN that could not help. The message
         must carry the real read error and say a PIN is not the answer."""
-        exc = main._pin_preflight_http({"ok": False, "code": "card_unreadable",
+        exc = lines_routes._pin_preflight_http({"ok": False, "code": "card_unreadable",
                                         "error": "ADF.USIM select failed"})
         self.assertIn("ADF.USIM select failed", exc.detail["message"])
         self.assertIn("not a PIN problem", exc.detail["message"])
 
     def test_card_unreadable_without_a_detail_still_reads(self):
-        exc = main._pin_preflight_http({"ok": False, "code": "card_unreadable"})
+        exc = lines_routes._pin_preflight_http({"ok": False, "code": "card_unreadable"})
         self.assertTrue(exc.detail["message"])
         self.assertNotIn("()", exc.detail["message"])
 
     def test_no_card_carries_expected_iccid(self):
-        exc = main._pin_preflight_http({"ok": False, "code": "no_card",
+        exc = lines_routes._pin_preflight_http({"ok": False, "code": "no_card",
                                         "line_iccid": "8944000000000000001"})
         self.assertIn("8944000000000000001", exc.detail["message"])
 
@@ -62,7 +62,7 @@ class PreflightBlockLifecycleTests(unittest.TestCase):
         with patch.object(app_state, "_record_lifecycle",
                           side_effect=lambda iid, event, **kw: events.append((event, kw))):
             with self.assertRaises(HTTPException) as ctx:
-                main._raise_preflight_block("3", pf)
+                lines_routes._raise_preflight_block("3", pf)
         return events, ctx.exception
 
     def test_records_closed_event_without_identifier(self):

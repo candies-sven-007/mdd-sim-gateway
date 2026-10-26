@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, patch
 
 from control.app import device_state, main
 from control.app import state as app_state
+from control.app.routers import lines as lines_routes
+from fastapi import HTTPException
 
 
 class DeviceStateTests(unittest.TestCase):
@@ -109,10 +111,10 @@ class DeviceDisplayNameTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp:
             with patch.multiple(device_state, ROOT=temp,
                                 HARDWARE=str(Path(temp) / "devices-hardware.json")), \
-                    patch.object(main, "_unified_devices", new=AsyncMock(return_value=[device])), \
+                    patch.object(lines_routes, "_unified_devices", new=AsyncMock(return_value=[device])), \
                     patch.object(app_state.hub, "broadcast", new=AsyncMock()):
-                await main.api_device_name("reader-old", {"display_name": " Desk reader "})
-                await main.api_device_hardware("reader-old", {"imei": "490154203237518"})
+                await lines_routes.api_device_name("reader-old", {"display_name": " Desk reader "})
+                await lines_routes.api_device_hardware("reader-old", {"imei": "490154203237518"})
                 record = device_state.hardware()["reader-old"]
                 self.assertEqual(record["display_name"], "Desk reader")
                 self.assertEqual(record["name"], raw_name)
@@ -125,12 +127,12 @@ class DeviceDisplayNameTests(unittest.IsolatedAsyncioTestCase):
                                  "Desk reader")
 
     async def test_name_validation_and_missing_device(self):
-        with patch.object(main, "_unified_devices", new=AsyncMock(return_value=[])):
-            with self.assertRaises(main.HTTPException) as invalid:
-                await main.api_device_name("reader-a", {"display_name": "bad\nname"})
+        with patch.object(lines_routes, "_unified_devices", new=AsyncMock(return_value=[])):
+            with self.assertRaises(HTTPException) as invalid:
+                await lines_routes.api_device_name("reader-a", {"display_name": "bad\nname"})
             self.assertEqual(invalid.exception.status_code, 422)
-            with self.assertRaises(main.HTTPException) as missing:
-                await main.api_device_name("reader-a", {"display_name": "Desk reader"})
+            with self.assertRaises(HTTPException) as missing:
+                await lines_routes.api_device_name("reader-a", {"display_name": "Desk reader"})
             self.assertEqual(missing.exception.status_code, 404)
 
 

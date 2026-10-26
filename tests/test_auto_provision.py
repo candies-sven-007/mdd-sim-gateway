@@ -6,15 +6,18 @@ from unittest.mock import AsyncMock, patch
 from control.app import config, main
 from control.app import state as app_state
 from control.app.routers import esim as esim_routes
+from control.app import device_state
+from control.app import vowifi_support
+from control.app.routers import lines as lines_routes
 
 
 class AutoProvisionTests(unittest.TestCase):
     def setUp(self):
         # Promotion asks DNS whether the carrier publishes an ePDG; never from a unit test.
-        lookup = patch.object(main.vowifi_support, "lookup", return_value="error")
+        lookup = patch.object(vowifi_support, "lookup", return_value="error")
         lookup.start()
         self.addCleanup(lookup.stop)
-        main.vowifi_support._cache.clear()
+        vowifi_support._cache.clear()
         self.draft = {
             "id": "2", "name": "234-33", "provisioning_state": "draft",
             "enabled": False, "imsi": "234330123456789", "mcc": "234", "mnc": "33",
@@ -59,7 +62,7 @@ class AutoProvisionTests(unittest.TestCase):
             self, hardware_imei, upsert, _publish):
         hardware_imei.return_value = ("490154203237518", "test", "modem")
         upsert.side_effect = lambda value, **kwargs: value
-        with patch.object(main.vowifi_support, "lookup", return_value="nxdomain"):
+        with patch.object(vowifi_support, "lookup", return_value="nxdomain"):
             result = app_state._auto_promote_card_draft(self.draft, self.card, [self.card])
         self.assertFalse(result["enabled"])
 
@@ -219,8 +222,8 @@ class ReaderImeiCompletionTests(unittest.IsolatedAsyncioTestCase):
         ready = {**draft, "provisioning_state": "ready", "enabled": True,
                  "imei": "490154203237518"}
 
-        with patch.object(main, "_unified_devices", new=AsyncMock(return_value=[device])), \
-                patch.object(main.device_state, "set_hardware", return_value={
+        with patch.object(lines_routes, "_unified_devices", new=AsyncMock(return_value=[device])), \
+                patch.object(device_state, "set_hardware", return_value={
                     "imei": "490154203237518"}), \
                 patch.object(main.cfg, "get_instance", return_value=draft), \
                 patch.object(app_state.hub, "cards_list", return_value=[card]), \
@@ -229,7 +232,7 @@ class ReaderImeiCompletionTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(app_state, "_line_auto_start_allowed", return_value=(True, "")), \
                 patch.object(app_state, "_start_engine_checked") as start, \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()):
-            result = await main.api_device_hardware(
+            result = await lines_routes.api_device_hardware(
                 "reader-1", {"imei": "490154203237518"})
 
         promote.assert_called_once_with(draft, card, [card])
@@ -272,8 +275,8 @@ class DraftSetupGuidanceTests(unittest.IsolatedAsyncioTestCase):
     async def test_saving_the_imei_says_what_is_still_missing(self):
         device = {"id": "reader-1", "device_type": "reader", "instance_id": "2",
                   "name": "Alcor Link AK9563", "stable_path": "1-2"}
-        with patch.object(main, "_unified_devices", new=AsyncMock(return_value=[device])), \
-                patch.object(main.device_state, "set_hardware", return_value={
+        with patch.object(lines_routes, "_unified_devices", new=AsyncMock(return_value=[device])), \
+                patch.object(device_state, "set_hardware", return_value={
                     "imei": "490154203237518"}), \
                 patch.object(main.cfg, "get_instance", return_value=self.draft), \
                 patch.object(app_state.hub, "cards_list", return_value=[self.card]), \
@@ -282,7 +285,7 @@ class DraftSetupGuidanceTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.engine, "is_running", return_value=False), \
                 patch.object(app_state, "_start_engine_checked") as start, \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()):
-            result = await main.api_device_hardware("reader-1", {"imei": "490154203237518"})
+            result = await lines_routes.api_device_hardware("reader-1", {"imei": "490154203237518"})
 
         start.assert_not_called()
         self.assertFalse(result["started"])
@@ -310,13 +313,13 @@ class LateCardDataTests(unittest.IsolatedAsyncioTestCase):
 
     def test_a_later_read_only_fills_gaps(self):
         entry = self.entry(imsi="234330000000000")
-        self.assertTrue(main._merge_card_read(entry, self.card(imsi="999990000000000")))
+        self.assertTrue(app_state._merge_card_read(entry, self.card(imsi="999990000000000")))
         self.assertEqual(entry["mnc"], "33")
         self.assertEqual(entry["imsi"], "234330000000000")   # never replaced
 
     def test_a_read_of_another_card_is_ignored(self):
         entry = self.entry()
-        self.assertFalse(main._merge_card_read(entry, self.card(iccid="8944000000000000999")))
+        self.assertFalse(app_state._merge_card_read(entry, self.card(iccid="8944000000000000999")))
         self.assertIsNone(entry["mnc"])
 
     async def test_the_background_retry_completes_the_draft(self):
@@ -351,7 +354,7 @@ class LateCardDataTests(unittest.IsolatedAsyncioTestCase):
                                  return_value=("490154203237518", "reader-1", "reader")), \
                     patch.object(app_state, "_auto_start_hotplugged_line",
                                  new=AsyncMock()) as start:
-                result = await main.api_sim_detect(4)
+                result = await lines_routes.api_sim_detect(4)
                 await asyncio.sleep(0)
             self.assertEqual(result["smsc"], "+447700900000")
             start.assert_awaited_once_with("2")
@@ -370,7 +373,7 @@ class LateCardDataTests(unittest.IsolatedAsyncioTestCase):
                                  return_value=("490154203237518", "reader-1", "reader")), \
                     patch.object(app_state.hub, "broadcast", new=AsyncMock()), \
                     patch.object(app_state, "_auto_start_hotplugged_line", new=AsyncMock()) as start:
-                result = await main.api_device_sim_reread("reader-1")
+                result = await lines_routes.api_device_sim_reread("reader-1")
             self.assertEqual(result["missing"], ["MCC/MNC"])
             self.assertFalse(result["completing"])
             start.assert_not_awaited()

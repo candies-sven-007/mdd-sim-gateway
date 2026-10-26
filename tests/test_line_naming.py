@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from control.app import config
 from control.app import state as app_state
+from control.app.routers import lines as lines_routes
 
 try:
     from control.app import main
@@ -115,13 +116,13 @@ class RenameApiTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(main.egress, "publish") as publish:
                 # The WebUI submits the complete form, not a special rename request. The server
                 # must identify the effective persisted diff rather than trusting payload shape.
-                renamed = await main.api_instance_upsert({**before, "name": "New name"})
+                renamed = await lines_routes.api_instance_upsert({**before, "name": "New name"})
 
         self.assertEqual(renamed["name"], "New name")
         self.assertFalse(renamed["applied"])
         restart.assert_not_called()
         publish.assert_called_once_with()
-        self.assertTrue(main._only_instance_name_changed(
+        self.assertTrue(lines_routes._only_instance_name_changed(
             before, {**before, "name": "New name"}))
 
     async def test_a_webui_rename_cleans_old_runtime_pollution_without_restart(self):
@@ -136,7 +137,7 @@ class RenameApiTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(main.engine, "is_running", return_value=True), \
                     patch.object(app_state, "_start_engine_checked") as restart, \
                     patch.object(main.egress, "publish") as publish:
-                renamed = await main.api_instance_upsert(
+                renamed = await lines_routes.api_instance_upsert(
                     {**polluted, "name": "New name", "status": {"state": "connected"},
                      "has_pin": False})
 
@@ -155,11 +156,11 @@ class RenameApiTests(unittest.IsolatedAsyncioTestCase):
             before = cfg_temp.add("4", "234-15-6315", mcc="234", mnc="15", reader_index=5,
                                   reader_port="1-3.4.1")
             with patch.object(main.engine, "is_running", return_value=True), \
-                    patch.object(main, "_reader_index_for_instance", return_value=1), \
-                    patch.object(main, "_reader_port_for_instance", return_value="1-3.4.1"), \
+                    patch.object(lines_routes, "_reader_index_for_instance", return_value=1), \
+                    patch.object(lines_routes, "_reader_port_for_instance", return_value="1-3.4.1"), \
                     patch.object(app_state, "_start_engine_checked") as restart, \
                     patch.object(main.egress, "publish"):
-                renamed = await main.api_instance_upsert(
+                renamed = await lines_routes.api_instance_upsert(
                     {**before, "name": "voxi-THB", "mnc": "015", "reader_index": 1})
 
         self.assertFalse(renamed["applied"])
@@ -167,21 +168,21 @@ class RenameApiTests(unittest.IsolatedAsyncioTestCase):
 
     def test_a_reader_index_other_than_the_live_one_is_still_an_edit(self):
         before = {"id": "4", "name": "a", "reader_index": 5}
-        self.assertFalse(main._only_instance_name_changed(
+        self.assertFalse(lines_routes._only_instance_name_changed(
             before, {**before, "name": "b", "reader_index": 2}, {"reader_index": 1}))
-        self.assertFalse(main._only_instance_name_changed(
+        self.assertFalse(lines_routes._only_instance_name_changed(
             before, {**before, "name": "b", "reader_index": 1}, {}))
 
     def test_a_different_mnc_is_still_an_edit(self):
         before = {"id": "4", "name": "a", "mcc": "234", "mnc": "15"}
-        self.assertTrue(main._only_instance_name_changed(
+        self.assertTrue(lines_routes._only_instance_name_changed(
             before, {**before, "name": "b", "mnc": "015"}))
-        self.assertFalse(main._only_instance_name_changed(
+        self.assertFalse(lines_routes._only_instance_name_changed(
             before, {**before, "name": "b", "mnc": "10"}))
 
     def test_an_operational_edit_is_not_treated_as_a_rename(self):
         before = {"id": "1", "name": "Old name", "proxy_country": "gb"}
-        self.assertFalse(main._only_instance_name_changed(
+        self.assertFalse(lines_routes._only_instance_name_changed(
             before, {**before, "name": "New name", "proxy_country": "us"}))
 
     async def test_renaming_onto_another_lines_name_is_refused(self):
@@ -191,20 +192,20 @@ class RenameApiTests(unittest.IsolatedAsyncioTestCase):
             cfg_temp.add("2", "310-240-1234")
             with patch.object(main.asyncio, "to_thread", return_value=False):
                 with self.assertRaises(HTTPException) as refused:
-                    await main.api_instance_upsert({"id": "2", "name": "giff"})
+                    await lines_routes.api_instance_upsert({"id": "2", "name": "giff"})
                 self.assertEqual(refused.exception.status_code, 409)
 
                 # Saving a line under its own name, and a free name, both still work.
-                kept = await main.api_instance_upsert({"id": "2", "name": "310-240-1234"})
+                kept = await lines_routes.api_instance_upsert({"id": "2", "name": "310-240-1234"})
                 self.assertEqual(kept["name"], "310-240-1234")
-                renamed = await main.api_instance_upsert({"id": "2", "name": "Home"})
+                renamed = await lines_routes.api_instance_upsert({"id": "2", "name": "Home"})
                 self.assertEqual(renamed["name"], "Home")
 
     async def test_an_edit_that_carries_no_name_is_unaffected(self):
         with TempConfig() as cfg_temp:
             cfg_temp.add("1", "Giff")
             with patch.object(main.asyncio, "to_thread", return_value=False):
-                saved = await main.api_instance_upsert({"id": "1", "proxy_country": "gb"})
+                saved = await lines_routes.api_instance_upsert({"id": "1", "proxy_country": "gb"})
         self.assertEqual(saved["name"], "Giff")
 
 
