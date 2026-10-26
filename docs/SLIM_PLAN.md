@@ -347,4 +347,44 @@ nft table inet mdd:
   - 删除：`host/vpcd_modem_bridge.py`、`host/modem_probe.py`、`control/app/modem_ims.py`、`control/app/modem_voice.py`，模块相关接口（cellular、ims、voice-audio、usb-candidates、modem-profiles），设置里的 `hardware`/`device_defaults`（config.load 会丢弃旧文件里的这两个键），WebUI 的 4G/飞行模式/模块 IMS/通话音频/模块拨号，以及对应测试与 92 条 i18n。
   - orchestrator 只保留出口（sing-box/xray）、路由、时区与服务重启；阶段 4 再按 netns 方案改写。
   - 留给后续阶段：设置页"维护/存储"里仍有 Docker 镜像与构建缓存相关的 UI 和后端字段（阶段 4/5 随 systemd 化删除）；`main.py` 里 `msisdn_source == "modemmanager"` 的旧记录兼容逻辑仍在（无害，读卡器不会产生该来源，阶段 3 拆分时再评估）；`test_operations` 中 host-diagnostics 的测试数据仍是模块字段（只测透传与脱敏），阶段 4 改写 host-diagnostics 时一起更新；MediaModePanel 的 relay 模式留到阶段 4。
+- 2026-10-26 插入的两个单独提交：6f912d4 ci.yml 的 push/PR 触发加上 `slim-reader-vowifi`；9fcbe5c WebUI 的 vite 固定为 6.4.4。原因：CI 的 npm audit 报 vite <=6.4.3 的 high 级公告 GHSA-587h-7wmj-h5pm 等。vite 是直接的 devDependency，lock 文件与上游 761d38e 相同，不是本分支引入的。lock 只改了 vite 一项。
+- 2026-10-26 阶段 3 进行中（main.py 5002 → 2391 行），每个 router 单独提交，提交前全量测试通过（978 个）：
+  - 已拆出：
+    - e1b8942 auth：同时加入 `tests/test_route_set.py`，固定拆分前的 (path, method) 集合；加入 `tests/route_listing.py`。FastAPI 0.141 的 `app.routes` 里，被 include 的 router 只占一项、不展开，所以 authz、路由集合、无短信接口这三个测试要遍历进去。
+    - a879084 esim，并新建 state.py
+    - 9b47915 egress
+    - 43824f8 logs
+    - cc04b7f system
+    - f6ef110 softphone
+    - 85107f4 engine
+  - 还剩，按顺序：
+    1. lines：/api/instances、/api/provision、/api/cards、/api/readers、/api/sim/*、/api/ports/suggest、/api/devices
+    2. tasks.py：card_monitor、status_poller、host_health_poller、media_supervisor 及只被它们用的辅助函数，例如 msisdn 学习、线路状态记录、媒体收敛
+    3. 收尾：main.py 只留应用创建、gate 中间件、审计中间件、include_router、lifespan、静态 WebUI；删除 tools/slim/；在 SLIM_PLAN 中标记阶段 3 完成。
+  - 拆分方法：
+    - 用 `tools/slim/` 里的临时生成器（说明见其 README），每一步都从 `tools/slim/main_source.py` 重新生成全部模块。
+    - 跨模块引用一律写成 `app_state.名字`、`<router>_routes.名字`，所以 patch 定义它的模块就能作用到所有调用方，main.py 里不留兼容别名。
+    - state 模块用别名 `app_state` 导入，因为很多函数里有名为 `state` 的局部变量。
+    - 每个模块各自定义 `log = logging.getLogger("vowifi.main")`，日志名不变。
+  - 唯一的代码改动：maintenance 的 refresh_egress 原来直接调用 egress 的路由函数。现在把函数体提到 `state.refresh_egress()`，两个路由都调用它，避免 router 之间互相导入。
+  - state.py 现在放了什么（1275 行）、为什么放在那里：
+    - 规则：被两个及以上模块（router、或仍留在 main 的路由/后台任务）使用的函数，连同它依赖的东西，都放进 state.py。router 只依赖 state 和业务模块。
+    - 具体内容：
+      - Hub 类和 hub 实例
+      - 卡片草稿与热插拔自动建线：_ensure_card_draft、_auto_promote_card_draft、_auto_start_hotplugged_line、_line_auto_start_allowed、_draft_missing、_next_instance_id、_match_instance_by_iccid、_find_running_by_reader、_start_engine_checked
+      - 读卡器与 IMEI 绑定：_live_reader_binding_for_instance、_device_for_card、_hardware_imei_for_card、_apply_current_hardware_imei
+      - 生命周期记录：_record_lifecycle
+      - 健康与恢复：apply_health、_auto_recover_instance、_judge_exit_failure、_local_card_fault、_peer_line_registered、出口账本、push_status、_with_status_activity。计划 §3 原本写把 apply_health 放进 engine router，但状态轮询任务也调用它，所以只能放在 state。
+      - 主机告警状态文件
+      - refresh_egress
+      - 运营商标识辅助函数
+  - 测试 patch 目标的进度：
+    - 已改到 app_state 或新 router 模块的测试：test_auto_provision、test_device_state、test_engine_restart_evidence、test_esim_409_structured、test_esim_run_coroutine_close、test_line_lifecycle、test_line_naming、test_media_control、test_mt_sms_discard、test_operations、test_pin_preflight_message、test_reader_line_rebind、test_vowifi_support、test_wrong_card_attribution、test_service_codes、test_softphone_ws、test_gate、test_authz。
+    - test_wrong_card_attribution 中对 egress/failover/engine 的重绑定是手工改到 app_state 的。
+    - 读源码的测试（test_stalled_exit、test_i18n_coverage 的 reason 扫描、test_ui_rekey_labels）改为通过 `tests/control_source.py` 读整个控制面。已核对 reason 集合与原 main.py 相同。
+    - 还在通过 main 访问的（都属于 lines 或后台任务，会在后面两步由 retarget 自动改写）：
+      - test_auto_provision、test_device_state、test_line_lifecycle、test_line_naming、test_media_control、test_pin_preflight_message：涉及 _unified_devices、extract_msisdn、_refresh_card_matches、_reader_index/port_for_instance、api_instance_*、api_device_*、_media_retry、_sustained_alerts、_outage_detail、_poll_instance_status、_CARD_REREAD_DELAYS、MSISDN_VERIFY_INTERVAL_SECONDS 等。
+      - test_webui_caching 用的 main._HashedAssets 会留在 main，不需要改。
+      - 测试里的 `main.cfg`、`main.engine` 这类业务模块引用，在 main 不再导入它们时由 retarget 改成直接导入。
+  - 下一步的第一条具体动作（在仓库根目录、用 3.12 venv）：`timeout 120 python tools/slim/split_gen.py tools/slim/main_source.py auth,esim,egress,logs,system,softphone,engine,lines --list`，然后运行 pyflakes，再运行 `python tools/slim/retarget.py`，并处理它输出的 MANUAL 行，最后跑全量测试、提交 lines。
 
