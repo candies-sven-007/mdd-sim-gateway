@@ -15,14 +15,9 @@ cookie is SameSite=Strict, but "site" means the registrable domain: a page on a 
 always send ``Origin`` on a WebSocket handshake and a page cannot change it, so the handshake is
 accepted only when that origin is the host the browser asked for.
 
-A client app (clients.py) presents ``Authorization: Bearer`` instead. A request that carries
-that header is judged by the token alone -- the cookie is ignored -- so it needs no CSRF token
-(nothing attaches a bearer token by itself) and no origin (it is not a page), and the cookie's
-own CSRF and origin checks are untouched by it.
-
 Once the caller is known, authz.allowed decides whether they may make this request. Revoking a
-credential also closes the WebSockets opened with it (``revoke``), so a signed-out browser or a
-thrown-off phone stops receiving events at once rather than at its next reconnect.
+credential also closes the WebSockets opened with it (``revoke``), so a signed-out browser
+stops receiving events at once rather than at its next reconnect.
 """
 from __future__ import annotations
 
@@ -38,14 +33,13 @@ from starlette.requests import cookie_parser
 from starlette.responses import JSONResponse
 from starlette.websockets import WebSocket
 
-from . import auth, authz, clients
+from . import auth, authz
 from . import config as cfg
 
 log = logging.getLogger("mdd.gate")
 
-# Where one signs in. They ignore any credential the caller still holds: an app signing in
-# again after its token was revoked would otherwise be refused for presenting the old one.
-SIGN_IN_PATHS = frozenset({"/api/auth/setup", "/api/auth/login", "/api/auth/client/login"})
+# Where one signs in.
+SIGN_IN_PATHS = frozenset({"/api/auth/setup", "/api/auth/login"})
 PUBLIC_PATHS = SIGN_IN_PATHS | {"/api/auth/status"}
 ENGINE_EVENT_PATH = "/api/engine/event"
 MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -54,7 +48,7 @@ ENGINE_TOKEN_HEADER = "x-mdd-engine-token"
 
 # WebSocket close codes. 4401: the credential is missing, expired or revoked -- sign in again.
 # 4403: this caller may not open this socket, or the page is not one the gateway serves;
-# signing in again would not change that, so clients do not retry.
+# signing in again would not change that, so the page does not retry.
 WS_UNAUTHENTICATED = 4401
 WS_FORBIDDEN = 4403
 
@@ -67,10 +61,9 @@ HTTPS_PORT = 443
 class Principal:
     """The caller of one request or socket."""
 
-    kind: str                   # "admin" | "client" | "engine" | "anonymous"
+    kind: str                   # "admin" | "engine" | "anonymous"
     csrf: str = ""              # the session's CSRF token; only a cookie session has one
-    client_id: int | None = None
-    # Names the credential for revocation without being it: "session:<digest>" or "client:<id>".
+    # Names the credential for revocation without being it: "session:<digest>".
     credential: str = ""
 
     @property
@@ -80,7 +73,7 @@ class Principal:
     @property
     def label(self) -> str:
         """Who acted, for the audit log."""
-        return f"client:{self.client_id}" if self.kind == "client" else self.kind
+        return self.kind
 
 
 ANONYMOUS = Principal("anonymous")
@@ -109,7 +102,7 @@ def _cookie(headers: dict[str, str], name: str) -> str:
 
 def _session(headers: dict[str, str]) -> Principal | None:
     token = _cookie(headers, auth.SESSION_COOKIE) or None
-    # Every browser session and client token was issued by an administrator. `install.sh
+    # Every browser session was issued by an administrator. `install.sh
     # reset-admin` removes the account without restarting anything, so until a new one is set
     # up there is nobody for them to speak for.
     if not token or not auth.configured():
@@ -119,25 +112,6 @@ def _session(headers: dict[str, str]) -> Principal | None:
         return None
     return Principal("admin", csrf=str(current.get("csrf") or ""),
                      credential="session:" + auth.session_key(token))
-
-
-def bearer_token(headers: dict[str, str]) -> str:
-    value = headers.get("authorization", "").strip()
-    return value[7:].strip() if value[:7].lower() == "bearer " else ""
-
-
-def _has_bearer(scope, headers: dict[str, str]) -> bool:
-    return "authorization" in headers and scope.get("path") not in SIGN_IN_PATHS
-
-
-def _client(headers: dict[str, str]) -> Principal | None:
-    token = bearer_token(headers)
-    if not token or not auth.configured():   # see _session
-        return None
-    record = clients.resolve(token)
-    if not record:
-        return None
-    return Principal("client", client_id=record["id"], credential=f"client:{record['id']}")
 
 
 def _engine(headers: dict[str, str]) -> Principal | None:
@@ -180,17 +154,12 @@ class Source:
 SOURCES: tuple[Source, ...] = (
     # Static assets stay public so the browser can render the login screen.
     Source("static", "http", lambda scope, headers: not _api(scope), _nobody, required=False),
-    # A request that names a bearer token is judged by it alone, wherever it goes under /api/.
-    Source("bearer", "http", lambda scope, headers: _has_bearer(scope, headers), _client,
-           refusal="invalid or revoked client token"),
     # Reachable signed out; a session, if there is one, is still reported to the handler.
     Source("public", "http", lambda scope, headers: scope.get("path") in PUBLIC_PATHS, _session,
            required=False),
     Source("engine", "http", lambda scope, headers: scope.get("path") == ENGINE_EVENT_PATH,
            _engine, refusal="invalid engine token"),
     Source("session", "http", _api, _session, csrf=True),
-    Source("bearer socket", "websocket", lambda scope, headers: _has_bearer(scope, headers),
-           _client),
     Source("socket", "websocket", lambda scope, headers: True, _session, origin=True),
 )
 
@@ -308,12 +277,12 @@ _live = _LiveSockets()
 
 
 def revoke(credential: str) -> int:
-    """Close the WebSockets opened with this credential (a sign-out or a revoked client)."""
+    """Close the WebSockets opened with this credential (a sign-out)."""
     return _live.revoke(lambda item: bool(credential) and item == credential)
 
 
 def revoke_kind(kind: str) -> int:
-    """Close every WebSocket of one kind of credential: "session" or "client"."""
+    """Close every WebSocket of one kind of credential, e.g. "session"."""
     return _live.revoke(lambda item: item.startswith(kind + ":"))
 
 
@@ -418,8 +387,7 @@ class Gate:
 
         A browser that asked for a subprotocol (the softphone's ``sip``) fails any handshake whose
         answer does not name one, so that socket is refused before it is accepted; the client sees
-        a failed handshake (HTTP 403). A native client learns why from any API request, which
-        answers 401 for a revoked token. (An ASGI denial response would carry the status itself,
+        a failed handshake (HTTP 403). (An ASGI denial response would carry the status itself,
         but uvicorn's default implementation logs every one as an error.) Anything else is
         accepted first, because a browser reports the close code only for an open socket: the
         WebUI's event socket relies on seeing 4401 to know the session has ended.

@@ -871,8 +871,7 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.cfg, "get_settings", return_value={}), \
                 patch.object(main, "_start_engine_checked") as restart, \
                 patch.object(main.hub, "drop_ami", new=AsyncMock()), \
-                patch.object(main.hub, "broadcast", new=AsyncMock()), \
-                patch.object(main.notify_push, "dispatch") as dispatch:
+                patch.object(main.hub, "broadcast", new=AsyncMock()) as dispatch:
             await main._verify_ims_msisdn("5", inst)
             for _ in range(20):
                 await __import__("asyncio").sleep(0.01)
@@ -890,9 +889,9 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
         # The dialplan is a snapshot from container start, so the line must be rebuilt or it
         # keeps presenting the old number as caller identity.
         restart.assert_called_once()
+        # Announced to the WebUI (there are no outbound push channels in this build).
         dispatch.assert_called_once()
-        self.assertEqual(dispatch.call_args.args[1], main.notify_push.EV_NUMBER_CHANGED)
-        self.assertIn("+447700900456", dispatch.call_args.args[4])
+        self.assertEqual(dispatch.call_args.args[0]["event"], "msisdn_updated")
         # Nothing is asked of the carrier. Forcing a REGISTER to produce a readable identity
         # is what issue #8 reported: some IMS cores answer it with 503, Asterisk reports a
         # rejected registration, and the health policy takes a working line down.
@@ -1262,8 +1261,6 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
                 seen.append((action, to_thread))
         action, to_thread = seen[-1]
         self.assertEqual(action, main.failover.BACK_OFF)
-        self.assertEqual(to_thread.call_args[0][0], main.notify_push.dispatch)
-        self.assertEqual(to_thread.call_args[0][2], main.notify_push.EV_LINE_UNRECOVERABLE)
         self.assertTrue(main.hub.exit_ledgers["9"]["exhausted"])
         # The slow retries that follow keep backing off without announcing again.
         action, _reselect, to_thread = self._judge("DOWN", 0)

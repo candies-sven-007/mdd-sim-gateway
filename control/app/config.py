@@ -79,9 +79,6 @@ DEFAULTS = {
         "debug": {"asterisk": False, "charon": False, "pcap": False, "ami": False},
         "manager_url": "",          # reachable URL engines POST events to (auto if empty)
         "retry": {"max": 3, "interval": 30},   # auto-retry attempts + seconds per attempt
-        # Minutes an enabled line may stay off the network before the line_offline notification
-        # is sent. Short outages are the retry policy's job; this is for the ones it is losing.
-        "line_offline_notify_minutes": 10,
         # Proactive IKEv2 SA rekey. IKEv2 does NOT negotiate SA lifetime on the wire (RFC 7296
         # dropped it), so rekey timing is local policy (3GPP TS 24.302 clause 7.2.2C: use a
         # configured value, else an implementation value). We rekey the CHILD (ESP) SA every
@@ -128,67 +125,12 @@ DEFAULTS = {
                  "at_interface": 2},
             ],
         },
-        # Outbound push notifications for incoming events (SMS / calls). Every channel is
-        # independent and gated on their own `enabled` flag + per-event checkboxes.
-        "webhook": {
-            "enabled": False,
-            "format": "generic",
-            "method": "POST",
-            "body_mode": "json",
-            "url": "",
-            "headers_json": "{}",
-            "payload_template": "",
-            "message_templates": {},
-            "verify_tls": True,
-            "events": {"incoming_sms": True, "incoming_call": True,
-                       "missed_call": True, "voicemail_received": True,
-                       "keepalive_result": True, "balance_low": True,
-                       "software_update": True},
-        },
-        "telegram": {
-            "enabled": False,
-            "bot_token": "",
-            "chat_id": "",
-            "proxy_mode": "direct",
-            "proxy_profile_id": "",
-            "proxy_url": "",
-            "proxy_country": "",
-            "message_templates": {},
-            "events": {"incoming_sms": True, "incoming_call": True,
-                       "missed_call": True, "voicemail_received": True,
-                       "keepalive_result": True, "balance_low": True,
-                       "software_update": True},
-        },
-        "pushplus": {
-            "enabled": False,
-            "token": "",
-            "topic": "",
-            "template": "html",
-            "channel": "wechat",
-            "message_templates": {},
-            "events": {"incoming_sms": True, "incoming_call": True,
-                       "missed_call": True, "voicemail_received": True,
-                       "keepalive_result": True, "balance_low": True,
-                       "software_update": True},
-        },
-        "feishu": {
-            "enabled": False,
-            "url": "",
-            "secret": "",
-            "channels": [],
-            "message_templates": {},
-            "events": {"incoming_sms": True, "incoming_call": True,
-                       "missed_call": True, "voicemail_received": True,
-                       "keepalive_result": True, "balance_low": True,
-                       "software_update": True},
-        },
         "security": {
             "https_only": True,
             "trusted_proxies": [],
             "audit_enabled": True,
         },
         "maintenance": {
-            "notification_history_days": 30,
             "support_bundle_log_lines": 500,
         },
 
@@ -345,77 +287,6 @@ def load() -> dict:
                                     **(data.get("settings", {}).get("rekey", {}))}
         out["settings"]["debug"] = {**DEFAULTS["settings"]["debug"],
                                     **(data.get("settings", {}).get("debug", {}))}
-        # notification channels: merge one level deep (like tls/retry) so a saved config that
-        # predates these keys — or omits the nested `events` map — still gets full defaults.
-        for key in ("webhook", "telegram", "pushplus", "feishu"):
-            saved = data.get("settings", {}).get(key, {}) or {}
-            merged = {**DEFAULTS["settings"][key], **saved}
-            merged["events"] = {**DEFAULTS["settings"][key]["events"],
-                                **(saved.get("events", {}) or {})}
-            # Number keeping superseded the old manually-entered activation countdown. Do not
-            # preserve its hidden checkbox forever when loading a pre-keepalive config.
-            merged["events"].pop("activation_reminder", None)
-            out["settings"][key] = merged
-        # Feishu originally stored one bot directly under ``settings.feishu``. Preserve that
-        # shape on disk for rollback compatibility, while exposing it as a synthetic channel
-        # when no explicit multi-channel list has been saved yet.
-        feishu = out["settings"]["feishu"]
-        saved_feishu = data.get("settings", {}).get("feishu", {}) or {}
-        channels = feishu.get("channels")
-        if not isinstance(channels, list):
-            channels = []
-        normalized_channels = []
-        for channel in channels:
-            if not isinstance(channel, dict):
-                continue
-            item = dict(channel)
-            item["events"] = {**DEFAULTS["settings"]["feishu"]["events"],
-                              **(channel.get("events", {}) or {})}
-            item["events"].pop("activation_reminder", None)
-            item["message_templates"] = dict(channel.get("message_templates", {}) or {})
-            item["instances"] = [str(value) for value in (channel.get("instances") or [])
-                                 if str(value).strip()]
-            normalized_channels.append(item)
-        if "channels" not in saved_feishu and (feishu.get("url") or feishu.get("enabled")):
-            normalized_channels.append({
-                "id": "legacy",
-                "name": "Feishu / Lark",
-                "enabled": bool(feishu.get("enabled")),
-                "url": str(feishu.get("url") or ""),
-                "secret": str(feishu.get("secret") or ""),
-                "instances": [],
-                "message_templates": dict(feishu.get("message_templates", {}) or {}),
-                "events": dict(feishu.get("events", {}) or {}),
-            })
-        feishu["channels"] = normalized_channels
-        # Telegram is notification-only. Drop command settings left by an older configuration
-        # so an upgrade cannot preserve a remote call/SMS control channel.
-        out["settings"]["telegram"].pop("commands", None)
-        # One private deployment previously appeared as a product-level "Universal Push"
-        # preset. Present it as the ordinary custom webhook it really is, preserving its URL,
-        # source field and token header. Saving Settings persists the standard representation.
-        webhook = out["settings"]["webhook"]
-        if webhook.get("format") == "universal_push":
-            source = str(webhook.pop("source", "") or "otptool")
-            token = str(webhook.pop("token", "") or "")
-            try:
-                headers = json.loads(webhook.get("headers_json") or "{}")
-                if not isinstance(headers, dict):
-                    headers = {}
-            except (TypeError, ValueError):
-                headers = {}
-            if token:
-                headers.setdefault("X-App-Token", token)
-            webhook.update({
-                "format": "custom",
-                "body_mode": "json",
-                "headers_json": json.dumps(headers, ensure_ascii=False),
-                "payload_template": json.dumps({
-                    "source": source,
-                    "title": "{{title}}",
-                    "content": "{{content}}",
-                }, ensure_ascii=False),
-            })
         esim_saved = data.get("settings", {}).get("esim", {}) or {}
         out["settings"]["esim"] = {**DEFAULTS["settings"]["esim"], **esim_saved}
         for key in ("proxy", "hardware", "security", "maintenance", "device_defaults"):
@@ -464,28 +335,6 @@ def load() -> dict:
         proxy["schema_version"] = 2
         proxy["profiles"] = profiles
         proxy["exits"] = exits
-        # A subscription names a collection of nodes, not one deterministic HTTP route.  Older
-        # builds nevertheless allowed Telegram and the updater to select it from the shared
-        # library, then silently reused the first ready country exit backed by that subscription.
-        # Preserve that effective route by making the country explicit on load.  Prefer an
-        # enabled exit, while retaining the first assigned exit as a fallback for configurations
-        # whose country routing is temporarily disabled.
-        def subscription_country(profile_id: str) -> str:
-            assigned = [(str(country).lower(), exit_cfg)
-                        for country, exit_cfg in exits.items()
-                        if re.fullmatch(r"[a-zA-Z]{2}", str(country))
-                        and isinstance(exit_cfg, dict)
-                        and exit_cfg.get("profile_id") == profile_id]
-            return next((country for country, exit_cfg in assigned if exit_cfg.get("enabled")),
-                        assigned[0][0] if assigned else "")
-
-        telegram = out["settings"]["telegram"]
-        telegram_profile_id = str(telegram.get("proxy_profile_id") or "")
-        if str(telegram.get("proxy_mode") or "direct").lower() == "library" \
-                and (profiles.get(telegram_profile_id) or {}).get("type") == "subscription":
-            country = subscription_country(telegram_profile_id)
-            if country:
-                telegram.update(proxy_mode="country", proxy_profile_id="", proxy_country=country)
         # Asterisk debug includes complete SIP messages and IMS identities.  Older manual
         # provisioning forms accidentally enabled it by default, so normalize every loaded
         # line as well as new writes; this makes an upgrade safe before the operator next edits

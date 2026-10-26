@@ -32,10 +32,10 @@ from fastapi.staticfiles import StaticFiles
 from starlette import formparsers as starlette_formparsers
 
 from . import config as cfg
-from . import (store, engine, status as status_mod, sim, card, notify_push, lpa, auth,
+from . import (store, engine, status as status_mod, sim, card, lpa, auth,
                estkme, usbreader, egress, device_state, operations,
                sysinfo, failover, carrier_id, softphone_ws, modem_ims, vowifi_support,
-               modem_voice, gate, line_offline, media, clients, authz)
+               modem_voice, gate, media, authz)
 
 from .version import SOURCE_URL, VERSION
 from .ami import AmiClient
@@ -460,11 +460,7 @@ class Hub:
         self.reg_unanswered_recovery_at: dict[str, float] = {}
         self.status_cache: dict[str, dict] = {}  # background sampled; HTTP never probes devices
         self.status_sampled_at: dict[str, float] = {}  # last authoritative status observation
-        self._pushed_calls: set[int] = set() # call-record ids already push-notified (dedupe)
-        # Separate from _pushed_calls: one call legitimately raises BOTH an incoming_call (on
-        # the first INVITE) and a missed_call (when it ends unanswered), so they cannot share
-        # a dedupe set. Keyed by call-record id because call_result retries and can re-enter.
-        self._pushed_missed: set[int] = set()
+
 
         # Per-reader serialization for PC/SC APDU access (sim.read_card / PIN / lpac).
         # lpac opens SCARD_SHARE_EXCLUSIVE; concurrent connect/APDU on the same reader
@@ -485,7 +481,7 @@ class Hub:
         # the API only marks currently visible items handled.
         self.host_alert_state: dict | None = None
         # Per-line outage clock for the offline notification; loaded on the first pass.
-        self.line_offline_state: dict[str, dict] | None = None
+
 
     def cards_list(self) -> list[dict]:
         """Reader/card entries sorted by current PC/SC index (the UI display order)."""
@@ -1396,11 +1392,6 @@ async def _verify_ims_msisdn(iid: str, inst: dict) -> None:
         client.msisdn = observed
     await hub.broadcast({"type": "engine", "instance": iid,
                          "event": "msisdn_updated", "args": []})
-    asyncio.create_task(asyncio.to_thread(
-        notify_push.dispatch, cfg.get_settings(), notify_push.EV_NUMBER_CHANGED, updated,
-        observed, f"{stored or '(未知)'} → {observed}\n"
-                  "运营商在 IMS 注册时下发了新号码（通常是携号转网）。线路已重建，"
-                  "主叫身份和短信发信人已同步更新。"))
 
 
 async def learn_msisdn(iid):
@@ -1718,7 +1709,7 @@ async def status_poller():
             await sync_modem_msisdns()
             await asyncio.gather(*(_poll_instance_status(inst)
                                    for inst in instances))
-            await _check_line_offline(instances)
+
             if time.monotonic() - last_prune >= LINE_HISTORY_PRUNE_INTERVAL_SECONDS:
                 last_prune = time.monotonic()
                 await asyncio.to_thread(store.prune_line_states,
@@ -1729,117 +1720,6 @@ async def status_poller():
             await asyncio.wait_for(hub.status_wakeup.wait(), timeout=_status_poll_delay(instances))
         except asyncio.TimeoutError:
             pass
-
-
-def _line_offline_observation(inst: dict) -> tuple[str | None, str]:
-    """Classify a line's latest sample for the offline notification.
-
-    Driven by the user's intent rather than by the status label: an enabled line whose
-    container is not running reads STOPPED, which the timeline files as "off", but nobody
-    asked for it to be off and it is exactly the kind of silent outage this exists to report.
-    """
-    iid = str(inst["id"])
-    if not inst.get("enabled", True) or inst.get("provisioning_state") == "draft":
-        return line_offline.IGNORE, ""
-    st = hub.status_cache.get(iid)
-    if not st:
-        return None, ""
-    state = str(st.get("state") or "").upper()
-    if state == "OK":
-        return line_offline.UP, ""
-    if _line_state_kind(st) is None:
-        return None, ""
-    allowed, blocked = _line_auto_start_allowed(inst)
-    if not allowed and blocked != "no_card":
-        return line_offline.IGNORE, ""
-    return line_offline.DOWN, line_offline.reason_text(state, str(st.get("reason_code") or ""))
-
-
-def _line_offline_state_path() -> str:
-    return os.path.join(cfg.DATA_DIR, "line-offline-state.json")
-
-
-def _load_line_offline_state() -> dict[str, dict]:
-    try:
-        with open(_line_offline_state_path(), encoding="utf-8") as handle:
-            return line_offline.restore(json.load(handle))
-    except (OSError, ValueError):
-        return {}
-
-
-def _save_line_offline_state(state: dict) -> None:
-    path = _line_offline_state_path()
-    try:
-        temporary = path + ".tmp"
-        with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(state, handle)
-        os.replace(temporary, path)
-    except OSError as exc:
-        log.debug("cannot persist line offline state: %r", exc)
-
-
-def _line_offline_clock(wall: float) -> str:
-    return datetime.fromtimestamp(wall, _local_tz()).strftime("%m-%d %H:%M")
-
-
-async def _check_line_offline(instances: list[dict]) -> None:
-    """Announce lines that stayed offline past the threshold, and their recovery."""
-    try:
-        if hub.line_offline_state is None:
-            hub.line_offline_state = await asyncio.to_thread(_load_line_offline_state)
-        settings = cfg.get_settings()
-        observations = {str(inst["id"]): _line_offline_observation(inst) for inst in instances}
-        went_offline, recovered, changed = line_offline.evaluate(
-            hub.line_offline_state, observations, line_offline.threshold_seconds(settings),
-            time.time(), time.monotonic())
-        if changed:
-            await asyncio.to_thread(_save_line_offline_state,
-                                    line_offline.persistable(hub.line_offline_state))
-        by_id = {str(inst["id"]): inst for inst in instances}
-        for event, entries in ((notify_push.EV_LINE_OFFLINE, went_offline),
-                               (notify_push.EV_LINE_RECOVERED, recovered)):
-            if entries:
-                _announce_line_offline(settings, event, entries, by_id)
-    except Exception as exc:  # noqa - a notification must never stall status sampling
-        log.debug("line offline check failed: %r", exc)
-
-
-def _announce_line_offline(settings: dict, event: str, entries: list[dict],
-                           by_id: dict[str, dict]) -> None:
-    offline = event == notify_push.EV_LINE_OFFLINE
-    for entry in entries:
-        log.warning("line %s %s %.0fs offline", entry["instance"],
-                    "has been" if offline else "recovered after", entry["duration"])
-
-    def describe(entry: dict) -> str:
-        head = (f"已离线 {line_offline.format_duration(entry['duration'])}"
-                f"（自 {_line_offline_clock(entry['since'])} 起）")
-        return f"{head}。\n{entry['reason']}" if offline and entry.get("reason") else f"{head}。"
-
-    if len(entries) == 1:
-        entry = entries[0]
-        inst = by_id.get(entry["instance"]) or {"id": entry["instance"]}
-        tail = ("网关仍在自动重试，恢复后会再通知。" if offline
-                else "线路已重新注册，可以正常收发短信和通话。")
-        text = f"{describe(entry)}\n{tail}"
-        source = inst.get("msisdn") or ""
-        target, match = inst, None
-    else:
-        # Lines that drop together share a cause — the uplink, the exit, the power — and one
-        # message says so better than a burst of identical ones. Feishu bots routed by line
-        # still receive it when any of their lines is among them.
-        names = []
-        for entry in entries:
-            inst = by_id.get(entry["instance"]) or {}
-            name = inst.get("name") or f"线路 {entry['instance']}"
-            names.append(f"• {name}：{describe(entry).replace(chr(10), ' ')}")
-        tail = ("多条线路同时离线，通常是网络、出口或供电问题。网关仍在自动重试。" if offline
-                else "以上线路已重新注册。")
-        text = "\n".join([*names, "", tail])
-        target = {"id": "", "name": f"{len(entries)} 条线路"}
-        source, match = "", [entry["instance"] for entry in entries]
-    asyncio.create_task(asyncio.to_thread(
-        notify_push.dispatch, settings, event, target, source, text, match))
 
 
 HOST_ALERT_POLL_SECONDS = 60.0
@@ -1926,10 +1806,6 @@ async def host_health_poller():
                                 item.get("detail"))
                 await hub.broadcast({"type": "host_alert",
                                      "alerts": [item["code"] for item in fresh]})
-                asyncio.create_task(asyncio.to_thread(
-                    notify_push.dispatch, cfg.get_settings(), notify_push.EV_HOST_ALERT,
-                    {"id": "host", "name": snapshot.get("model") or "gateway"},
-                    snapshot.get("model") or "gateway", _host_alert_summary(fresh)))
             if fresh or codes != previous_alerts:
                 previous_alerts = codes
                 await asyncio.to_thread(_save_host_alert_state, state)
@@ -2142,9 +2018,6 @@ def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> st
             action == failover.BACK_OFF and not was_backing_off):
         text = failover.summarise(ledger, action, country, pinned)
         log.warning("line %s: %s", iid, text)
-        asyncio.create_task(asyncio.to_thread(
-            notify_push.dispatch, cfg.get_settings(), notify_push.EV_LINE_UNRECOVERABLE,
-            inst, node or country.upper(), text))
     return action
 
 
@@ -2670,12 +2543,7 @@ app.add_middleware(gate.Gate)
 def api_auth_status(request: Request):
     who = gate.current(request)
     body = {"configured": auth.configured(), "authenticated": who.kind == "admin",
-            "username": auth.username(), "csrf": who.csrf,
-            # What this gateway offers a client app, which may be newer or older than it.
-            "api": 1, "features": ["client_tokens"]}
-    if who.kind == "client":
-        # A client that reaches this is signed in: its token was checked on the way.
-        body.update({"authenticated": True, "kind": "client", "client_id": who.client_id})
+            "username": auth.username(), "csrf": who.csrf, "api": 1, "features": []}
     return body
 
 
@@ -2687,11 +2555,9 @@ def api_auth_setup(body: dict, request: Request):
         auth.setup(str(body.get("password") or ""), str(body.get("username") or "admin"))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    # Setting up again follows `install.sh reset-admin` -- typically because a phone or a
-    # password was lost -- so nothing signed in with the old account survives it.
-    clients.revoke_all()
+    # Setting up again follows `install.sh reset-admin` -- typically because the password was
+    # lost -- so nothing signed in with the old account survives it.
     gate.revoke_kind("session")
-    gate.revoke_kind("client")
     remember = bool(body.get("remember"))
     result = auth.login(str(body.get("username") or "admin"), str(body.get("password") or ""),
                         request.client.host if request.client else "", remember=remember)
@@ -2743,62 +2609,11 @@ def api_auth_password(body: dict, request: Request):
                              str(body.get("new_password") or ""))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    # A new password ends every sign-in made with the old one: browsers and client apps alike.
-    clients.revoke_all()
+    # A new password ends every sign-in made with the old one.
     gate.revoke_kind("session")
-    gate.revoke_kind("client")
     response = JSONResponse({"ok": True, "reauthenticate": True})
     response.delete_cookie(auth.SESSION_COOKIE, path="/")
     return response
-
-
-@app.post("/api/auth/client/login")
-def api_auth_client_login(body: dict, request: Request):
-    """Sign a client app in with the administrator's credentials; it gets a bearer token.
-
-    The token is returned this once. Only its digest is stored, so it cannot be shown again."""
-    if not auth.configured():
-        raise HTTPException(409, "administrator setup is required")
-    peer = request.client.host if request.client else ""
-    retry = auth.throttled(peer)
-    if retry:
-        return JSONResponse({"detail": "too many attempts", "retry_after": retry},
-                            status_code=429, headers={"Retry-After": str(retry)})
-    if not auth.verify(str(body.get("username") or "admin"), str(body.get("password") or ""),
-                       peer):
-        raise HTTPException(401, "invalid username or password")
-    for evicted in clients.make_room():
-        gate.revoke(f"client:{evicted}")
-    try:
-        client, token = clients.register(str(body.get("name") or ""),
-                                         str(body.get("platform") or "other"),
-                                         str(body.get("app_version") or ""))
-    except clients.ClientError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    return {"token": token, "client": client}
-
-
-@app.post("/api/auth/client/logout")
-def api_auth_client_logout(request: Request):
-    who = gate.current(request)
-    if who.kind != "client":
-        raise HTTPException(400, "only a client app signs itself out here")
-    clients.revoke(who.client_id)
-    gate.revoke(who.credential)
-    return {"ok": True}
-
-
-@app.get("/api/auth/clients")
-def api_auth_clients():
-    return {"clients": clients.list_clients()}
-
-
-@app.delete("/api/auth/clients/{client_id}")
-def api_auth_client_revoke(client_id: int):
-    if not clients.revoke(client_id):
-        raise HTTPException(404, "no such client")
-    gate.revoke(f"client:{client_id}")
-    return {"ok": True}
 
 
 def _audit_client(request: Request, settings: dict) -> str:
@@ -4878,70 +4693,6 @@ def api_put_settings(body: dict):
             raise HTTPException(400, "invalid new-device defaults")
         if any(not isinstance(value, bool) for value in defaults.values()):
             raise HTTPException(400, "new-device defaults must be boolean")
-    if "line_offline_notify_minutes" in body:
-        minutes = body.get("line_offline_notify_minutes")
-        if isinstance(minutes, bool) or not isinstance(minutes, int) \
-                or not line_offline.MIN_MINUTES <= minutes <= line_offline.MAX_MINUTES:
-            raise HTTPException(400, f"offline notification delay must be "
-                                     f"{line_offline.MIN_MINUTES}-{line_offline.MAX_MINUTES} minutes")
-    for channel in ("webhook", "telegram", "pushplus"):
-        try:
-            notify_push.validate_message_templates(body.get(channel) or {})
-        except ValueError as exc:
-            raise HTTPException(400, f"invalid {channel} configuration: {exc}") from exc
-    webhook = body.get("webhook") or {}
-    if webhook.get("enabled"):
-        try:
-            sample = notify_push.build_payload(
-                notify_push.EV_INCOMING_SMS,
-                {"id": "preview", "name": "SIM", "iccid": "", "msisdn": ""},
-                "+10000000000", "123456")
-            notify_push.build_webhook_request(webhook, sample)
-        except (ValueError, TypeError, json.JSONDecodeError) as exc:
-            raise HTTPException(400, f"invalid webhook configuration: {exc}")
-    # Telegram is notification-only. Ignore stale clients that
-    # still submit a remote command configuration.
-    telegram = body.get("telegram") or {}
-    telegram.pop("commands", None)
-    telegram_mode = str(telegram.get("proxy_mode") or "direct").lower()
-    if telegram_mode not in {"direct", "library", "country", "manual"}:
-        raise HTTPException(400, "invalid Telegram proxy mode")
-    effective_proxy = (body.get("proxy") if isinstance(body.get("proxy"), dict)
-                       else cfg.get_settings().get("proxy")) or {}
-    if telegram_mode == "library":
-        telegram_profile = (effective_proxy.get("profiles") or {}).get(
-            str(telegram.get("proxy_profile_id") or "")) or {}
-        if not telegram_profile:
-            raise HTTPException(400, "Telegram proxy references an unknown proxy library entry")
-        if telegram_profile.get("type") == "subscription":
-            raise HTTPException(400, "Telegram cannot select a subscription; use a country exit")
-    if telegram_mode == "country" and egress.normalize_country(telegram.get("proxy_country")) \
-            not in (effective_proxy.get("exits") or {}):
-        raise HTTPException(400, "Telegram proxy references an unknown country exit")
-    pushplus = body.get("pushplus") or {}
-    if pushplus.get("enabled"):
-        if not str(pushplus.get("token") or "").strip():
-            raise HTTPException(400, "PushPlus token is required")
-        if str(pushplus.get("template") or "html") not in {"html", "txt", "markdown", "json"}:
-            raise HTTPException(400, "unsupported PushPlus template")
-    feishu = body.get("feishu") or {}
-    try:
-        channels = notify_push.validate_feishu_channels(feishu)
-    except ValueError as exc:
-        raise HTTPException(400, f"invalid Feishu configuration: {exc}") from exc
-    for channel in channels:
-        try:
-            if not channel.get("enabled"):
-                continue
-            sample = notify_push.build_payload(
-                notify_push.EV_INCOMING_SMS,
-                {"id": "preview", "name": "SIM", "iccid": "", "msisdn": ""},
-                "+10000000000", "123456")
-            # Validation happens before the HTTP request inside send_feishu. Use a local copy
-            # of the same checks here so saving settings never sends a notification.
-            notify_push.build_notification_message(sample, channel)
-        except ValueError as exc:
-            raise HTTPException(400, f"invalid Feishu configuration: {exc}") from exc
     hardware = body.get("hardware")
     if hardware is not None:
         if not isinstance(hardware, dict):
@@ -5060,74 +4811,6 @@ async def api_egress_test(country: str):
     return await _test_egress_country(country)
 
 
-def _test_push_payload(event: str = notify_push.EV_INCOMING_SMS) -> dict:
-    if event not in notify_push.NOTIFICATION_EVENTS:
-        raise ValueError("unknown notification test event")
-    return notify_push.build_payload(
-        event,
-        {"id": "test", "name": "Gateway test", "iccid": "", "msisdn": ""},
-        "+10000000000", "MDD Sim Gateway notification test")
-
-
-def _notification_test_event(body: dict) -> str:
-    return str(body.pop("_test_event", notify_push.EV_INCOMING_SMS) or
-               notify_push.EV_INCOMING_SMS)
-
-
-@app.post("/api/notifications/webhook/test")
-async def api_webhook_test(body: dict):
-    try:
-        event = _notification_test_event(body)
-        return await asyncio.to_thread(notify_push.send_webhook, body, _test_push_payload(event))
-    except (ValueError, RuntimeError, json.JSONDecodeError) as exc:
-        raise HTTPException(400 if isinstance(exc, (ValueError, json.JSONDecodeError)) else 502,
-                            str(exc)) from exc
-
-
-@app.post("/api/notifications/telegram/test")
-async def api_telegram_test(body: dict):
-    try:
-        event = _notification_test_event(body)
-        return await asyncio.to_thread(notify_push.send_telegram, body, _test_push_payload(event))
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(502, str(exc)) from exc
-
-
-@app.post("/api/notifications/pushplus/test")
-async def api_pushplus_test(body: dict):
-    try:
-        event = _notification_test_event(body)
-        return await asyncio.to_thread(notify_push.send_pushplus, body, _test_push_payload(event))
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(502, str(exc)) from exc
-
-
-@app.post("/api/notifications/feishu/test")
-async def api_feishu_test(body: dict):
-    try:
-        event = _notification_test_event(body)
-        return await asyncio.to_thread(notify_push.send_feishu, body, _test_push_payload(event))
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(502, str(exc)) from exc
-
-
-@app.get("/api/notifications/deliveries")
-def api_notification_deliveries(limit: int = 100):
-    return notify_push.delivery_status(limit)
-
-
-@app.delete("/api/notifications/deliveries")
-def api_notification_deliveries_clear():
-    notify_push.clear_delivery_history()
-    return {"ok": True}
-
-
 @app.get("/api/system/status")
 def api_system_status():
     settings = cfg.get_settings()
@@ -5214,9 +4897,7 @@ async def api_system_maintenance(body: dict):
         hub.host_snapshot = snapshot
         hub.host_alerts = _visible_host_alerts(current_alerts, state)
         return {**result, "action": action}
-    if action == "clear_notification_history":
-        notify_push.clear_delivery_history()
-        return {"ok": True, "action": action}
+
     if action == "refresh_egress":
         return api_egress_refresh()
     if action == "restart_lines":
@@ -5323,15 +5004,8 @@ async def api_support_bundle():
 @app.get("/api/instances")
 async def api_instances(request: Request):
     out = []
-    client = gate.current(request).kind == "client"
     for inst in cfg.list_instances():
         st = _cached_line_status(inst)
-        if client:
-            # A client app lists lines to talk on; the line's configuration is not its business.
-            out.append({"id": inst["id"], "name": inst.get("name", ""),
-                        "msisdn": inst.get("msisdn", ""), "enabled": inst.get("enabled", True),
-                        "status": authz.status_for(gate.current(request), st)})
-            continue
         safe = {k: v for k, v in inst.items() if k not in ("pin", "carrier_identity")}
         safe["has_pin"] = bool(inst.get("pin"))
         safe["proxy_country_effective"] = egress.line_country(inst)
@@ -5710,19 +5384,6 @@ async def api_instance_register(iid: str):
     return {"output": engine.exec_cli(iid, "pjsip send register volte_ims")}
 
 
-def _owner(request: Request) -> int:
-    """Whose address book this request is about.
-
-    An address book belongs to whoever keeps it, not to the gateway, so the rows carry an
-    owner and every query names one instead of assuming it. This gateway has a single
-    administrator, so that is the answer for every request that gets this far -- the
-    administrator's browser, or a client app signed in with the administrator's credentials.
-    """
-    if gate.current(request).kind not in ("admin", "client"):
-        raise HTTPException(401, "authentication required")
-    return store.ADMIN_OWNER
-
-
 def _local_tz() -> ZoneInfo:
     """The user's configured zone, for timestamps shown in local time."""
     try:
@@ -5968,19 +5629,6 @@ async def api_engine_event(payload: dict):
         peer = args[0] if args else ""
         rec = store.add_call_deduped(iid, "in", peer, status="ringing")
         await hub.broadcast({"type": "call", "instance": iid, "call": rec})
-        # Push-notify ONCE per real inbound call. IMS re-delivers call_in several times for
-        # one call (VoLTE preconditions / GRUU fork / retransmit); add_call_deduped folds
-        # them into a single record, so key the notification on that record id. An anonymous
-        # first event ('') whose number arrives on a later duplicate would push before the
-        # number is known — so only notify once we have the peer, or after ~4s if it stays
-        # anonymous (caller genuinely withheld it).
-        cid = rec.get("id")
-        if cid is not None and cid not in hub._pushed_calls:
-            if peer or int(time.time()) - int(rec.get("start_ts", 0)) >= 4:
-                hub._pushed_calls.add(cid)
-                if len(hub._pushed_calls) > 512:      # bound the dedupe set
-                    hub._pushed_calls = set(list(hub._pushed_calls)[-256:])
-                _dispatch_push(notify_push.EV_INCOMING_CALL, iid, rec.get("peer") or peer)
     elif event == "call_out" and args:
         rec = store.add_call(iid, "out", args[0], status="dialing")
         await hub.broadcast({"type": "call", "instance": iid, "call": rec})
@@ -6027,18 +5675,6 @@ async def api_engine_event(payload: dict):
             rec = store.update_last_call(iid, direction, None, disp)
         if rec:
             await hub.broadcast({"type": "call", "instance": iid, "call": rec})
-            # A call nobody answered is worth a notification; one the user actively declined
-            # is not — they were there and said no. Dedupe on the record id, not on the
-            # event: the retry loop above and the peerless fallback can both re-enter with
-            # the same verdict for one call.
-            if direction == "in" and disp == "missed":
-                cid = rec.get("id")
-                if cid is not None and cid not in hub._pushed_missed:
-                    hub._pushed_missed.add(cid)
-                    if len(hub._pushed_missed) > 512:      # bound the dedupe set
-                        hub._pushed_missed = set(list(hub._pushed_missed)[-256:])
-                    asyncio.create_task(_push_missed_call(
-                        iid, cid, rec.get("peer") or to))
     elif event == "cp_mode_resolved" and args:
         # CP auto-discovery success: the engine found the address family (v6/v4/dual) that yields a
         # usable PDN on this carrier. Repin the line from 'auto' to the resolved family so it stops
@@ -6078,34 +5714,6 @@ async def push_status(iid: str):
         await hub.broadcast({"type": "status", "instance": str(iid), **st})
     except Exception as e:  # noqa
         log.debug("push_status error: %r", e)
-
-
-async def _push_missed_call(iid: str, call_id: int, peer: str) -> None:
-    """Announce a missed call."""
-    try:
-        _dispatch_push(notify_push.EV_MISSED_CALL, iid, peer)
-
-    except Exception as exc:  # noqa
-        log.debug("missed-call push failed instance=%s: %r", iid, exc)
-
-
-def _dispatch_push(event: str, iid: str, source: str, text: str | None = None):
-    """Fire outbound push notifications for an incoming event, off the
-    event path so a slow endpoint can't stall engine-event handling. No-op unless a channel
-    is enabled for this event."""
-    inst = cfg.get_instance(iid)
-    if not inst:
-        return
-    settings = cfg.get_settings()
-    wh = settings.get("webhook") or {}
-    tg = settings.get("telegram") or {}
-    pp = settings.get("pushplus") or {}
-    if not notify_push.has_enabled_channel(settings, event):
-        return
-    asyncio.create_task(
-        asyncio.to_thread(notify_push.dispatch, settings, event, inst, source, text))
-
-
 
 
 # ----------------------------- eSIM / LPA (lpac) -----------------------------

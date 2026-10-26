@@ -3,14 +3,14 @@ import { api, connectWs, setCsrf } from './api.js'
 import Softphone from './views/Softphone.jsx'
 import GlobalSoftphone from './GlobalSoftphone.jsx'
 import Esim from './views/Esim.jsx'
-import { UnifiedOverview, DevicesPage, EgressPage, NotificationsPage, SystemPage, DiagnosticsPage } from './views/UnifiedPages.jsx'
+import { UnifiedOverview, DevicesPage, EgressPage, SystemPage, DiagnosticsPage } from './views/UnifiedPages.jsx'
 import { useI18n } from './i18n.jsx'
 
 const NAV = [
   ['overview', 'Overview', '⌂'], ['devices', 'Devices', '▣'], ['calls', 'Calls', '☎'],
   ['esim', 'eSIM', '◎'],
   ['egress', 'Network exits', '⇄'],
-  ['notifications', 'Notifications', '◉'], ['settings', 'System settings', '⚙'], ['diagnostics', 'Diagnostics', '≣'],
+  ['settings', 'System settings', '⚙'], ['diagnostics', 'Diagnostics', '≣'],
 ]
 
 // Each page is addressable as #/<key>, so a refresh (or a bookmark) lands on the same page
@@ -202,7 +202,6 @@ export default function App() {
     overview:<UnifiedOverview {...common}/>, devices:<DevicesPage {...common}/>, calls:<Softphone {...common}/>,
     esim:<Esim {...common}/>,
     egress:<EgressPage {...common}/>,
-    notifications:<NotificationsPage {...common}/>,
     settings:<SystemPage {...common}/>, diagnostics:<DiagnosticsPage {...common}/>,
   }[view]
   const issueUrl = `${(systemMeta.repository_url || 'https://github.com/MddIdd/mdd-sim-gateway').replace(/\/$/, '')}/issues/new/choose`

@@ -155,8 +155,7 @@ def throttled(peer: str) -> int:
 def verify(username: str, password: str, peer: str) -> bool:
     """Check the administrator's credentials, counting a failure against the peer.
 
-    Both sign-ins use it: the browser's, which opens a session, and a client app's, which is
-    given a token instead (clients.py).
+    The browser sign-in uses it to open a session.
     """
     data = _read()
     try:

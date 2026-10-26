@@ -79,8 +79,6 @@ export const api = {
   authLogin: (username, password, remember) => j('POST', '/api/auth/login', { username, password, remember }),
   authLogout: () => j('POST', '/api/auth/logout', {}),
   authPassword: (current_password, new_password) => j('POST', '/api/auth/password', { current_password, new_password }),
-  authClients: () => j('GET', '/api/auth/clients'),
-  revokeAuthClient: (id) => j('DELETE', `/api/auth/clients/${encodeURIComponent(id)}`),
   // Unified physical-device control plane. Older deployments may return 404;
   // App.jsx then derives read-only device cards from /api/instances + /api/cards.
   devices: () => j('GET', '/api/devices'),
@@ -113,12 +111,6 @@ export const api = {
   testEgress: (country) => j('POST', `/api/egress/${encodeURIComponent(country)}/test`, {}),
   testProxyProfile: (profileId, profile) => j('POST', `/api/egress/profile/${encodeURIComponent(profileId)}/test`, profile || {}),
   refreshEgress: () => j('POST', '/api/egress/refresh', {}),
-  testWebhook: (config) => j('POST', '/api/notifications/webhook/test', config || {}),
-  testTelegram: (config) => j('POST', '/api/notifications/telegram/test', config || {}),
-  testPushPlus: (config) => j('POST', '/api/notifications/pushplus/test', config || {}),
-  testFeishu: (config) => j('POST', '/api/notifications/feishu/test', config || {}),
-  notificationDeliveries: (limit = 100) => j('GET', `/api/notifications/deliveries?limit=${limit}`),
-  clearNotificationDeliveries: () => j('DELETE', '/api/notifications/deliveries'),
   systemStatus: () => j('GET', '/api/system/status'),
   clearHostAlerts: () => j('DELETE', '/api/system/host-alerts'),
   createBackup: () => j('POST', '/api/system/backups', {}),

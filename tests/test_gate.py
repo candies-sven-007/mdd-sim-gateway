@@ -93,18 +93,15 @@ def run(scope):
     return asyncio.run(_run(scope))
 
 
-CLIENT_TOKEN = "mdd_c1_valid-client-token"
-BEARER = [("authorization", f"Bearer {CLIENT_TOKEN}")]
+SECOND_SESSION = "second-browser-session"
 
 
 class GateTestCase(unittest.TestCase):
     def setUp(self):
-        sessions = {SESSION: {"csrf": CSRF}}
-        known = {CLIENT_TOKEN: {"id": 3}}
+        sessions = {SESSION: {"csrf": CSRF}, SECOND_SESSION: {"csrf": "other"}}
         settings = {"security": {"trusted_proxies": ["10.0.0.0/8"]}}
         for p in (
             patch.object(gate.auth, "session", side_effect=lambda token: sessions.get(token)),
-            patch.object(gate.clients, "resolve", side_effect=lambda token: known.get(token)),
             patch.object(gate.cfg, "internal_event_token", return_value=ENGINE_TOKEN),
             patch.object(gate.cfg, "get_settings", return_value=settings),
             patch.object(gate.auth, "configured", return_value=True),
@@ -257,71 +254,22 @@ class WebSocketTests(GateTestCase):
 
 
 class BearerTests(GateTestCase):
-    def test_a_client_token_is_a_client(self):
-        result = run(http("/api/instances/sim1/status", cookie=None, headers=BEARER))
-        self.assertEqual(result.status, 200)
-        self.assertEqual(result.principal.kind, "client")
-        self.assertEqual(result.principal.client_id, 3)
-        self.assertEqual(result.principal.credential, "client:3")
+    """This build has no client-app tokens: an Authorization header is not a credential."""
 
-    def test_an_unknown_or_malformed_token_is_refused(self):
-        for value in ("Bearer mdd_c1_revoked", "Bearer ", "Basic YWRtaW46eA==", "mdd_c1_x"):
-            with self.subTest(value=value):
-                result = run(http("/api/instances", cookie=None,
-                                  headers=[("authorization", value)]))
-                self.assertEqual(result.status, 401)
-
-    def test_a_bearer_request_is_judged_by_the_token_alone(self):
-        # A valid cookie does not rescue a bad token, and does not add the cookie's powers.
-        result = run(http("/api/instances", headers=[("authorization", "Bearer mdd_c1_bad")]))
+    def test_a_bearer_header_does_not_sign_anyone_in(self):
+        result = run(http("/api/instances", cookie=None,
+                          headers=[("authorization", "Bearer mdd_c1_anything")]))
         self.assertEqual(result.status, 401)
-        result = run(http("/api/auth/clients", headers=BEARER))
-        self.assertEqual(result.status, 403)
-
-    def test_a_bearer_request_needs_no_csrf_token(self):
-        result = run(http("/api/instances/sim1/hangup", "POST", cookie=None, headers=BEARER))
-        self.assertEqual(result.status, 200)
-
-    def test_a_client_is_refused_what_authz_does_not_list(self):
-        for method, path in (("GET", "/api/instances/sim1/logs"), ("POST", "/api/auth/password"),
-                             ("PUT", "/api/instances/sim1/country")):
-            with self.subTest(method=method, path=path):
-                result = run(http(path, method, cookie=None, headers=BEARER))
-                self.assertEqual(result.status, 403)
-                self.assertIsNone(result.reached)
-
-    def test_signing_in_ignores_a_stale_token(self):
-        scope = http("/api/auth/client/login", "POST", cookie=None,
-                     headers=[("authorization", "Bearer mdd_c1_revoked")])
-        result = run(scope)
-        self.assertEqual(result.status, 200)
-        self.assertEqual(result.principal, gate.ANONYMOUS)
-
-    def test_status_reports_the_client(self):
-        result = run(http("/api/auth/status", cookie=None, headers=BEARER))
-        self.assertEqual(result.principal.kind, "client")
-
-    def test_a_client_socket_needs_no_origin(self):
-        result = run(websocket("/api/instances/sim1/softphone/ws", cookie=None, origin=None,
-                               headers=BEARER))
-        self.assertEqual(result.principal.kind, "client")
-
-    def test_a_client_socket_is_refused_where_authz_says_so(self):
-        result = run(websocket("/api/some/admin/socket", cookie=None, origin=None,
-                               headers=BEARER))
         self.assertIsNone(result.reached)
-        self.assertEqual(result.close_code, gate.WS_FORBIDDEN)
 
-    def test_a_refused_subprotocol_handshake_is_closed_before_accepting(self):
-        for headers, code in (([("authorization", "Bearer mdd_c1_bad")], gate.WS_UNAUTHENTICATED),
-                              (BEARER, gate.WS_FORBIDDEN)):
-            with self.subTest(code=code):
-                scope = websocket("/api/instances/sim1/logs/ws", cookie=None, origin=None,
-                                  subprotocols=["sip"], headers=headers)
-                result = run(scope)
-                self.assertIsNone(result.reached)
-                self.assertFalse(result.accepted)
-                self.assertEqual(result.close_code, code)
+    def test_a_bearer_header_neither_adds_to_nor_replaces_a_session(self):
+        result = run(http("/api/instances", headers=[("authorization", "Bearer x")]))
+        self.assertEqual(result.status, 200)
+        self.assertEqual(result.principal.kind, "admin")
+        result = run(websocket(cookie=None, origin=None,
+                               headers=[("authorization", "Bearer x")]))
+        self.assertIsNone(result.reached)
+        self.assertEqual(result.close_code, gate.WS_UNAUTHENTICATED)
 
 
 class NoAdministratorTests(GateTestCase):
@@ -329,8 +277,6 @@ class NoAdministratorTests(GateTestCase):
         # `install.sh reset-admin` removes the account without restarting the control plane.
         with patch.object(gate.auth, "configured", return_value=False):
             self.assertEqual(run(http("/api/instances")).status, 401)
-            self.assertEqual(run(http("/api/instances/sim1/status", cookie=None,
-                                      headers=BEARER)).status, 401)
             result = run(websocket())
             self.assertIsNone(result.reached)
             self.assertEqual(result.close_code, gate.WS_UNAUTHENTICATED)
@@ -360,36 +306,37 @@ class RevocationTests(GateTestCase):
 
     def test_revoking_a_credential_closes_its_sockets_only(self):
         async def scenario():
-            phone, phone_sent, phone_ended = await self._open(
-                websocket(cookie=None, origin=None, headers=BEARER))
-            browser, browser_sent, browser_ended = await self._open(websocket())
-            self.assertEqual(gate.revoke("client:3"), 1)
-            await asyncio.wait_for(phone, 5)
-            self.assertTrue(phone_ended.is_set())
-            self.assertIn({"type": "websocket.close", "code": gate.WS_UNAUTHENTICATED}, phone_sent)
-            self.assertFalse(browser_ended.is_set())
+            first, first_sent, first_ended = await self._open(websocket())
+            second, _second_sent, second_ended = await self._open(
+                websocket(cookie=SECOND_SESSION))
+            credential = "session:" + gate.auth.session_key(SESSION)
+            self.assertEqual(gate.revoke(credential), 1)
+            await asyncio.wait_for(first, 5)
+            self.assertTrue(first_ended.is_set())
+            self.assertIn({"type": "websocket.close", "code": gate.WS_UNAUTHENTICATED},
+                          first_sent)
+            self.assertFalse(second_ended.is_set())
             self.assertEqual(gate.revoke_kind("session"), 1)
-            await asyncio.wait_for(browser, 5)
-            self.assertEqual(gate.revoke("client:3"), 0)
+            await asyncio.wait_for(second, 5)
+            self.assertEqual(gate.revoke(credential), 0)
 
         asyncio.run(scenario())
 
     def test_a_revocation_during_the_handshake_is_not_missed(self):
         # Revoked after the credential was checked but before the socket was registered: the
         # socket must not open with a dead credential and stay open until the next reconnect.
-        answers = iter([{"id": 3}, None])
-        with patch.object(gate.clients, "resolve", side_effect=lambda token: next(answers)):
-            result = run(websocket(cookie=None, origin=None, headers=BEARER))
+        answers = iter([{"csrf": CSRF}, None])
+        with patch.object(gate.auth, "session", side_effect=lambda token: next(answers)):
+            result = run(websocket())
         self.assertIsNone(result.reached)
         self.assertEqual(result.close_code, gate.WS_UNAUTHENTICATED)
 
     def test_revocation_is_safe_from_a_worker_thread(self):
-        # Synchronous handlers (logout, revoke) run in FastAPI's thread pool.
+        # Synchronous handlers (logout, password change) run in FastAPI's thread pool.
         async def scenario():
-            phone, _, ended = await self._open(websocket(cookie=None, origin=None,
-                                                         headers=BEARER))
-            await asyncio.to_thread(gate.revoke, "client:3")
-            await asyncio.wait_for(phone, 5)
+            browser, _, ended = await self._open(websocket())
+            await asyncio.to_thread(gate.revoke_kind, "session")
+            await asyncio.wait_for(browser, 5)
             self.assertTrue(ended.is_set())
 
         asyncio.run(scenario())
@@ -402,9 +349,6 @@ class SourceTableTests(unittest.TestCase):
         "public": http("/api/auth/login", "POST", cookie=None),
         "engine": http(gate.ENGINE_EVENT_PATH, "POST", cookie=None),
         "session": http("/api/instances"),
-        "bearer": http("/api/instances", cookie=None,
-                       headers=[("authorization", "Bearer mdd_c1_x")]),
-        "bearer socket": websocket(cookie=None, headers=[("authorization", "Bearer mdd_c1_x")]),
         "socket": websocket(),
     }
 
