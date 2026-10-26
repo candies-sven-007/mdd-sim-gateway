@@ -1,6 +1,6 @@
 # slim-reader-vowifi 精简重构计划
 
-> 状态：**计划待确认**（阶段 0 未开始，尚未改动任何代码）
+> 状态：**计划待确认**（已收到第一批设备信息，见 F12/F13）（阶段 0 未开始，尚未改动任何代码）
 > 基线：`761d38e`（MddIdd/mdd-sim-gateway v1.14.0 合并提交）
 > 基线测试：`python -m unittest discover -s tests` 在 Python 3.12 下 2015 个测试全部通过；`webui npm run build` 成功（2026-10-26 10:37 CST）
 
@@ -23,6 +23,8 @@ swap 191 MB，根分区可用 1.6 GB，读卡器 2ce3:9563（Alcor AK9563，本�
 | F8 | 线路上限当前是 `config.MAX_SIM_LINES = 10`，由 `tests/test_product_boundaries.py` 强制。 | | 改为可配置、默认 2 |
 | F9 | lpac 2.3.0 需要 CMake ≥ 3.31（bullseye 是 3.18）；install.sh 已固定 Kitware 二进制 SHA-256。pcsc-lite 2.3.3 / ccid 1.6.2 用 meson 构建，bullseye 自带 meson 0.56 可能偏旧。 | `install.sh:1794-1800, 89-104` | CI 里用 Kitware cmake + pip 安装的 meson |
 | F10 | Debian 11 LTS 已于 2026-08-31 结束，现在（2026-10）bullseye 源可能已迁到 archive.debian.org。 | 公开时间表，需要设备上验证 | install.sh 的"安装运行依赖"可能要处理源；见 Q11 |
+| F12 | 设备实测（2026-10-26）：`CONFIG_MEMCG=y`，cgroup2 已启用 memory 控制器 → `MemoryMax` 有效；`CONFIG_NET_NS=y`，`ip netns add` 实测成功；`VETH`/`TUN`/`NF_TABLES`/`NFT_NAT`/`ZRAM` 均为模块（=m）；系统未安装 `nft` 命令；已有 `/dev/zram0` 191 MB swap；349c:0418 是 U 盘类大容量存储设备，不是读卡器（目前只有 1 个 SIM 读卡器）；apt 走阿里云 bullseye 源，可用，security 源被注释掉 | 设备输出 | install.sh：`modprobe` 并写 `/etc/modules-load.d/mdd.conf`；安装 nftables；检测到已有 zram 则跳过；当前硬件只能跑 1 条线路 |
+| F13 | 设备在中国大陆网络。浏览器软电话 direct 模式不用 STUN/TURN（`iceServers: []`），不受影响；ePDG 用宿主 DNS 解析（`host/mdd_orchestrator.py:2850`），境内解析器可能返回被污染的或不同的结果；订阅拉取已有"经出口"选项；出口探测 `gstatic.com/generate_204` 经出口访问 | grep | 建议默认开启国家出口、ePDG 经出口解析（Q15）；设备本身不访问 GitHub，发布包在电脑上下载后 scp 到设备 |
 | F11 | SMS-over-IMS：网络下发的短信由 `res_pjsip_messaging` 接收，RP-ACK 回送依赖要删的 `mt_rpack_routing` 补丁。删掉后，短信不再只是"不显示"，而是 SMSC 收不到确认，会重发并最终判失败。 | `engine/asterisk-keep-modules.txt`、补丁说明 | 见 Q2 |
 
 ---
@@ -291,7 +293,7 @@ nft table inet mdd:
 | # | 风险 | 应对 |
 |---|---|---|
 | R1 | 内存：估算（未实测）pcscd 3 + sing-box 30–40 + orchestrator 25–30 + control 60–80 + 每线路（asterisk 25–40、swu_ike 25–35、ami_usim 约 20、pin_keeper 约 15）≈ 90–110 MB。1 条线路约 210–260 MB，2 条约 300–370 MB，超过当前可用 286 MB。 | zram + MemoryMax + MALLOC_ARENA_MAX；第一次构建后在设备上实测 RSS，再决定默认值是否需要从 2 降到 1 或合并 pin_keeper/ami_usim 进程 |
-| R2 | 内核特性未确认：handsomekernel 是否开启 NET_NS、VETH、NF_TABLES/NFT_NAT/NFT_MASQ、IP_MULTIPLE_TABLES、MEMCG、ZRAM。缺 MEMCG 则 MemoryMax 无效；缺 netns/veth 则 §4.3 整体不可行。 | 需要设备输出（Q10） |
+| R2 | 内核：NET_NS/MEMCG/ZRAM/VETH/TUN/NF_TABLES/NFT_NAT 已确认（F12）；IP_MULTIPLE_TABLES、NFT_MASQ、NFT_CT、NF_CONNTRACK_MARK 未确认。 | Q16 |
 | R3 | sysmocom Asterisk 在 bullseye（gcc 10、OpenSSL 1.1.1）上从未构建过，原 Dockerfile 用的是 Fedora 44。 | 先单独跑通 build-arm64 的 Asterisk 步骤再做后续 |
 | R4 | main.py 拆分时大量测试 patch `main.xxx`，移动后 patch 失效但测试可能"假通过"或失败。 | 每个 router 一步、只改 patch 目标；加路由集合一致性测试 |
 | R5 | 删除 SMS 后网络侧行为（F11）。 | Q2 |
@@ -328,6 +330,8 @@ nft table inet mdd:
 - **Q11** `apt-get update` 在设备上是否还能正常工作？如已切到 archive.debian.org，install.sh 只检测并提示，不自动改源，是否可以？
 - **Q12** fork 仓库是公开还是私有（决定 ubuntu-24.04-arm runner 能否使用）？
 - **Q13** Xray 作为可选组件：打进主包但默认不启用，还是单独出一个 `mdd-slim-xray-arm64-<version>.tar.gz`？我倾向单独打包（主包省约 30 MB）。
+- **Q15** 中国大陆网络下，建议 (a) 默认开启国家出口：没有健康出口的线路不启动（原版是可选）；(b) ePDG 域名经该国出口解析（复用 `egress.resolve_ipv4_via_socks` 的思路，sing-box 上开一个仅本机可达的 DNS/SOCKS 入口），不再用宿主 DNS。是否同意？
+- **Q16** 第二批设备检查（策略路由、nft masquerade/ct mark、veth 实际可加载）结果待回。若内核没有 `CONFIG_IP_MULTIPLE_TABLES`，§4.3 的策略路由不可用，备选：netns 内不设任何出口路由，swu_ike 走 veth 网关上的 SOCKS5（即保留的 `outer_transport.py`），同样做到"出口不通不泄漏"。
 - **Q14** 控制面以非 root `mdd` 用户运行 + sudo 只放行 `mdd-enginectl`（§4.2），多一个约 25–30 MB 的 root orchestrator。若内存紧张，可合并为一个 root 进程。先按分离方案做，是否同意？
 
 ---
