@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from control.app import config, engine, main
+from control.app import state as app_state
 
 
 _lifecycle_patcher = None
@@ -14,7 +15,7 @@ def setUpModule():
     # Lifecycle persistence itself is covered against a TemporaryDirectory below. Other tests
     # exercise policy decisions and must never write their fictional line ids into repo data.
     global _lifecycle_patcher
-    _lifecycle_patcher = patch.object(main, "_record_lifecycle")
+    _lifecycle_patcher = patch.object(app_state, "_record_lifecycle")
     _lifecycle_patcher.start()
 
 
@@ -107,16 +108,16 @@ class LineDeleteApiTests(unittest.IsolatedAsyncioTestCase):
         inst = {"id": "1", "iccid": "test-iccid"}
         card = {"present": True, "matched": "1", "iccid": "test-iccid"}
         with patch.object(main.cfg, "get_instance", return_value=inst), \
-                patch.object(main.hub, "cards_list", return_value=[card]), \
+                patch.object(app_state.hub, "cards_list", return_value=[card]), \
                 patch.object(main.cfg, "suppress_card_until_removal") as suppress, \
                 patch.object(main.engine, "stop"), \
-                patch.object(main.hub, "drop_ami", new=AsyncMock()), \
+                patch.object(app_state.hub, "drop_ami", new=AsyncMock()), \
                 patch.object(main.cfg, "delete_instance") as delete_config, \
                 patch.object(main.engine, "delete_instance_data") as delete_data, \
                 patch.object(main.store, "clear_calls", return_value=3) as clear_calls, \
                 patch.object(main.store, "clear_line_states", return_value=7) as clear_states, \
                 patch.object(main, "_refresh_card_matches"), \
-                patch.object(main.hub, "broadcast", new=AsyncMock()):
+                patch.object(app_state.hub, "broadcast", new=AsyncMock()):
             result = await main.api_instance_delete("1", delete_history=True, confirm_id="1")
 
         suppress.assert_called_once_with("test-iccid")
@@ -129,15 +130,15 @@ class LineDeleteApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_delete_line_can_preserve_history(self):
         inst = {"id": "1", "iccid": ""}
         with patch.object(main.cfg, "get_instance", return_value=inst), \
-                patch.object(main.hub, "cards_list", return_value=[]), \
+                patch.object(app_state.hub, "cards_list", return_value=[]), \
                 patch.object(main.engine, "stop"), \
-                patch.object(main.hub, "drop_ami", new=AsyncMock()), \
+                patch.object(app_state.hub, "drop_ami", new=AsyncMock()), \
                 patch.object(main.cfg, "delete_instance"), \
                 patch.object(main.engine, "delete_instance_data"), \
                 patch.object(main.store, "clear_calls") as clear_calls, \
                 patch.object(main.store, "clear_line_states") as clear_states, \
                 patch.object(main, "_refresh_card_matches"), \
-                patch.object(main.hub, "broadcast", new=AsyncMock()):
+                patch.object(app_state.hub, "broadcast", new=AsyncMock()):
             result = await main.api_instance_delete("1", delete_history=False, confirm_id="1")
 
         clear_calls.assert_not_called()
@@ -154,16 +155,16 @@ class LineDeleteApiTests(unittest.IsolatedAsyncioTestCase):
         card = {"present": True, "matched": "old", "iccid": "same-card"}
         with patch.object(main.cfg, "get_instance", return_value=inst), \
                 patch.object(main.cfg, "list_instances", return_value=[inst, replacement]), \
-                patch.object(main.hub, "cards_list", return_value=[card]), \
+                patch.object(app_state.hub, "cards_list", return_value=[card]), \
                 patch.object(main.cfg, "suppress_card_until_removal") as suppress, \
                 patch.object(main.engine, "stop"), \
-                patch.object(main.hub, "drop_ami", new=AsyncMock()), \
+                patch.object(app_state.hub, "drop_ami", new=AsyncMock()), \
                 patch.object(main.cfg, "delete_instance"), \
                 patch.object(main.engine, "delete_instance_data"), \
                 patch.object(main.store, "clear_line_states"), \
                 patch.object(main, "_refresh_card_matches"), \
-                patch.object(main, "_auto_start_hotplugged_line", new=AsyncMock()) as start, \
-                patch.object(main.hub, "broadcast", new=AsyncMock()):
+                patch.object(app_state, "_auto_start_hotplugged_line", new=AsyncMock()) as start, \
+                patch.object(app_state.hub, "broadcast", new=AsyncMock()):
             await main.api_instance_delete("old", delete_history=False, confirm_id="old")
             await __import__('asyncio').sleep(0)
 
@@ -174,31 +175,31 @@ class LineDeleteApiTests(unittest.IsolatedAsyncioTestCase):
 class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         for iid in ("1", "2", "offline", "removed"):
-            main.hub.reset_health(iid)
+            app_state.hub.reset_health(iid)
 
     def test_saved_line_without_a_live_card_is_not_eligible(self):
         inst = {"id": "offline", "iccid": "saved-card", "enabled": True}
-        with patch.object(main.hub, "cards_list", return_value=[]):
+        with patch.object(app_state.hub, "cards_list", return_value=[]):
             self.assertEqual(main._line_auto_start_allowed(inst), (False, "no_card"))
 
 
     async def test_auto_recovery_rechecks_a_transiently_absent_card(self):
         inst = {"id": "offline", "iccid": "saved-card", "enabled": True}
-        main.hub.health_for("offline").update({
+        app_state.hub.health_for("offline").update({
             "frozen_code": "tunnel_sim_auth", "frozen_reason": "failed",
             "auto_retrying": True, "retry_count": 3,
         })
         started = main.time.monotonic()
         with patch.object(main, "_line_auto_start_allowed",
                           return_value=(False, "no_card")), \
-                patch.object(main, "_start_engine_checked") as start, \
-                patch.object(main, "_record_lifecycle") as lifecycle, \
-                patch.object(main.hub, "broadcast", new=AsyncMock()):
+                patch.object(app_state, "_start_engine_checked") as start, \
+                patch.object(app_state, "_record_lifecycle") as lifecycle, \
+                patch.object(app_state.hub, "broadcast", new=AsyncMock()):
             await main._auto_recover_instance("offline", inst, 60)
 
         start.assert_not_called()
-        self.assertEqual(main.hub.status_cache["offline"]["state"], "NO_CARD")
-        health = main.hub.health["offline"]
+        self.assertEqual(app_state.hub.status_cache["offline"]["state"], "NO_CARD")
+        health = app_state.hub.health["offline"]
         self.assertEqual(health["frozen_code"], "tunnel_sim_auth")
         self.assertFalse(health["auto_retrying"])
         self.assertGreaterEqual(health["next_retry_at"], started + 60)
@@ -214,22 +215,22 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disabled_vowifi_still_cancels_pending_recovery(self):
         inst = {"id": "offline", "iccid": "saved-card", "enabled": True}
-        main.hub.health_for("offline").update({
+        app_state.hub.health_for("offline").update({
             "frozen_code": "tunnel_network", "frozen_reason": "failed",
             "auto_retrying": True, "next_retry_at": 12345,
         })
         with patch.object(main, "_line_auto_start_allowed",
                           return_value=(False, "vowifi_disabled")), \
-                patch.object(main, "_start_engine_checked") as start, \
-                patch.object(main, "_record_lifecycle") as lifecycle, \
-                patch.object(main.hub, "broadcast", new=AsyncMock()):
+                patch.object(app_state, "_start_engine_checked") as start, \
+                patch.object(app_state, "_record_lifecycle") as lifecycle, \
+                patch.object(app_state.hub, "broadcast", new=AsyncMock()):
             await main._auto_recover_instance("offline", inst, 60)
 
         start.assert_not_called()
-        health = main.hub.health["offline"]
+        health = app_state.hub.health["offline"]
         self.assertIsNone(health["frozen_code"])
         self.assertIsNone(health["next_retry_at"])
-        self.assertEqual(main.hub.status_cache["offline"]["state"], "STOPPED")
+        self.assertEqual(app_state.hub.status_cache["offline"]["state"], "STOPPED")
         lifecycle.assert_called_once_with(
             "offline", "recovery_cancelled", "vowifi_disabled",
             retry_count=0, card_present=True)
@@ -237,7 +238,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_hardware_imei_recovery_failure_is_structured_without_exception_text(self):
         inst = {"id": "offline", "iccid": "saved-card", "enabled": True,
                 "imei_source_device_id": "modem-a"}
-        main.hub.health_for("offline").update({
+        app_state.hub.health_for("offline").update({
             "frozen_code": "tunnel_network", "frozen_reason": "failed",
             "auto_retrying": True, "retry_count": 3,
         })
@@ -247,9 +248,9 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
             "device_id": "modem-a",
         })
         with patch.object(main, "_line_auto_start_allowed", return_value=(True, "")), \
-                patch.object(main, "_start_engine_checked", side_effect=failure), \
-                patch.object(main, "_record_lifecycle") as lifecycle, \
-                patch.object(main.hub, "broadcast", new=AsyncMock()):
+                patch.object(app_state, "_start_engine_checked", side_effect=failure), \
+                patch.object(app_state, "_record_lifecycle") as lifecycle, \
+                patch.object(app_state.hub, "broadcast", new=AsyncMock()):
             await main._auto_recover_instance("offline", inst, 60)
 
         self.assertEqual(lifecycle.call_count, 2)
@@ -262,19 +263,19 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_card_removal_cancels_a_pending_recovery_without_a_container(self):
         inst = {"id": "removed", "iccid": "saved-card"}
-        main.hub.health_for("removed").update({
+        app_state.hub.health_for("removed").update({
             "frozen_code": "tunnel_sim_auth", "next_retry_at": 12345,
         })
         entry = {"name": "reader", "index": 2, "matched": "removed",
                  "iccid": "saved-card"}
         with patch.object(main.cfg, "unsuppress_card"), \
                 patch.object(main.cfg, "get_instance", return_value=inst), \
-                patch.object(main, "_record_lifecycle") as lifecycle, \
+                patch.object(app_state, "_record_lifecycle") as lifecycle, \
                 patch.object(main.engine, "is_running", return_value=False):
             stopped = await main._on_card_remove(entry)
 
         self.assertFalse(stopped)
-        health = main.hub.health["removed"]
+        health = app_state.hub.health["removed"]
         self.assertIsNone(health["frozen_code"])
         self.assertIsNone(health["next_retry_at"])
         lifecycle.assert_called_once_with(
@@ -292,8 +293,8 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.cfg, "get_settings", return_value={}), \
                 patch.object(main.engine, "is_running", side_effect=is_running), \
                 patch.object(main.engine, "stop") as stop, \
-                patch.object(main, "_start_engine_checked") as start, \
-                patch.object(main.hub, "drop_ami", new=AsyncMock()):
+                patch.object(app_state, "_start_engine_checked") as start, \
+                patch.object(app_state.hub, "drop_ami", new=AsyncMock()):
             result = await main.api_system_maintenance({"action": "restart_lines"})
 
         self.assertEqual(result["restarted"], ["1"])
@@ -301,8 +302,8 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
         start.assert_called_once_with(running, {}, dev_mounts=False)
 
     async def test_maintenance_can_prune_only_dangling_build_cache(self):
-        main.hub.host_snapshot = {"disk": {"used_percent": 99.0}}
-        main.hub.host_alerts = [{"code": "disk_critical"}]
+        app_state.hub.host_snapshot = {"disk": {"used_percent": 99.0}}
+        app_state.hub.host_alerts = [{"code": "disk_critical"}]
         with patch.object(main.operations, "prune_dangling_build_cache",
                           return_value={"ok": True, "space_reclaimed_bytes": 4096}) as prune, \
                 patch.object(main.sysinfo, "collect",
@@ -310,8 +311,8 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
             result = await main.api_system_maintenance({"action": "prune_build_cache"})
         self.assertEqual(result["space_reclaimed_bytes"], 4096)
         self.assertEqual(result["action"], "prune_build_cache")
-        self.assertEqual(main.hub.host_snapshot, {"disk": {"used_percent": 70.0}})
-        self.assertEqual(main.hub.host_alerts, [])
+        self.assertEqual(app_state.hub.host_snapshot, {"disk": {"used_percent": 70.0}})
+        self.assertEqual(app_state.hub.host_alerts, [])
         prune.assert_called_once_with()
 
     async def test_build_cache_prune_failure_is_an_actionable_http_error(self):
@@ -334,7 +335,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
 
 class StatusActivityTests(unittest.TestCase):
     def test_frozen_status_explains_countdown_and_next_action(self):
-        main.hub.health["activity-test"] = {
+        app_state.hub.health["activity-test"] = {
             "auto_retrying": False, "fail_start": None, "retry_count": 3,
             "frozen_code": "registering", "frozen_reason": "IMS unavailable",
             "next_retry_at": None, "last_state": None,
@@ -346,10 +347,10 @@ class StatusActivityTests(unittest.TestCase):
         })
         self.assertEqual(status["activity"]["seconds"], 18)
         self.assertIn("rebuilt", status["activity"]["next"])
-        main.hub.health.pop("activity-test", None)
+        app_state.hub.health.pop("activity-test", None)
 
     def test_permanent_pin_freeze_explains_required_manual_action(self):
-        main.hub.health["pin-test"] = {
+        app_state.hub.health["pin-test"] = {
             "auto_retrying": False, "fail_start": None, "retry_count": 3,
             "frozen_code": "pin_wrong", "frozen_reason": "SIM PIN is incorrect.",
             "next_retry_at": None, "last_state": None,
@@ -361,31 +362,31 @@ class StatusActivityTests(unittest.TestCase):
         })
         self.assertFalse(status["activity"]["automatic"])
         self.assertIn("PIN", status["activity"]["next"])
-        main.hub.health.pop("pin-test", None)
+        app_state.hub.health.pop("pin-test", None)
 
 
 class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
     def test_quiet_stopped_lines_do_not_hold_gateway_on_fast_polling(self):
         instances = [{"id": "ok", "enabled": True}, {"id": "away", "enabled": True}]
-        main.hub.status_cache["ok"] = {"state": "OK"}
-        main.hub.status_cache["away"] = {"state": "STOPPED"}
+        app_state.hub.status_cache["ok"] = {"state": "OK"}
+        app_state.hub.status_cache["away"] = {"state": "STOPPED"}
         self.assertEqual(main._status_poll_delay(instances), main.STATUS_POLL_HEALTHY_SECONDS)
-        main.hub.status_cache.pop("ok", None)
-        main.hub.status_cache.pop("away", None)
+        app_state.hub.status_cache.pop("ok", None)
+        app_state.hub.status_cache.pop("away", None)
 
     def test_registering_line_keeps_fast_polling(self):
         instances = [{"id": "starting", "enabled": True}]
-        main.hub.status_cache["starting"] = {"state": "REGISTERING"}
+        app_state.hub.status_cache["starting"] = {"state": "REGISTERING"}
         self.assertEqual(main._status_poll_delay(instances), main.STATUS_POLL_FAST_SECONDS)
-        main.hub.status_cache.pop("starting", None)
+        app_state.hub.status_cache.pop("starting", None)
 
     async def test_ims_rejection_uses_retry_budget_before_cooldown_rebuild(self):
-        main.hub.health.pop("3", None)
+        app_state.hub.health.pop("3", None)
 
     async def test_unanswered_ims_with_no_call_uses_generation_safe_fast_recovery(self):
         iid = "fast-unanswered"
-        main.hub.reset_health(iid)
-        main.hub.reg_unanswered_recovery_at.pop(iid, None)
+        app_state.hub.reset_health(iid)
+        app_state.hub.reg_unanswered_recovery_at.pop(iid, None)
         unanswered = {
             "state": "REGISTERING", "label": "Registering to IMS",
             "reason_code": "reg_unanswered", "reason": "Carrier IMS did not answer.",
@@ -395,7 +396,7 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         started = main.time.monotonic()
         with patch.object(main.engine, "capture_and_stop") as capture_and_stop, \
                 patch.object(main, "_judge_exit_failure", return_value=main.failover.HOLD), \
-                patch.object(main.hub, "drop_ami", new=AsyncMock()) as drop_ami:
+                patch.object(app_state.hub, "drop_ami", new=AsyncMock()) as drop_ami:
             result = main.apply_health(iid, inst, unanswered, "generation-1")
             for _ in range(20):
                 await __import__("asyncio").sleep(0.01)
@@ -409,17 +410,17 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         capture_and_stop.assert_called_once_with(
             iid, inst, "health-freeze:reg_unanswered", "generation-1")
         drop_ami.assert_awaited_once_with(iid)
-        self.assertGreaterEqual(main.hub.reg_unanswered_recovery_at[iid], started)
-        main.hub.reset_health(iid)
-        main.hub.reg_unanswered_recovery_at.pop(iid, None)
+        self.assertGreaterEqual(app_state.hub.reg_unanswered_recovery_at[iid], started)
+        app_state.hub.reset_health(iid)
+        app_state.hub.reg_unanswered_recovery_at.pop(iid, None)
 
     async def test_unanswered_ims_with_active_or_unknown_calls_keeps_slow_path(self):
         inst = {"id": "guarded", "enabled": True,
                 "retry": {"max": 3, "interval": 30}}
         for channels in (1, None):
             with self.subTest(active_channels=channels):
-                main.hub.reset_health("guarded")
-                main.hub.reg_unanswered_recovery_at.pop("guarded", None)
+                app_state.hub.reset_health("guarded")
+                app_state.hub.reg_unanswered_recovery_at.pop("guarded", None)
                 st = {
                     "state": "REGISTERING", "label": "Registering to IMS",
                     "reason_code": "reg_unanswered", "reason": "No response.",
@@ -430,13 +431,13 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("frozen", result)
                 self.assertEqual(result["retry"], {"count": 1, "max": 3})
                 capture.assert_not_called()
-        main.hub.reset_health("guarded")
+        app_state.hub.reset_health("guarded")
 
     async def test_unanswered_fast_recovery_is_rate_limited_per_line(self):
-        main._record_lifecycle.reset_mock()
+        app_state._record_lifecycle.reset_mock()
         iid = "rate-limited"
-        main.hub.reset_health(iid)
-        main.hub.reg_unanswered_recovery_at[iid] = main.time.monotonic()
+        app_state.hub.reset_health(iid)
+        app_state.hub.reg_unanswered_recovery_at[iid] = main.time.monotonic()
         st = {
             "state": "REGISTERING", "label": "Registering to IMS",
             "reason_code": "reg_unanswered", "reason": "No response.",
@@ -447,9 +448,9 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
             result = main.apply_health(iid, inst, st, "generation-2")
         self.assertNotIn("frozen", result)
         capture.assert_not_called()
-        main.hub.reset_health(iid)
-        main.hub.reg_unanswered_recovery_at.pop(iid, None)
-        main.hub.status_cache.pop("3", None)
+        app_state.hub.reset_health(iid)
+        app_state.hub.reg_unanswered_recovery_at.pop(iid, None)
+        app_state.hub.status_cache.pop("3", None)
         rejected = {"state": "REGISTERING", "label": "Registering to IMS",
                     "reason_code": "reg_rejected", "reason": "Carrier rejected IMS.",
                     "detail": {"registration": "Rejected"}}
@@ -466,11 +467,11 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
                              return_value={"state": "CONNECTED"}), \
                 patch.object(main.engine, "ike_evidence", return_value={"retransmits": 0}), \
                 patch.object(main, "_save_exit_ledgers"), \
-                patch.object(main.hub, "drop_ami", new=AsyncMock()) as drop_ami:
+                patch.object(app_state.hub, "drop_ami", new=AsyncMock()) as drop_ami:
             inst = {"id": "3", "enabled": True,
                     "retry": {"max": 3, "interval": 30}}
             first = main.apply_health("3", inst, rejected)
-            main.hub.health["3"]["fail_start"] = started - 91
+            app_state.hub.health["3"]["fail_start"] = started - 91
             exhausted = main.apply_health("3", inst, rejected)
             for _ in range(20):
                 await __import__("asyncio").sleep(0.01)
@@ -483,13 +484,13 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exhausted["reason_code"], "reg_rejected")
         self.assertGreaterEqual(exhausted["automatic_retry_in"], 119)
         self.assertLessEqual(exhausted["automatic_retry_in"], 120)
-        self.assertGreaterEqual(main.hub.health["3"]["next_retry_at"] - started, 119)
+        self.assertGreaterEqual(app_state.hub.health["3"]["next_retry_at"] - started, 119)
         capture_and_stop.assert_called_once()
         self.assertEqual(capture_and_stop.call_args.args[0], "3")
         self.assertIn("reg_rejected", capture_and_stop.call_args.args[2])
         self.assertIsNone(capture_and_stop.call_args.args[3])
-        main._record_lifecycle.assert_called_once()
-        lifecycle_call = main._record_lifecycle.call_args
+        app_state._record_lifecycle.assert_called_once()
+        lifecycle_call = app_state._record_lifecycle.call_args
         self.assertEqual(
             lifecycle_call.args,
             ("3", "recovery_scheduled", "reg_rejected"))
@@ -502,29 +503,29 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         # went on to carry this same line for eight uninterrupted hours.
         reselect.assert_not_called()
         drop_ami.assert_awaited_once_with("3")
-        main.hub.exit_ledgers.pop("3", None)
-        main.hub.health.pop("3", None)
+        app_state.hub.exit_ledgers.pop("3", None)
+        app_state.hub.health.pop("3", None)
 
 
     async def test_disabled_line_stops_stale_container_without_auto_recovery(self):
         inst = {"id": "3", "enabled": False}
         with patch.object(main.cfg, "get_instance", return_value=inst), \
-                patch.object(main.hub.runtime, "get", new=AsyncMock(return_value={
+                patch.object(app_state.hub.runtime, "get", new=AsyncMock(return_value={
                     "running": True, "ip": "172.17.0.2", "container_id": "c3"})), \
                 patch.object(main.engine, "stop") as stop, \
-                patch.object(main.hub, "drop_ami", new=AsyncMock()) as drop_ami, \
-                patch.object(main.hub, "broadcast", new=AsyncMock()) as broadcast, \
+                patch.object(app_state.hub, "drop_ami", new=AsyncMock()) as drop_ami, \
+                patch.object(app_state.hub, "broadcast", new=AsyncMock()) as broadcast, \
                 patch.object(main.status_mod, "compute", new=AsyncMock()) as compute:
             await main._poll_instance_status(inst)
 
         stop.assert_called_once_with("3")
         drop_ami.assert_awaited_once_with("3")
         compute.assert_not_awaited()
-        self.assertEqual(main.hub.status_cache["3"]["state"], "STOPPED")
+        self.assertEqual(app_state.hub.status_cache["3"]["state"], "STOPPED")
         broadcast.assert_awaited_once()
-        main.hub.status_cache.pop("3", None)
-        main.hub.status_sampled_at.pop("3", None)
-        main.hub.health.pop("3", None)
+        app_state.hub.status_cache.pop("3", None)
+        app_state.hub.status_sampled_at.pop("3", None)
+        app_state.hub.health.pop("3", None)
 
     async def test_stale_disabled_snapshot_does_not_stop_newly_enabled_line(self):
         stale = {"id": "race", "enabled": False}
@@ -533,17 +534,17 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
                    "reason_code": "registering", "reason": "Registering.",
                    "detail": {"registration": "unknown"}}
         with patch.object(main.cfg, "get_instance", return_value=current), \
-                patch.object(main.hub.runtime, "get", new=AsyncMock(return_value={
+                patch.object(app_state.hub.runtime, "get", new=AsyncMock(return_value={
                     "running": True, "ip": "172.17.0.2", "container_id": "race"})), \
                 patch.object(main.engine, "stop") as stop, \
-                patch.object(main.hub, "ami_for", new=AsyncMock(return_value=object())), \
+                patch.object(app_state.hub, "ami_for", new=AsyncMock(return_value=object())), \
                 patch.object(main.status_mod, "compute", new=AsyncMock(return_value=sampled)), \
-                patch.object(main.hub, "broadcast", new=AsyncMock()):
+                patch.object(app_state.hub, "broadcast", new=AsyncMock()):
             await main._poll_instance_status(stale)
 
         stop.assert_not_called()
-        self.assertEqual(main.hub.status_cache["race"]["state"], "REGISTERING")
-        main.hub.reset_health("race")
+        self.assertEqual(app_state.hub.status_cache["race"]["state"], "REGISTERING")
+        app_state.hub.reset_health("race")
 
     async def test_reader_enable_is_persisted_before_engine_start(self):
         device = {"id": "reader-a", "device_type": "reader", "instance_id": "7"}
@@ -568,25 +569,25 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order, ["save", "start"])
 
     async def test_manual_stop_clears_pending_automatic_recovery(self):
-        main.hub.health["stop-test"] = {
+        app_state.hub.health["stop-test"] = {
             "auto_retrying": False, "fail_start": 1, "retry_count": 3,
             "frozen_code": "registering", "frozen_reason": "IMS unavailable",
             "next_retry_at": main.time.monotonic() + 1, "last_state": "REGISTERING",
         }
-        main._record_lifecycle.reset_mock()
+        app_state._record_lifecycle.reset_mock()
         with patch.object(main.engine, "stop") as stop, \
-                patch.object(main.hub, "drop_ami", new=AsyncMock()) as drop_ami:
+                patch.object(app_state.hub, "drop_ami", new=AsyncMock()) as drop_ami:
             await main.api_instance_stop("stop-test")
 
-        self.assertIsNone(main.hub.health["stop-test"]["frozen_code"])
-        self.assertIsNone(main.hub.health["stop-test"]["next_retry_at"])
-        self.assertEqual(main.hub.status_cache["stop-test"]["state"], "STOPPED")
+        self.assertIsNone(app_state.hub.health["stop-test"]["frozen_code"])
+        self.assertIsNone(app_state.hub.health["stop-test"]["next_retry_at"])
+        self.assertEqual(app_state.hub.status_cache["stop-test"]["state"], "STOPPED")
         stop.assert_called_once_with("stop-test")
         drop_ami.assert_awaited_once_with("stop-test")
-        main._record_lifecycle.assert_called_once_with(
+        app_state._record_lifecycle.assert_called_once_with(
             "stop-test", "recovery_cancelled", "user_requested",
             retry_count=3, card_present=None)
-        main.hub.reset_health("stop-test")
+        app_state.hub.reset_health("stop-test")
 
     async def test_unknown_registration_only_holds_ok_for_bounded_grace(self):
         iid = "status-grace"
@@ -596,24 +597,24 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
                    "reason_code": "registering", "reason": "Checking.",
                    "detail": {"registration": "unknown"}}
         sampled_at = main.time.monotonic()
-        main.hub.status_cache[iid] = previous
-        main.hub.status_sampled_at[iid] = sampled_at
+        app_state.hub.status_cache[iid] = previous
+        app_state.hub.status_sampled_at[iid] = sampled_at
         inst = {"id": iid, "enabled": True}
-        with patch.object(main.hub, "ami_for", new=AsyncMock(return_value=object())), \
+        with patch.object(app_state.hub, "ami_for", new=AsyncMock(return_value=object())), \
                 patch.object(main.status_mod, "compute", new=AsyncMock(return_value=unknown)), \
-                patch.object(main.hub.runtime, "get", new=AsyncMock(return_value={
+                patch.object(app_state.hub.runtime, "get", new=AsyncMock(return_value={
                     "running": True, "ip": "172.17.0.2", "container_id": "grace"})), \
-                patch.object(main.hub, "broadcast", new=AsyncMock()):
+                patch.object(app_state.hub, "broadcast", new=AsyncMock()):
             await main._poll_instance_status(inst)
-            self.assertEqual(main.hub.status_cache[iid]["state"], "OK")
-            self.assertEqual(main.hub.status_sampled_at[iid], sampled_at)
+            self.assertEqual(app_state.hub.status_cache[iid]["state"], "OK")
+            self.assertEqual(app_state.hub.status_sampled_at[iid], sampled_at)
 
-            main.hub.status_sampled_at[iid] = (
+            app_state.hub.status_sampled_at[iid] = (
                 main.time.monotonic() - main.STATUS_OK_GRACE_SECONDS - 1)
             await main._poll_instance_status(inst)
 
-        self.assertEqual(main.hub.status_cache[iid]["state"], "REGISTERING")
-        main.hub.reset_health(iid)
+        self.assertEqual(app_state.hub.status_cache[iid]["state"], "REGISTERING")
+        app_state.hub.reset_health(iid)
 
 
 if __name__ == "__main__":
@@ -684,19 +685,19 @@ class HostAlertSuppressionTests(unittest.TestCase):
             alerts, {"undervoltage_seen": {"acknowledged": True}}), [])
 
     def test_clear_host_alerts_persists_acknowledgement(self):
-        old_alerts, old_state = main.hub.host_alerts, main.hub.host_alert_state
+        old_alerts, old_state = app_state.hub.host_alerts, app_state.hub.host_alert_state
         try:
-            main.hub.host_alerts = [{"code": "undervoltage_seen", "severity": "warning"}]
-            main.hub.host_alert_state = {}
+            app_state.hub.host_alerts = [{"code": "undervoltage_seen", "severity": "warning"}]
+            app_state.hub.host_alert_state = {}
 
             result = main.api_host_alerts_clear()
 
             self.assertEqual(result["cleared"], ["undervoltage_seen"])
-            self.assertEqual(main.hub.host_alerts, [])
+            self.assertEqual(app_state.hub.host_alerts, [])
             saved = main._load_host_alert_state()
             self.assertTrue(saved["undervoltage_seen"]["acknowledged"])
         finally:
-            main.hub.host_alerts, main.hub.host_alert_state = old_alerts, old_state
+            app_state.hub.host_alerts, app_state.hub.host_alert_state = old_alerts, old_state
 
     def test_the_summary_explains_each_condition_rather_than_naming_it(self):
         text = main._host_alert_summary([
@@ -713,7 +714,7 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
     presenting its previous number as caller identity indefinitely."""
 
     def setUp(self):
-        main.hub._msisdn_checked.pop("5", None)
+        app_state.hub._msisdn_checked.pop("5", None)
 
     async def _verify(self, stored, observed, source="ims"):
         inst = {"id": "5", "name": "voxi", "msisdn": stored, "msisdn_source": source}
@@ -722,9 +723,9 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.cfg, "upsert_instance",
                              side_effect=lambda x: {**inst, **x}) as upsert, \
                 patch.object(main.cfg, "get_settings", return_value={}), \
-                patch.object(main, "_start_engine_checked") as restart, \
-                patch.object(main.hub, "drop_ami", new=AsyncMock()), \
-                patch.object(main.hub, "broadcast", new=AsyncMock()) as dispatch:
+                patch.object(app_state, "_start_engine_checked") as restart, \
+                patch.object(app_state.hub, "drop_ami", new=AsyncMock()), \
+                patch.object(app_state.hub, "broadcast", new=AsyncMock()) as dispatch:
             await main._verify_ims_msisdn("5", inst)
             for _ in range(20):
                 await __import__("asyncio").sleep(0.01)
@@ -776,8 +777,8 @@ class PortedNumberTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.engine, "exec_cli"), \
                 patch.object(main.cfg, "upsert_instance") as upsert, \
                 patch.object(main.cfg, "get_settings", return_value={}), \
-                patch.object(main, "_start_engine_checked", side_effect=RuntimeError("docker")), \
-                patch.object(main.hub, "drop_ami", new=AsyncMock()):
+                patch.object(app_state, "_start_engine_checked", side_effect=RuntimeError("docker")), \
+                patch.object(app_state.hub, "drop_ami", new=AsyncMock()):
             with self.assertLogs("vowifi.main", level="WARNING") as captured:
                 await main._verify_ims_msisdn("5", inst)
         upsert.assert_not_called()
@@ -888,10 +889,10 @@ class HardwareImeiRecoveryTests(unittest.TestCase):
 
     def test_reader_rebuild_also_reuses_its_verified_line_snapshot(self):
         inst = {"imei": "123456789012345", "imei_source_device_id": "reader-a"}
-        with patch.object(main, "_device_for_card", return_value=("reader-a", "reader")), \
+        with patch.object(app_state, "_device_for_card", return_value=("reader-a", "reader")), \
                 patch.object(main.device_state, "hardware", return_value={}), \
-                patch.object(main, "_match_instance_by_iccid", return_value=inst):
-            resolved = main._hardware_imei_for_card(self.CARD, [self.CARD])
+                patch.object(app_state, "_match_instance_by_iccid", return_value=inst):
+            resolved = app_state._hardware_imei_for_card(self.CARD, [self.CARD])
         self.assertEqual(resolved, ("123456789012345", "reader-a", "reader"))
 
 
@@ -951,8 +952,8 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
     INST = {"id": "9", "enabled": True, "mcc": "310", "mnc": "240", "name": "test"}
 
     def setUp(self):
-        main.hub.exit_ledgers.pop("9", None)
-        main.hub.reset_health("9")
+        app_state.hub.exit_ledgers.pop("9", None)
+        app_state.hub.reset_health("9")
         settings = patch.object(main.cfg, "get_settings", return_value={"proxy": {"enabled": True}})
         settings.start()
         self.addCleanup(settings.stop)
@@ -961,8 +962,8 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(stalled.stop)
 
     def tearDown(self):
-        main.hub.exit_ledgers.pop("9", None)
-        main.hub.reset_health("9")
+        app_state.hub.exit_ledgers.pop("9", None)
+        app_state.hub.reset_health("9")
 
     def _judge(self, swu, retransmits, exits=None, stable_for=0.0, peers=(),
                reason="tunnel_network", evidence_error=None):
@@ -987,7 +988,7 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(action, (main.failover.HOLD, main.failover.REPORT))
             reselect.assert_not_called()
         self.stalled.assert_not_called()
-        self.assertEqual(main.hub.exit_ledgers["9"]["strikes"], 0)
+        self.assertEqual(app_state.hub.exit_ledgers["9"]["strikes"], 0)
 
     async def test_retransmit_read_failure_preserves_connected_evidence(self):
         for attempt in range(3):
@@ -995,7 +996,7 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(action, main.failover.HOLD)
             reselect.assert_not_called()
         self.stalled.assert_not_called()
-        self.assertEqual(main.hub.exit_ledgers["9"]["strikes"], 0)
+        self.assertEqual(app_state.hub.exit_ledgers["9"]["strikes"], 0)
 
     async def test_dns_failure_never_strikes_or_cleans_an_exit(self):
         for attempt in range(3):
@@ -1007,20 +1008,20 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
     async def test_direct_missing_and_nonselectable_exits_do_not_accumulate_ledgers(self):
         for exits in ({}, {"exits": {}}, {"exits": {"us": {"mode": "direct"}}},
                       {"exits": {"us": {"mode": "manual", "node": "fixed"}}}):
-            main.hub.exit_ledgers["9"] = {"exhausted": True, "given_up": True}
+            app_state.hub.exit_ledgers["9"] = {"exhausted": True, "given_up": True}
             for attempt in range(4):
                 action, reselect, notify = self._judge("DOWN", 0, exits=exits)
                 self.assertEqual(action, main.failover.HOLD)
                 reselect.assert_not_called()
                 notify.assert_not_called()
-                self.assertNotIn("9", main.hub.exit_ledgers)
+                self.assertNotIn("9", app_state.hub.exit_ledgers)
         self.stalled.assert_not_called()
 
     async def test_disabled_proxy_ignores_stale_subscription_status(self):
         with patch.object(main.cfg, "get_settings", return_value={"proxy": {"enabled": False}}):
             action, reselect, _ = self._judge("DOWN", 0)
         self.assertEqual(action, main.failover.HOLD)
-        self.assertNotIn("9", main.hub.exit_ledgers)
+        self.assertNotIn("9", app_state.hub.exit_ledgers)
         reselect.assert_not_called()
         self.stalled.assert_not_called()
 
@@ -1032,12 +1033,12 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
         ledger = {**main.failover.blank_ledger(), "node": "node-b", "strikes": 1,
                   "tried": ["node-a", "node-b"], "exhausted": True, "given_up": True,
                   "failures": 7, "reported": True}
-        main.hub.exit_ledgers["9"] = dict(ledger)
+        app_state.hub.exit_ledgers["9"] = dict(ledger)
         unknown = {"exits": {"us": {"node": "", "candidates": ["node-a", "node-b"],
                                     "selection": "auto", "mode": "subscription"}}}
         action, reselect, notify = self._judge("DOWN", 0, exits=unknown)
         self.assertEqual(action, main.failover.HOLD)
-        self.assertEqual(main.hub.exit_ledgers["9"], ledger)
+        self.assertEqual(app_state.hub.exit_ledgers["9"], ledger)
         reselect.assert_not_called()
         notify.assert_not_called()
         self.stalled.assert_not_called()
@@ -1048,16 +1049,16 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main, "_local_card_fault", return_value=""), \
                 patch.object(main, "_save_exit_ledgers"), \
                 patch.object(main.asyncio, "to_thread", new=AsyncMock()), \
-                patch.object(main.hub, "drop_ami", new=AsyncMock()):
+                patch.object(app_state.hub, "drop_ami", new=AsyncMock()):
             for attempt in range(4):
-                main.hub.reset_health("9")
-                health = main.hub.health_for("9")
+                app_state.hub.reset_health("9")
+                health = app_state.hub.health_for("9")
                 health["fail_start"] = main.time.monotonic() - 10000
                 before = main.time.monotonic()
                 main.apply_health("9", self.INST, dict(st))
                 self.assertGreaterEqual(health["next_retry_at"], before + 160)
                 self.assertLess(health["next_retry_at"], before + 170)
-                self.assertNotIn("9", main.hub.exit_ledgers)
+                self.assertNotIn("9", app_state.hub.exit_ledgers)
 
     def test_empty_or_missing_ike_logs_are_explicitly_unavailable(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1097,7 +1098,7 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
                 seen.append((action, to_thread))
         action, to_thread = seen[-1]
         self.assertEqual(action, main.failover.BACK_OFF)
-        self.assertTrue(main.hub.exit_ledgers["9"]["exhausted"])
+        self.assertTrue(app_state.hub.exit_ledgers["9"]["exhausted"])
         # The slow retries that follow keep backing off without announcing again.
         action, _reselect, to_thread = self._judge("DOWN", 0)
         self.assertEqual(action, main.failover.BACK_OFF)
@@ -1105,7 +1106,7 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_registered_sibling_keeps_the_exit_where_it_is(self):
         peer = {"id": "7", "enabled": True, "mcc": "310", "mnc": "260", "name": "peer"}
-        main.hub.status_cache["7"] = {"state": "OK"}
+        app_state.hub.status_cache["7"] = {"state": "OK"}
         actions = []
         try:
             for _ in range(main.failover.FAILURES_BEFORE_REPORT):
@@ -1113,13 +1114,13 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
                 actions.append(action)
                 reselect.assert_not_called()
         finally:
-            main.hub.status_cache.pop("7", None)
+            app_state.hub.status_cache.pop("7", None)
         # Never a switch — but the operator is still told, once, that the line is stuck.
         self.assertNotIn(main.failover.SWITCH, actions)
         self.assertEqual(actions[-1], main.failover.REPORT)
 
     async def test_giving_up_stops_the_automatic_rebuild(self):
-        h = main.hub.health_for("9")
+        h = app_state.hub.health_for("9")
         h["fail_start"] = main.time.monotonic() - 10_000    # past the retry budget
         st = {"state": "TUNNEL_DOWN", "label": "x", "reason_code": "tunnel_network",
               "reason": "x", "detail": {}}
@@ -1133,9 +1134,9 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(h["frozen_code"], "tunnel_network")
 
     async def test_a_failed_manual_retry_stays_stopped_while_pin_is_still_locked(self):
-        h = main.hub.health_for("9")
+        h = app_state.hub.health_for("9")
         h["fail_start"] = main.time.monotonic() - 10_000
-        main.hub.exit_ledgers["9"] = {
+        app_state.hub.exit_ledgers["9"] = {
             "node": "node-a", "strikes": 3, "tried": ["node-a"],
             "failures": 3, "given_up": True, "reported": True,
         }
@@ -1146,10 +1147,10 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.cfg, "get_settings", return_value={}):
             main.apply_health("9", self.INST, st)
         self.assertIsNone(h["next_retry_at"])
-        main.hub.exit_ledgers.pop("9", None)
+        app_state.hub.exit_ledgers.pop("9", None)
 
     async def test_backing_off_slows_the_rebuild_instead_of_stopping_it(self):
-        h = main.hub.health_for("9")
+        h = app_state.hub.health_for("9")
         h["fail_start"] = main.time.monotonic() - 10_000
         st = {"state": "TUNNEL_DOWN", "label": "x", "reason_code": "tunnel_network",
               "reason": "x", "detail": {}}
@@ -1164,7 +1165,7 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(remaining, main.failover.EXHAUSTED_RETRY_SECONDS * 0.9)
 
     async def test_a_freeze_that_still_has_options_keeps_its_retry_time(self):
-        h = main.hub.health_for("9")
+        h = app_state.hub.health_for("9")
         h["fail_start"] = main.time.monotonic() - 10_000
         st = {"state": "TUNNEL_DOWN", "label": "x", "reason_code": "tunnel_network",
               "reason": "x", "detail": {}}
@@ -1175,14 +1176,14 @@ class ExitFailoverWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(h["next_retry_at"])
 
     async def test_registering_clears_what_the_ledger_held_against_the_exit(self):
-        main.hub.exit_ledgers["9"] = {"node": "node-a", "strikes": 2, "tried": ["node-a"],
+        app_state.hub.exit_ledgers["9"] = {"node": "node-a", "strikes": 2, "tried": ["node-a"],
                                       "failures": 2, "given_up": True, "reported": True}
         st = {"state": "OK", "label": "Working", "reason_code": "ok", "reason": "",
               "detail": {}}
         with patch.object(main, "_save_exit_ledgers"), \
                 patch.object(main.cfg, "get_settings", return_value={}):
             main.apply_health("9", self.INST, st)
-        self.assertNotIn("9", main.hub.exit_ledgers)
+        self.assertNotIn("9", app_state.hub.exit_ledgers)
 
 
 class StaleStatusCacheTests(unittest.TestCase):
@@ -1195,8 +1196,8 @@ class StaleStatusCacheTests(unittest.TestCase):
              "reason": "No SIM card detected in the reader.", "detail": {}}
 
     def setUp(self):
-        main.hub.status_cache["line-stale"] = dict(self.STALE)
-        self.addCleanup(main.hub.status_cache.pop, "line-stale", None)
+        app_state.hub.status_cache["line-stale"] = dict(self.STALE)
+        self.addCleanup(app_state.hub.status_cache.pop, "line-stale", None)
 
     def test_a_disabled_line_is_not_reported_from_the_cache_it_left_behind(self):
         status = main._cached_line_status({"id": "line-stale", "enabled": False})

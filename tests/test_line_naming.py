@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from control.app import config
+from control.app import state as app_state
 
 try:
     from control.app import main
@@ -110,7 +111,7 @@ class RenameApiTests(unittest.IsolatedAsyncioTestCase):
         with TempConfig() as cfg_temp:
             before = cfg_temp.add("1", "Old name", mcc="234", mnc="010")
             with patch.object(main.engine, "is_running", return_value=True), \
-                    patch.object(main, "_start_engine_checked") as restart, \
+                    patch.object(app_state, "_start_engine_checked") as restart, \
                     patch.object(main.egress, "publish") as publish:
                 # The WebUI submits the complete form, not a special rename request. The server
                 # must identify the effective persisted diff rather than trusting payload shape.
@@ -133,7 +134,7 @@ class RenameApiTests(unittest.IsolatedAsyncioTestCase):
             raw["instances"]["1"] = polluted
             config.save(raw)
             with patch.object(main.engine, "is_running", return_value=True), \
-                    patch.object(main, "_start_engine_checked") as restart, \
+                    patch.object(app_state, "_start_engine_checked") as restart, \
                     patch.object(main.egress, "publish") as publish:
                 renamed = await main.api_instance_upsert(
                     {**polluted, "name": "New name", "status": {"state": "connected"},
@@ -156,7 +157,7 @@ class RenameApiTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(main.engine, "is_running", return_value=True), \
                     patch.object(main, "_reader_index_for_instance", return_value=1), \
                     patch.object(main, "_reader_port_for_instance", return_value="1-3.4.1"), \
-                    patch.object(main, "_start_engine_checked") as restart, \
+                    patch.object(app_state, "_start_engine_checked") as restart, \
                     patch.object(main.egress, "publish"):
                 renamed = await main.api_instance_upsert(
                     {**before, "name": "voxi-THB", "mnc": "015", "reader_index": 1})

@@ -16,6 +16,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from control.app import state as app_state
 
 REPO = Path(__file__).resolve().parent.parent
 ENTRYPOINT = REPO / "engine" / "entrypoint.sh"
@@ -216,7 +217,7 @@ class RestartBaselineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bounce_after_manager_restart_is_recorded(self):
         from control.app import main
-        hub = main.Hub()
+        hub = app_state.Hub()
         # Manager just started; the status poll sees line 5 running with no bounces yet.
         hub.seed_restart_baseline("5", {"running": True, "restart_count": 0})
         with patch.object(main.engine, "last_engine_exit",
@@ -227,7 +228,7 @@ class RestartBaselineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_seeding_never_overwrites_an_existing_baseline(self):
         from control.app import main
-        hub = main.Hub()
+        hub = app_state.Hub()
         hub.seed_restart_baseline("7", {"running": True, "restart_count": 0})
         # A later poll after the bounce must not swallow it by moving the baseline.
         hub.seed_restart_baseline("7", {"running": True, "restart_count": 1})

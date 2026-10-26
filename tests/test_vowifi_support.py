@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from control.app import main, vowifi_support
+from control.app import state as app_state
 
 
 class VowifiSupportTests(unittest.TestCase):
@@ -54,10 +55,10 @@ class UnsupportedCarrierHealthTests(unittest.IsolatedAsyncioTestCase):
               "reason_code": "epdg_unresolved", "reason": "x", "detail": {}}
         inst = {"id": "9", "enabled": True, "mcc": "460", "mnc": "11",
                 "retry": {"max": 3, "interval": 30}}
-        main.hub.reset_health("9", None)
+        app_state.hub.reset_health("9", None)
         with patch.object(main.engine, "capture_and_stop") as capture_and_stop, \
-                patch.object(main, "_record_lifecycle") as lifecycle, \
-                patch.object(main.hub, "drop_ami", new=AsyncMock()):
+                patch.object(app_state, "_record_lifecycle") as lifecycle, \
+                patch.object(app_state.hub, "drop_ami", new=AsyncMock()):
             result = main.apply_health("9", inst, st, "generation-1")
             for _ in range(20):
                 await __import__("asyncio").sleep(0.01)
@@ -74,7 +75,7 @@ class UnsupportedCarrierHealthTests(unittest.IsolatedAsyncioTestCase):
               "reason_code": "epdg_unresolved", "reason": "x", "detail": {}}
         inst = {"id": "10", "enabled": True, "mcc": "234", "mnc": "33",
                 "retry": {"max": 3, "interval": 30}}
-        main.hub.reset_health("10", None)
+        app_state.hub.reset_health("10", None)
         vowifi_support._cache.clear()
         with patch.object(vowifi_support, "probe_in_background"):
             result = main.apply_health("10", inst, st, "generation-1")

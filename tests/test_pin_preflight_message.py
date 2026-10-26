@@ -11,6 +11,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from control.app import main
+from control.app import state as app_state
 
 
 class PinPreflightMessageTests(unittest.TestCase):
@@ -58,7 +59,7 @@ class PinPreflightMessageTests(unittest.TestCase):
 class PreflightBlockLifecycleTests(unittest.TestCase):
     def _capture(self, pf):
         events = []
-        with patch.object(main, "_record_lifecycle",
+        with patch.object(app_state, "_record_lifecycle",
                           side_effect=lambda iid, event, **kw: events.append((event, kw))):
             with self.assertRaises(HTTPException) as ctx:
                 main._raise_preflight_block("3", pf)

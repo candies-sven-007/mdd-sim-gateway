@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from control.app import failover, main
+from control.app import state as app_state
 
 
 OURS = "8900000000000000022"
@@ -112,20 +113,20 @@ class LocalCardFaultTests(unittest.TestCase):
 class CardCountTests(unittest.TestCase):
     def test_distinct_sims_are_counted_not_readers(self):
         # One modem exposes three VPCD readers onto the same UICC; that is one SIM, not three.
-        with patch.object(main.hub, "cards", {
+        with patch.object(app_state.hub, "cards", {
                 "VoWiFi Modem A 00 00": {"iccid": OURS},
                 "VoWiFi Modem A 00 01": {"iccid": OURS},
                 "VoWiFi Modem A 00 02": {"iccid": OURS}}):
             self.assertEqual(main._distinct_cards_present(), 1)
 
     def test_two_modems_count_as_two(self):
-        with patch.object(main.hub, "cards", {
+        with patch.object(app_state.hub, "cards", {
                 "VoWiFi Modem A 00 00": {"iccid": OURS},
                 "VoWiFi Modem B 00 00": {"iccid": THEIRS}}):
             self.assertEqual(main._distinct_cards_present(), 2)
 
     def test_an_empty_or_unreadable_cache_does_not_claim_a_single_sim_host(self):
-        with patch.object(main.hub, "cards", {}):
+        with patch.object(app_state.hub, "cards", {}):
             self.assertGreater(main._distinct_cards_present(), 1)
 
 

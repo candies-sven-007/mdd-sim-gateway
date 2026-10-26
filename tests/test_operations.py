@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from control.app import config, operations
+from control.app import state as app_state
 
 try:
     from control.app import main
@@ -659,18 +660,18 @@ class LineDiagnosticsTests(unittest.TestCase):
     """The per-line verdict the bundle carries beside the logs."""
 
     def setUp(self):
-        main.hub.status_cache.clear()
-        main.hub.health.clear()
-        main.hub.ok_since.clear()
+        app_state.hub.status_cache.clear()
+        app_state.hub.health.clear()
+        app_state.hub.ok_since.clear()
 
     def test_summary_names_the_reason_and_how_far_the_retry_budget_has_run(self):
-        main.hub.status_cache["1"] = {
+        app_state.hub.status_cache["1"] = {
             "state": "REGISTERING", "reason_code": "reg_unanswered",
             "reason": "The carrier's IMS stopped answering registration.",
             "retry": {"count": 2, "max": 3},
             "detail": {"registration": "unregistered", "active_channels": 0},
         }
-        main.hub.health["1"] = {"fail_start": time.monotonic() - 61.0, "frozen_code": None}
+        app_state.hub.health["1"] = {"fail_start": time.monotonic() - 61.0, "frozen_code": None}
 
         entry = main._line_diagnostics({"id": "1", "name": "T-MOBILE"})
 
@@ -683,7 +684,7 @@ class LineDiagnosticsTests(unittest.TestCase):
         self.assertIsNone(entry["ok_for_seconds"])
 
     def test_summary_carries_no_subscriber_identifiers(self):
-        main.hub.status_cache["1"] = {
+        app_state.hub.status_cache["1"] = {
             "state": "OK", "reason_code": "ok", "reason": "", "retry": {},
             "detail": {"registration": "registered", "msisdn": "+12025550123",
                        "imsi": "001010123456789"},

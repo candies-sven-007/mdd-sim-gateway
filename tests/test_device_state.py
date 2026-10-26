@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from control.app import device_state, main
+from control.app import state as app_state
 
 
 class DeviceStateTests(unittest.TestCase):
@@ -109,7 +110,7 @@ class DeviceDisplayNameTests(unittest.IsolatedAsyncioTestCase):
             with patch.multiple(device_state, ROOT=temp,
                                 HARDWARE=str(Path(temp) / "devices-hardware.json")), \
                     patch.object(main, "_unified_devices", new=AsyncMock(return_value=[device])), \
-                    patch.object(main.hub, "broadcast", new=AsyncMock()):
+                    patch.object(app_state.hub, "broadcast", new=AsyncMock()):
                 await main.api_device_name("reader-old", {"display_name": " Desk reader "})
                 await main.api_device_hardware("reader-old", {"imei": "490154203237518"})
                 record = device_state.hardware()["reader-old"]

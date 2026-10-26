@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from control.app import main, media
+from control.app import state as app_state
 
 INSTANCE = {"id": "1", "mcc": "001", "mnc": "01",
             "sip": {"webrtc": {"enable": True, "username": "webrtc", "password": "p"}}}
@@ -44,11 +45,11 @@ class MediaControlTests(unittest.TestCase):
                 patch.object(main.cfg, "get_instance", side_effect=lambda iid: {"id": iid}), \
                 patch.object(main.cfg, "get_settings", return_value={}), \
                 patch.object(main.engine, "media_mode_of", side_effect=modes.get), \
-                patch.object(main, "_start_engine_checked", side_effect=start), \
-                patch.object(main, "_record_lifecycle"), \
+                patch.object(app_state, "_start_engine_checked", side_effect=start), \
+                patch.object(app_state, "_record_lifecycle"), \
                 patch.object(main.time, "monotonic", return_value=now), \
-                patch.object(main.hub, "drop_ami", side_effect=drop_ami), \
-                patch.object(main.hub, "reset_health"):
+                patch.object(app_state.hub, "drop_ami", side_effect=drop_ami), \
+                patch.object(app_state.hub, "reset_health"):
             rebuilt = asyncio.run(main._media_converge_once())
         return rebuilt, started, order
 

@@ -4,6 +4,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from control.app import config, main
+from control.app import state as app_state
+from control.app.routers import esim as esim_routes
 
 
 class AutoProvisionTests(unittest.TestCase):
@@ -35,7 +37,7 @@ class AutoProvisionTests(unittest.TestCase):
 
     @patch.object(main.egress, "publish")
     @patch.object(main.cfg, "upsert_instance")
-    @patch.object(main, "_hardware_imei_for_card")
+    @patch.object(app_state, "_hardware_imei_for_card")
     def test_a_carrier_without_vowifi_is_provisioned_with_vowifi_off(
             self, hardware_imei, upsert, _publish):
         """A China Telecom SIM got a line that could only fail on ePDG DNS and marked a
@@ -45,28 +47,28 @@ class AutoProvisionTests(unittest.TestCase):
         draft = {**self.draft, "imsi": "460110123456789", "mcc": "460", "mnc": "11"}
         card = {**self.card, "imsi": draft["imsi"], "mcc": "460", "mnc": "11"}
 
-        result = main._auto_promote_card_draft(draft, card, [card])
+        result = app_state._auto_promote_card_draft(draft, card, [card])
 
         self.assertEqual(result["provisioning_state"], "ready")
         self.assertFalse(result["enabled"])
 
     @patch.object(main.egress, "publish")
     @patch.object(main.cfg, "upsert_instance")
-    @patch.object(main, "_hardware_imei_for_card")
+    @patch.object(app_state, "_hardware_imei_for_card")
     def test_a_carrier_that_publishes_no_epdg_is_provisioned_with_vowifi_off(
             self, hardware_imei, upsert, _publish):
         hardware_imei.return_value = ("490154203237518", "test", "modem")
         upsert.side_effect = lambda value, **kwargs: value
         with patch.object(main.vowifi_support, "lookup", return_value="nxdomain"):
-            result = main._auto_promote_card_draft(self.draft, self.card, [self.card])
+            result = app_state._auto_promote_card_draft(self.draft, self.card, [self.card])
         self.assertFalse(result["enabled"])
 
     @patch.object(main.cfg, "upsert_instance")
-    @patch.object(main, "_hardware_imei_for_card")
+    @patch.object(app_state, "_hardware_imei_for_card")
     def test_incomplete_draft_stays_stopped(self, hardware_imei, upsert):
         hardware_imei.return_value = ("", "reader-test", "reader")
 
-        result = main._auto_promote_card_draft(self.draft, self.card, [self.card])
+        result = app_state._auto_promote_card_draft(self.draft, self.card, [self.card])
 
         self.assertEqual(result["provisioning_state"], "draft")
         self.assertFalse(result["enabled"])
@@ -74,22 +76,22 @@ class AutoProvisionTests(unittest.TestCase):
         upsert.assert_not_called()
 
     @patch.object(main.cfg, "upsert_instance")
-    @patch.object(main, "_hardware_imei_for_card")
+    @patch.object(app_state, "_hardware_imei_for_card")
     def test_pin_locked_draft_waits_for_saved_pin(self, hardware_imei, upsert):
         hardware_imei.return_value = ("490154203237518", "test", "modem")
         self.card["pin_enabled"] = True
 
-        result = main._auto_promote_card_draft(self.draft, self.card, [self.card])
+        result = app_state._auto_promote_card_draft(self.draft, self.card, [self.card])
 
         self.assertIn("SIM PIN", result["auto_provision_missing"])
         upsert.assert_not_called()
 
     @patch.object(main.cfg, "upsert_instance")
-    @patch.object(main, "_hardware_imei_for_card")
+    @patch.object(app_state, "_hardware_imei_for_card")
     def test_ready_disabled_line_is_never_promoted(self, hardware_imei, upsert):
         ready = {**self.draft, "provisioning_state": "ready", "enabled": False}
 
-        result = main._auto_promote_card_draft(ready, self.card, [self.card])
+        result = app_state._auto_promote_card_draft(ready, self.card, [self.card])
 
         self.assertIs(result, ready)
         hardware_imei.assert_not_called()
@@ -167,7 +169,7 @@ class AutoProvisionTests(unittest.TestCase):
 
     @patch.object(main.egress, "publish")
     @patch.object(main.cfg, "upsert_instance")
-    @patch.object(main, "_hardware_imei_for_card")
+    @patch.object(app_state, "_hardware_imei_for_card")
     def test_giffgaff_draft_promotion_applies_carrier_profile(
             self, hardware_imei, upsert, _publish):
         draft = {**self.draft, "mcc": "234", "mnc": "10", "sip": {
@@ -176,7 +178,7 @@ class AutoProvisionTests(unittest.TestCase):
         hardware_imei.return_value = ("490154203237518", "test", "modem")
         upsert.side_effect = lambda value, **kwargs: value
 
-        result = main._auto_promote_card_draft(draft, card, [card])
+        result = app_state._auto_promote_card_draft(draft, card, [card])
 
         self.assertEqual(result["sip"]["access_type"], "wlan1")
         self.assertTrue(result["sip"]["user_eq_phone"])
@@ -196,15 +198,15 @@ class HotplugDraftPromotionTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main.asyncio, "sleep", new=AsyncMock()), \
                 patch.object(main.cfg, "get_instance", return_value=draft), \
                 patch.object(main.engine, "is_running", return_value=False), \
-                patch.object(main.hub, "cards_list", return_value=[card]), \
-                patch.object(main, "_auto_promote_card_draft",
+                patch.object(app_state.hub, "cards_list", return_value=[card]), \
+                patch.object(app_state, "_auto_promote_card_draft",
                              return_value=promoted) as promote, \
-                patch.object(main, "_start_engine_checked") as start:
-            await main._auto_start_hotplugged_line("2")
+                patch.object(app_state, "_start_engine_checked") as start:
+            await app_state._auto_start_hotplugged_line("2")
 
         promote.assert_called_once_with(draft, card, [card])
         start.assert_not_called()
-        self.assertNotIn("2", main.hub.hotplug_starts)
+        self.assertNotIn("2", app_state.hub.hotplug_starts)
 
 
 class ReaderImeiCompletionTests(unittest.IsolatedAsyncioTestCase):
@@ -221,12 +223,12 @@ class ReaderImeiCompletionTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.device_state, "set_hardware", return_value={
                     "imei": "490154203237518"}), \
                 patch.object(main.cfg, "get_instance", return_value=draft), \
-                patch.object(main.hub, "cards_list", return_value=[card]), \
-                patch.object(main, "_auto_promote_card_draft", return_value=ready) as promote, \
+                patch.object(app_state.hub, "cards_list", return_value=[card]), \
+                patch.object(app_state, "_auto_promote_card_draft", return_value=ready) as promote, \
                 patch.object(main.engine, "is_running", return_value=False), \
                 patch.object(main, "_line_auto_start_allowed", return_value=(True, "")), \
-                patch.object(main, "_start_engine_checked") as start, \
-                patch.object(main.hub, "broadcast", new=AsyncMock()):
+                patch.object(app_state, "_start_engine_checked") as start, \
+                patch.object(app_state.hub, "broadcast", new=AsyncMock()):
             result = await main.api_device_hardware(
                 "reader-1", {"imei": "490154203237518"})
 
@@ -247,25 +249,25 @@ class DraftSetupGuidanceTests(unittest.IsolatedAsyncioTestCase):
             "imsi": "234330000000000", "mcc": "234", "mnc": "", "smsc": ""}
 
     def test_missing_lists_exactly_what_blocks_promotion(self):
-        with patch.object(main, "_hardware_imei_for_card",
+        with patch.object(app_state, "_hardware_imei_for_card",
                           return_value=("490154203237518", "reader-1", "reader")):
-            self.assertEqual(main._draft_missing(self.draft, self.card, [self.card]),
+            self.assertEqual(app_state._draft_missing(self.draft, self.card, [self.card]),
                              ["MCC/MNC"])
-            promoted = main._auto_promote_card_draft(self.draft, self.card, [self.card])
+            promoted = app_state._auto_promote_card_draft(self.draft, self.card, [self.card])
         self.assertEqual(promoted["provisioning_state"], "draft")
         self.assertEqual(promoted["auto_provision_missing"], ["MCC/MNC"])
 
     def test_a_sim_without_an_sms_centre_is_not_held_as_a_draft(self):
         card = {**self.card, "mnc": "33", "smsc": ""}
-        with patch.object(main, "_hardware_imei_for_card",
+        with patch.object(app_state, "_hardware_imei_for_card",
                           return_value=("490154203237518", "reader-1", "reader")):
-            self.assertEqual(main._draft_missing({**self.draft, "mnc": "33"}, card, [card]), [])
+            self.assertEqual(app_state._draft_missing({**self.draft, "mnc": "33"}, card, [card]), [])
 
     def test_a_locked_sim_without_a_saved_pin_is_reported(self):
         card = {**self.card, "mnc": "33", "pin_enabled": True}
-        with patch.object(main, "_hardware_imei_for_card",
+        with patch.object(app_state, "_hardware_imei_for_card",
                           return_value=("490154203237518", "reader-1", "reader")):
-            self.assertEqual(main._draft_missing(self.draft, card, [card]), ["SIM PIN"])
+            self.assertEqual(app_state._draft_missing(self.draft, card, [card]), ["SIM PIN"])
 
     async def test_saving_the_imei_says_what_is_still_missing(self):
         device = {"id": "reader-1", "device_type": "reader", "instance_id": "2",
@@ -274,12 +276,12 @@ class DraftSetupGuidanceTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.device_state, "set_hardware", return_value={
                     "imei": "490154203237518"}), \
                 patch.object(main.cfg, "get_instance", return_value=self.draft), \
-                patch.object(main.hub, "cards_list", return_value=[self.card]), \
-                patch.object(main, "_hardware_imei_for_card",
+                patch.object(app_state.hub, "cards_list", return_value=[self.card]), \
+                patch.object(app_state, "_hardware_imei_for_card",
                              return_value=("490154203237518", "reader-1", "reader")), \
                 patch.object(main.engine, "is_running", return_value=False), \
-                patch.object(main, "_start_engine_checked") as start, \
-                patch.object(main.hub, "broadcast", new=AsyncMock()):
+                patch.object(app_state, "_start_engine_checked") as start, \
+                patch.object(app_state.hub, "broadcast", new=AsyncMock()):
             result = await main.api_device_hardware("reader-1", {"imei": "490154203237518"})
 
         start.assert_not_called()
@@ -320,60 +322,60 @@ class LateCardDataTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_background_retry_completes_the_draft(self):
         entry = self.entry()
         draft = {"id": "2", "provisioning_state": "draft", "iccid": entry["iccid"]}
-        main.hub.cards[entry["name"]] = entry
+        app_state.hub.cards[entry["name"]] = entry
         try:
             with patch.object(main, "_CARD_REREAD_DELAYS", (0,)), \
                     patch.object(main.cfg, "get_instance", return_value=draft), \
-                    patch.object(main, "_hardware_imei_for_card",
+                    patch.object(app_state, "_hardware_imei_for_card",
                                  return_value=("490154203237518", "reader-1", "reader")), \
                     patch.object(main.sim, "read_card", return_value=self.card()), \
-                    patch.object(main, "_auto_start_hotplugged_line",
+                    patch.object(app_state, "_auto_start_hotplugged_line",
                                  new=AsyncMock()) as start:
                 await main._complete_draft_from_card(entry["name"])
                 await asyncio.sleep(0)
             start.assert_awaited_once_with("2")
-            self.assertEqual(main.hub.cards[entry["name"]]["mnc"], "33")
+            self.assertEqual(app_state.hub.cards[entry["name"]]["mnc"], "33")
         finally:
-            main.hub.cards.pop(entry["name"], None)
+            app_state.hub.cards.pop(entry["name"], None)
 
     async def test_read_sim_card_on_the_sim_tab_now_finishes_the_draft(self):
         entry = self.entry()
         draft = {"id": "2", "provisioning_state": "draft", "iccid": entry["iccid"]}
-        main.hub.cards[entry["name"]] = entry
+        app_state.hub.cards[entry["name"]] = entry
         try:
             with patch.object(main.sim, "list_readers",
                               return_value=["r0", "r1", "r2", "r3", entry["name"]]), \
                     patch.object(main.sim, "read_card", return_value=self.card()), \
                     patch.object(main.cfg, "get_instance", return_value=draft), \
-                    patch.object(main, "_hardware_imei_for_card",
+                    patch.object(app_state, "_hardware_imei_for_card",
                                  return_value=("490154203237518", "reader-1", "reader")), \
-                    patch.object(main, "_auto_start_hotplugged_line",
+                    patch.object(app_state, "_auto_start_hotplugged_line",
                                  new=AsyncMock()) as start:
                 result = await main.api_sim_detect(4)
                 await asyncio.sleep(0)
             self.assertEqual(result["smsc"], "+447700900000")
             start.assert_awaited_once_with("2")
         finally:
-            main.hub.cards.pop(entry["name"], None)
+            app_state.hub.cards.pop(entry["name"], None)
 
     async def test_the_device_button_reports_what_the_card_still_lacks(self):
         entry = self.entry()
         draft = {"id": "2", "provisioning_state": "draft", "iccid": entry["iccid"]}
-        main.hub.cards[entry["name"]] = entry
+        app_state.hub.cards[entry["name"]] = entry
         try:
-            with patch.object(main, "_device_for_card", return_value=("reader-1", "reader")), \
+            with patch.object(app_state, "_device_for_card", return_value=("reader-1", "reader")), \
                     patch.object(main.sim, "read_card", return_value=self.card(mnc="")), \
                     patch.object(main.cfg, "get_instance", return_value=draft), \
-                    patch.object(main, "_hardware_imei_for_card",
+                    patch.object(app_state, "_hardware_imei_for_card",
                                  return_value=("490154203237518", "reader-1", "reader")), \
-                    patch.object(main.hub, "broadcast", new=AsyncMock()), \
-                    patch.object(main, "_auto_start_hotplugged_line", new=AsyncMock()) as start:
+                    patch.object(app_state.hub, "broadcast", new=AsyncMock()), \
+                    patch.object(app_state, "_auto_start_hotplugged_line", new=AsyncMock()) as start:
                 result = await main.api_device_sim_reread("reader-1")
             self.assertEqual(result["missing"], ["MCC/MNC"])
             self.assertFalse(result["completing"])
             start.assert_not_awaited()
         finally:
-            main.hub.cards.pop(entry["name"], None)
+            app_state.hub.cards.pop(entry["name"], None)
 
 
 class ImsIdentityLearningTests(unittest.IsolatedAsyncioTestCase):
@@ -397,10 +399,10 @@ class ImsIdentityLearningTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.cfg, "upsert_instance", return_value=corrected) as upsert, \
                 patch.object(main.cfg, "get_settings", return_value={}), \
                 patch.object(main.engine, "is_running", return_value=True), \
-                patch.object(main, "_start_engine_checked") as restart, \
-                patch.object(main.hub, "drop_ami", new=AsyncMock()) as drop_ami, \
-                patch.object(main.hub, "broadcast", new=AsyncMock()), \
-                patch.object(main.hub, "reset_health"):
+                patch.object(app_state, "_start_engine_checked") as restart, \
+                patch.object(app_state.hub, "drop_ami", new=AsyncMock()) as drop_ami, \
+                patch.object(app_state.hub, "broadcast", new=AsyncMock()), \
+                patch.object(app_state.hub, "reset_health"):
             await main.learn_msisdn("2")
 
         upsert.assert_called_once_with({"id": "2", "msisdn": "+447000000001",
@@ -440,8 +442,8 @@ class IdenticalNativeReaderTests(unittest.IsolatedAsyncioTestCase):
             instances[iid].update(update)
             return dict(instances[iid])
 
-        main.hub.cards.clear()
-        self.addCleanup(main.hub.cards.clear)
+        app_state.hub.cards.clear()
+        self.addCleanup(app_state.hub.cards.clear)
         with patch.object(main.usbreader, "port_for_index",
                           side_effect=lambda idx: {0: "2-3", 1: "2-1"}[idx]), \
                 patch.object(main.cfg, "list_instances",
@@ -451,14 +453,14 @@ class IdenticalNativeReaderTests(unittest.IsolatedAsyncioTestCase):
                              side_effect=lambda iid, _name: {"reader": pin_readers[str(iid)]}), \
                 patch.object(main.sim, "read_card", side_effect=lambda idx: cards[idx]) as read, \
                 patch.object(main.cfg, "upsert_instance", side_effect=upsert), \
-                patch.object(main, "_auto_start_hotplugged_line", new=AsyncMock()):
+                patch.object(app_state, "_auto_start_hotplugged_line", new=AsyncMock()):
             await main._on_card_insert("AK9563 00 00", 0)
             await main._on_card_insert("AK9563 01 00", 1)
             await asyncio.sleep(0)
 
         self.assertEqual(read.call_count, 2)
-        self.assertEqual(main.hub.cards["AK9563 00 00"]["matched"], "2")
-        self.assertEqual(main.hub.cards["AK9563 01 00"]["matched"], "1")
+        self.assertEqual(app_state.hub.cards["AK9563 00 00"]["matched"], "2")
+        self.assertEqual(app_state.hub.cards["AK9563 01 00"]["matched"], "1")
         self.assertEqual(instances["1"]["reader_port"], "2-1")
         self.assertEqual(instances["1"]["reader_index"], 1)
         self.assertEqual(instances["2"]["reader_port"], "2-3")
@@ -479,18 +481,18 @@ class EsimProfileRefreshTests(unittest.IsolatedAsyncioTestCase):
             scheduled.append(coro)
             coro.close()
 
-        with patch.dict(main.hub.cards, {"Reader": {
+        with patch.dict(app_state.hub.cards, {"Reader": {
                 "index": 4, "name": "Reader", "present": True,
                 "reader_port": "1-1.2", "matched": "4",
                 "iccid": "89441000400130000000",
         }}, clear=True), \
                 patch.object(main.sim, "read_card", return_value=card), \
-                patch.object(main, "_match_instance_by_iccid", return_value=None), \
+                patch.object(app_state, "_match_instance_by_iccid", return_value=None), \
                 patch.object(main.cfg, "card_auto_create_suppressed", return_value=False), \
-                patch.object(main, "_ensure_card_draft", return_value=draft) as ensure, \
-                patch.object(main.hub, "broadcast", new=AsyncMock()) as broadcast, \
+                patch.object(app_state, "_ensure_card_draft", return_value=draft) as ensure, \
+                patch.object(app_state.hub, "broadcast", new=AsyncMock()) as broadcast, \
                 patch.object(main.asyncio, "create_task", side_effect=capture):
-            result = await main._esim_refresh_card("Reader", 4)
+            result = await esim_routes._esim_refresh_card("Reader", 4)
 
         self.assertEqual(result["iccid"], card.iccid)
         self.assertEqual(result["matched"], "5")

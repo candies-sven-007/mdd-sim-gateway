@@ -26,6 +26,7 @@ from jinja2 import Environment, FileSystemLoader
 
 from control.app import main, store
 from tests.route_listing import api_routes
+from control.app import state as app_state
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES = ROOT / "engine" / "templates"
@@ -126,7 +127,7 @@ class ControlPlaneNeverSeesTheMessage(unittest.IsolatedAsyncioTestCase):
         body = base64.b64encode("Your code is 482913".encode()).decode()
         with tempfile.TemporaryDirectory() as temp, \
                 patch.multiple(store, DATA_DIR=temp, DB_PATH=str(Path(temp) / "h.sqlite")), \
-                patch.object(main.hub, "broadcast", new=AsyncMock()) as broadcast:
+                patch.object(app_state.hub, "broadcast", new=AsyncMock()) as broadcast:
             store.init()
             for event in ("sms_in", "sms_out", "ussd"):
                 result = await main.api_engine_event(

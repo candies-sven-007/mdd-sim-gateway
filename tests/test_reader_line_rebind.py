@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from control.app import main
+from control.app import state as app_state
 
 ICCID = "89440000000000000315"
 SCR = {"name": "SCR Prime CCID Reader (000000000001) 01 00", "index": 5, "present": True,
@@ -21,8 +22,8 @@ MODEM = {"name": "VoWiFi Modem 2c7c-0125-1-2.1 00 01", "index": 1, "present": Tr
 
 class LiveReaderBindingTests(unittest.TestCase):
     def binding(self, cards, **inst):
-        with patch.object(main.hub, "cards", {c["name"]: c for c in cards}):
-            return main._live_reader_binding_for_instance({"iccid": ICCID, **inst})
+        with patch.object(app_state.hub, "cards", {c["name"]: c for c in cards}):
+            return app_state._live_reader_binding_for_instance({"iccid": ICCID, **inst})
 
     def test_the_reader_holding_the_sim_is_found(self):
         self.assertEqual(self.binding([OTHER, SCR]), {"reader_port": "1-2.2", "reader_index": 5})
@@ -32,7 +33,7 @@ class LiveReaderBindingTests(unittest.TestCase):
         self.assertEqual(self.binding([OTHER]), {})
         self.assertEqual(self.binding([{**SCR, "present": False}]), {})
         self.assertEqual(self.binding([SCR, {**SCR, "name": "second", "reader_port": "1-3"}]), {})
-        self.assertEqual(main._live_reader_binding_for_instance({}), {})
+        self.assertEqual(app_state._live_reader_binding_for_instance({}), {})
 
     def test_modem_readers_are_left_to_the_modem_binding(self):
         self.assertEqual(self.binding([MODEM]), {})
@@ -41,25 +42,25 @@ class LiveReaderBindingTests(unittest.TestCase):
 
 class StartRebindsTests(unittest.TestCase):
     @patch.object(main.engine, "start", return_value="container-id")
-    @patch.object(main, "_apply_current_hardware_imei", side_effect=lambda inst: inst)
+    @patch.object(app_state, "_apply_current_hardware_imei", side_effect=lambda inst: inst)
     @patch.object(main.cfg, "line_allowed", return_value=True)
     def test_a_stale_port_is_corrected_before_the_engine_starts(self, _allowed, _imei, start):
         stale = {"id": "4", "iccid": ICCID, "reader_port": "1-3.2", "reader_index": 1}
         corrected = {**stale, "reader_port": "1-2.2", "reader_index": 5}
-        with patch.object(main.hub, "cards", {SCR["name"]: SCR}), \
+        with patch.object(app_state.hub, "cards", {SCR["name"]: SCR}), \
                 patch.object(main.cfg, "upsert_instance", return_value=corrected) as upsert:
-            main._start_engine_checked(stale, {}, reason="card-inserted")
+            app_state._start_engine_checked(stale, {}, reason="card-inserted")
         upsert.assert_called_once_with({"id": "4", "reader_port": "1-2.2", "reader_index": 5})
         start.assert_called_once_with(corrected, {}, dev_mounts=False, reason="card-inserted")
 
     @patch.object(main.engine, "start", return_value="container-id")
-    @patch.object(main, "_apply_current_hardware_imei", side_effect=lambda inst: inst)
+    @patch.object(app_state, "_apply_current_hardware_imei", side_effect=lambda inst: inst)
     @patch.object(main.cfg, "line_allowed", return_value=True)
     def test_a_correct_binding_is_not_rewritten(self, _allowed, _imei, start):
         current = {"id": "4", "iccid": ICCID, "reader_port": "1-2.2", "reader_index": 5}
-        with patch.object(main.hub, "cards", {SCR["name"]: SCR}), \
+        with patch.object(app_state.hub, "cards", {SCR["name"]: SCR}), \
                 patch.object(main.cfg, "upsert_instance") as upsert:
-            main._start_engine_checked(current, {}, reason="manual")
+            app_state._start_engine_checked(current, {}, reason="manual")
         upsert.assert_not_called()
         start.assert_called_once()
 
