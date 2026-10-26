@@ -31,6 +31,7 @@ from . import (store, engine, status as status_mod, sim, card, usbreader, egress
 from .version import SOURCE_URL, VERSION
 from . import state as app_state
 from .routers import auth as auth_routes
+from .routers import egress as egress_routes
 from .routers import esim as esim_routes
 
 STATUS_OK_GRACE_SECONDS = 20
@@ -1667,6 +1668,7 @@ app = FastAPI(title="MDD Sim Gateway", lifespan=lifespan)
 app.add_middleware(gate.Gate)
 app.include_router(auth_routes.router)
 app.include_router(esim_routes.router)
+app.include_router(egress_routes.router)
 
 
 def _audit_client(request: Request, settings: dict) -> str:
@@ -2614,106 +2616,6 @@ def api_put_settings(body: dict):
     return {key: value for key, value in saved.items() if key != "system_name"}
 
 
-@app.get("/api/egress/status")
-def api_egress_status():
-    return egress.status()
-
-
-@app.post("/api/egress/refresh")
-def api_egress_refresh():
-    cache = os.path.join(cfg.DATA_DIR, "orchestrator", "subscription.yaml")
-    try:
-        os.remove(cache)
-    except FileNotFoundError:
-        pass
-    cache_dir = os.path.join(cfg.DATA_DIR, "orchestrator", "subscriptions")
-    try:
-        for name in os.listdir(cache_dir):
-            if name.endswith(".yaml"):
-                os.remove(os.path.join(cache_dir, name))
-    except FileNotFoundError:
-        pass
-    egress.publish()
-    return {"ok": True, "requested_at": int(time.time())}
-
-
-def _egress_not_ready_reason(country: str, latest: dict) -> str:
-    """Say why an exit never became testable, instead of blaming the node pool.
-
-    "no healthy UDP-capable node is ready" was returned for a disabled exit, a master
-    switch left off and an orchestrator that had not published anything — three different
-    problems with three different fixes, none of them the node the operator just pasted.
-    """
-    if latest.get("error"):
-        return str(latest["error"])
-    proxy = cfg.get_settings().get("proxy") or {}
-    if not proxy.get("enabled"):
-        return ("country proxy routing is switched off — enable it before testing an exit")
-    if not ((proxy.get("exits") or {}).get(country) or {}).get("enabled"):
-        return f"the {country.upper()} exit is configured but not enabled"
-    document = egress.status()
-    updated_at = float(document.get("updated_at") or 0)
-    if not updated_at:
-        return ("the host orchestrator has not published any exit status yet — check that "
-                "mdd-sim-gateway-orchestrator is running")
-    age = time.time() - updated_at
-    if age > 60:
-        return ("the host orchestrator last published exit status "
-                f"{int(age)}s ago — it is not reconciling; check its service log")
-    return ("the exit did not come up within 25s and reported no error — check the "
-            "orchestrator log for sing-box startup failures")
-
-
-async def _test_egress_country(country: str):
-    country = egress.normalize_country(country)
-    exits = (cfg.get_settings().get("proxy") or {}).get("exits") or {}
-    if not country or country not in exits:
-        raise HTTPException(404, "country exit is not configured")
-    egress.publish()
-    deadline = time.monotonic() + 25
-    latest = {}
-    while time.monotonic() < deadline:
-        latest = (egress.status().get("exits") or {}).get(country) or {}
-        if latest.get("ready"):
-            host, port = str(latest.get("proxy_host") or ""), int(latest.get("proxy_port") or 0)
-            if not host or not port:
-                raise HTTPException(503, "country exit has no UDP test endpoint")
-            try:
-                latency = await asyncio.to_thread(egress.test_udp_proxy, host, port)
-            except egress.EgressError as exc:
-                raise HTTPException(503, str(exc)) from exc
-            return {"ok": True, "country": country, "node": latest.get("node") or "",
-                    "interface": latest.get("interface") or "", "latency_ms": latency}
-        if latest.get("error"):
-            break
-        await asyncio.sleep(.5)
-    raise HTTPException(503, await asyncio.to_thread(
-        _egress_not_ready_reason, country, latest))
-
-
-@app.post("/api/egress/profile/{profile_id}/test")
-async def api_egress_profile_test(profile_id: str, body: dict | None = None):
-    saved = ((cfg.get_settings().get("proxy") or {}).get("profiles") or {}).get(profile_id)
-    profile = body if isinstance(body, dict) and body else saved
-    if not isinstance(profile, dict):
-        raise HTTPException(404, "save this proxy before testing it")
-    if profile.get("type") not in {"node", "socks5"}:
-        raise HTTPException(400, "only individual nodes and SOCKS5 proxies can be tested here")
-    parsed = await asyncio.to_thread(egress.describe_proxy_profile, profile)
-    try:
-        latency = await asyncio.to_thread(egress.test_proxy_profile, profile)
-    except egress.EgressError as exc:
-        # The parsed view travels with the failure: it is what tells an operator whether the
-        # gateway read their link the same way their other client did.
-        raise HTTPException(503, {"message": str(exc), "parsed": parsed}) from exc
-    return {"ok": True, "profile_id": profile_id, "latency_ms": latency, "parsed": parsed}
-
-
-@app.post("/api/egress/{country}/test")
-async def api_egress_test(country: str):
-    return await _test_egress_country(country)
-
-
 @app.get("/api/system/status")
 def api_system_status():
     settings = cfg.get_settings()
@@ -2802,7 +2704,7 @@ async def api_system_maintenance(body: dict):
         return {**result, "action": action}
 
     if action == "refresh_egress":
-        return api_egress_refresh()
+        return egress_routes.api_egress_refresh()
     if action == "restart_lines":
         restarted, failed = [], {}
         # A saved line may be offline because its SIM is absent or its physical device has
