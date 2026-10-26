@@ -5,10 +5,12 @@ on:
     branches:
       - main
       - develop
+      - slim-reader-vowifi
   pull_request:
     branches:
       - main
       - develop
+      - slim-reader-vowifi
   workflow_dispatch:
 
 concurrency:
