@@ -328,7 +328,7 @@ nft table inet mdd:
 规则：每阶段结束跑全量测试 + `npm run build`，全部通过后提交、推送，并更新本节。删除前先 grep 引用；`engine/notify.py` 与 `/api/engine/event`（来电、注册状态等）必须保留。遇到会改变已确认架构的问题先停下报告。
 
 - [x] 阶段 0：建分支 `slim-reader-vowifi`、写入已确认决定、记录基线（2015 测试通过、WebUI 构建成功）
-- [ ] 阶段 1：删除短信/彩信/USSD（保留 D2 的最小 RP-ACK）、余额保号、通知推送、语音留言、联系人、自动更新，连同测试、UI、i18n
+- [x] 阶段 1：删除短信/彩信/USSD（保留 D2 的最小 RP-ACK）、余额保号、通知推送、语音留言、联系人、自动更新，连同测试、UI、i18n
 - [ ] 阶段 2：删除蜂窝模块路径与全部容器部署文件（runtime/、Dockerfile、compose、drivers/、相关 tools 与 workflow）
 - [ ] 阶段 3：拆分 main.py 为 routers（每拆一块跑一次测试）
 - [ ] 阶段 4：systemd 替换 Docker 编排——引擎、netns 隔离、出口防泄漏、RTP DNAT，补测试
@@ -338,3 +338,9 @@ nft table inet mdd:
 
 ### 进度日志
 - 2026-10-26 阶段 0 完成。
+- 2026-10-26 阶段 1 完成（提交 b35c9c3 自动更新、bf88ada 语音留言、c6851fd 余额保号、8b6264f 联系人、1af09cf 短信/彩信/USSD、1833903 通知推送与客户端令牌）。全量测试 1298 个通过，WebUI 构建通过。
+  - 实际删除顺序与计划不同：先删依赖 notify_push 的功能，最后删 notify_push，避免为马上要删的测试做无用修改。
+  - D2 实现：`[volte_ims_msg]` 保留一个只 `Hangup()` 的通配分机（sysmocom 只在消息有去处时才回 200 + RP-ACK）；`mt_rpack_routing.py` 整个保留（三处修正都是确认能送达所必需）；`mo_submit_report`/`mt_concat_udh`/`ussd_body_capture` 删除，已在 sysmocom 源码副本上验证剩余 6 个补丁能顺序打上。测试见 `tests/test_mt_sms_discard.py`。
+  - 顺带：`cellular_call.py` 依赖 `cellular_sms`，提前在阶段 1 删除；`clients.py`（D4）在本阶段删除；SMSC 不再是建线路的必填项；store.py 重写为只含 calls 与 line_states（不做旧库迁移，D4）。
+  - 待后续阶段处理：Asterisk 的 DEBUG 日志会打印 RP-DATA 十六进制（含短信正文），阶段 4/5 必须保证 Asterisk 默认不开 debug、`pjsip set logger` 关闭；`i18n` 中 "Responsible use notice" 仍写"最多十条线路"，阶段 4 改线路上限时一并修改；软电话页里的"模块通话"UI 和 `api.cellularCall*` 留到阶段 2 随蜂窝路径删除；`sim.py`/卡片信息里仍读取 SMSC（只读、无害）。
+
