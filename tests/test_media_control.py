@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from control.app import main, media
 from control.app import state as app_state
+from control.app.routers import softphone as softphone_routes
 
 INSTANCE = {"id": "1", "mcc": "001", "mnc": "01",
             "sip": {"webrtc": {"enable": True, "username": "webrtc", "password": "p"}}}
@@ -142,9 +143,9 @@ class MediaControlTests(unittest.TestCase):
         with patch.object(main.cfg, "list_instances",
                           return_value=[{"id": iid} for iid in modes]), \
                 patch.object(main.engine, "media_mode_of", side_effect=modes.get), \
-                patch.object(main, "_line_media_report",
+                patch.object(softphone_routes, "_line_media_report",
                              return_value={"state": "ready", "filter": "nft"}):
-            status = main.api_media()
+            status = softphone_routes.api_media()
         self.assertEqual(status["lines"], {"1": "ready", "2": "no_media_network"})
 
     def test_media_status_says_which_filter_the_engines_use(self):
@@ -158,18 +159,18 @@ class MediaControlTests(unittest.TestCase):
             media.save_state({"mode": "relay", "port": 8478, "secret": "x", **recorded})
             with patch.object(main.cfg, "list_instances", return_value=[{"id": "1"}]), \
                     patch.object(main.engine, "media_mode_of", side_effect=modes.get), \
-                    patch.object(main, "_line_media_report", return_value=report):
-                status = main.api_media()
+                    patch.object(softphone_routes, "_line_media_report", return_value=report):
+                status = softphone_routes.api_media()
             self.assertEqual(status["filter"], recorded.get("filter", "nft"))
             self.assertEqual(status["filter_separates_legs"], separates)
             self.assertEqual(status["line_filters"], {"1": report.get("filter", "")})
 
     def test_direct_mode_status_carries_no_filter(self):
-        self.assertNotIn("filter", main.api_media())
+        self.assertNotIn("filter", softphone_routes.api_media())
 
     def test_direct_mode_provisioning_carries_no_ice_servers(self):
         with patch.object(main.cfg, "get_instance", return_value=INSTANCE):
-            prov = main.api_softphone("1", _request())
+            prov = softphone_routes.api_softphone("1", _request())
         self.assertEqual(prov["media_mode"], "direct")
         self.assertEqual(prov["ice_servers"], [])
         self.assertEqual(prov["ice_transport_policy"], "all")
@@ -181,8 +182,8 @@ class MediaControlTests(unittest.TestCase):
                                                ("unavailable", "ready", False)):
             with patch.object(main.cfg, "get_instance", return_value=INSTANCE), \
                     patch.object(media, "relay_status", return_value={"state": relay_state}), \
-                    patch.object(main, "_line_media_state", return_value=line_state):
-                prov = main.api_softphone("1", _request())
+                    patch.object(softphone_routes, "_line_media_state", return_value=line_state):
+                prov = softphone_routes.api_softphone("1", _request())
             self.assertEqual(prov["relay_ready"], ready, (relay_state, line_state))
             self.assertEqual(prov["ice_transport_policy"], "relay")
             self.assertEqual(prov["ice_servers"][0]["urls"][0],

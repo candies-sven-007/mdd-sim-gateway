@@ -8,6 +8,8 @@ from jinja2 import Environment, FileSystemLoader
 from websockets.asyncio.server import serve
 
 from control.app import main, softphone_ws
+from control.app.routers import softphone as softphone_routes
+import docker
 
 
 class _Browser:
@@ -78,7 +80,7 @@ class SoftphoneRelayTests(unittest.IsolatedAsyncioTestCase):
     async def test_sip_messages_flow_both_ways_on_the_sip_subprotocol(self):
         self.patched()
         browser = _Browser()
-        call = asyncio.create_task(main.ws_softphone(browser, "sim1"))
+        call = asyncio.create_task(softphone_routes.ws_softphone(browser, "sim1"))
         browser.say("REGISTER sip:ims SIP/2.0")
         reply = await asyncio.wait_for(browser.outbox.get(), 5)
         self.assertEqual(browser.accepted, "sip")
@@ -93,7 +95,7 @@ class SoftphoneRelayTests(unittest.IsolatedAsyncioTestCase):
     async def refused(self, browser=None, **patches):
         self.patched(**patches)
         browser = browser or _Browser()
-        await asyncio.wait_for(main.ws_softphone(browser, "sim1"), 10)
+        await asyncio.wait_for(softphone_routes.ws_softphone(browser, "sim1"), 10)
         self.assertIsNone(browser.accepted)
         return browser.close_code
 
@@ -125,7 +127,7 @@ class SoftphoneRelayTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("browser disconnected during accept")
 
         with self.assertRaisesRegex(RuntimeError, "browser disconnected"):
-            await asyncio.wait_for(main.ws_softphone(_AcceptFailure(), "sim1"), 5)
+            await asyncio.wait_for(softphone_routes.ws_softphone(_AcceptFailure(), "sim1"), 5)
         await asyncio.wait_for(self.engine_closed.wait(), 5)
 
     async def test_docker_failure_is_temporarily_unavailable(self):
@@ -133,8 +135,8 @@ class SoftphoneRelayTests(unittest.IsolatedAsyncioTestCase):
         browser = _Browser()
         with patch.object(
                 main.engine, "container_runtime",
-                side_effect=main.docker.errors.DockerException("daemon unavailable")):
-            await asyncio.wait_for(main.ws_softphone(browser, "sim1"), 5)
+                side_effect=docker.errors.DockerException("daemon unavailable")):
+            await asyncio.wait_for(softphone_routes.ws_softphone(browser, "sim1"), 5)
         self.assertIsNone(browser.accepted)
         self.assertEqual(browser.close_code, 1013)
 
