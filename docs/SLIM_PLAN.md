@@ -330,7 +330,7 @@ nft table inet mdd:
 - [x] 阶段 0：建分支 `slim-reader-vowifi`、写入已确认决定、记录基线（2015 测试通过、WebUI 构建成功）
 - [x] 阶段 1：删除短信/彩信/USSD（保留 D2 的最小 RP-ACK）、余额保号、通知推送、语音留言、联系人、自动更新，连同测试、UI、i18n
 - [x] 阶段 2：删除蜂窝模块路径与全部容器部署文件（runtime/、Dockerfile、compose、drivers/、相关 tools 与 workflow）
-- [ ] 阶段 3：拆分 main.py 为 routers（每拆一块跑一次测试）
+- [x] 阶段 3：拆分 main.py 为 routers（每拆一块跑一次测试）
 - [ ] 阶段 4：systemd 替换 Docker 编排——引擎、netns 隔离、出口防泄漏、RTP DNAT，补测试
 - [ ] 阶段 5：重写 install.sh（install/status/logs/uninstall）与 systemd 单元
 - [ ] 阶段 6：CI——ci.yml 在工作分支 push/PR 上跑；新增 build-arm64.yml；删除 release.yml
@@ -388,3 +388,9 @@ nft table inet mdd:
       - 测试里的 `main.cfg`、`main.engine` 这类业务模块引用，在 main 不再导入它们时由 retarget 改成直接导入。
   - 下一步的第一条具体动作（在仓库根目录、用 3.12 venv）：`timeout 120 python tools/slim/split_gen.py tools/slim/main_source.py auth,esim,egress,logs,system,softphone,engine,lines --list`，然后运行 pyflakes，再运行 `python tools/slim/retarget.py`，并处理它输出的 MANUAL 行，最后跑全量测试、提交 lines。
 
+- 2026-10-26 阶段 3 完成（e1b8942 auth、a879084 esim、9b47915 egress、43824f8 logs、cc04b7f system、f6ef110 softphone、85107f4 engine、f589b51 lines、13d246b tasks）。main.py 从 5002 行变为 201 行，只留应用创建、gate 中间件、审计中间件、include_router、lifespan 和静态 WebUI。
+  - 临时生成器 tools/slim/ 已删除。从现在起 control/app/*.py 和 routers/*.py 就是正式源码，直接编辑它们。
+  - Codespace 里 tests/test_country_egress.py 的 IdleBackoffTests.test_waiting_ends_early_when_an_input_document_changes 会偶发失败（对时间敏感）。拆分前的 8fa4ab9 上同样如此，GitHub CI 上通过。
+  - 遗留项 1（下一步先做）：路由防漏测试。以拆分前 9fcbe5c 的 /api/ 路由 (method, path) 集合和 WebSocket 路径集合为固定基线，断言 tests/route_listing.api_routes(app) 与基线一致；再用 TestClient 在未登录状态下请求每个基线接口，除白名单（登录、首次设置等）外都必须返回 401 或 403。
+  - 遗留项 2：设置页的维护/存储里仍有 Docker 镜像与构建缓存相关的 UI 和后端字段，留给阶段 4。
+  - 遗留项 3：i18n 里仍写最多十条线路，阶段 4 改线路上限时一并修改。
