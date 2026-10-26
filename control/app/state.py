@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import random
+import time
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import WebSocket, HTTPException
 
@@ -544,6 +545,36 @@ def _auto_promote_card_draft(inst: dict, card_info: dict, cards: list[dict]) -> 
     return promoted
 
 
+def _visible_host_alerts(alerts: list[dict], state: dict) -> list[dict]:
+    """Hide acknowledged conditions until the poller observes a sustained recovery."""
+    return [item for item in alerts
+            if not (state.get(item["code"]) or {}).get("acknowledged")]
+
+
+def _host_alert_state_path() -> str:
+    return os.path.join(cfg.DATA_DIR, "host-alert-state.json")
+
+
+def _load_host_alert_state() -> dict:
+    try:
+        with open(_host_alert_state_path(), encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        return {str(k): v for k, v in loaded.items() if isinstance(v, dict)}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _save_host_alert_state(state: dict) -> None:
+    path = _host_alert_state_path()
+    try:
+        temporary = path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+        os.replace(temporary, path)
+    except OSError as exc:
+        log.debug("cannot persist host alert state: %r", exc)
+
+
 _lifecycle_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mdd-lifecycle")
 
 
@@ -652,3 +683,21 @@ def _apply_current_hardware_imei(inst: dict) -> dict:
     return cfg.upsert_instance({"id": str(inst["id"]), "imei": imei,
                                 "imei_source_device_id": _device_id,
                                 "imeisv": cfg.imeisv_from_imei(imei, svn=svn)})
+
+
+def refresh_egress() -> dict:
+    """Drop the cached subscriptions and ask the orchestrator to fetch and reconcile again."""
+    cache = os.path.join(cfg.DATA_DIR, "orchestrator", "subscription.yaml")
+    try:
+        os.remove(cache)
+    except FileNotFoundError:
+        pass
+    cache_dir = os.path.join(cfg.DATA_DIR, "orchestrator", "subscriptions")
+    try:
+        for name in os.listdir(cache_dir):
+            if name.endswith(".yaml"):
+                os.remove(os.path.join(cache_dir, name))
+    except FileNotFoundError:
+        pass
+    egress.publish()
+    return {"ok": True, "requested_at": int(time.time())}

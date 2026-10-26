@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 from control.app import config, engine, main
 from control.app import state as app_state
+from control.app.routers import system as system_routes
 
 
 _lifecycle_patcher = None
@@ -295,7 +296,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.engine, "stop") as stop, \
                 patch.object(app_state, "_start_engine_checked") as start, \
                 patch.object(app_state.hub, "drop_ami", new=AsyncMock()):
-            result = await main.api_system_maintenance({"action": "restart_lines"})
+            result = await system_routes.api_system_maintenance({"action": "restart_lines"})
 
         self.assertEqual(result["restarted"], ["1"])
         stop.assert_called_once_with("1")
@@ -308,7 +309,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
                           return_value={"ok": True, "space_reclaimed_bytes": 4096}) as prune, \
                 patch.object(main.sysinfo, "collect",
                              return_value={"disk": {"used_percent": 70.0}}):
-            result = await main.api_system_maintenance({"action": "prune_build_cache"})
+            result = await system_routes.api_system_maintenance({"action": "prune_build_cache"})
         self.assertEqual(result["space_reclaimed_bytes"], 4096)
         self.assertEqual(result["action"], "prune_build_cache")
         self.assertEqual(app_state.hub.host_snapshot, {"disk": {"used_percent": 70.0}})
@@ -319,7 +320,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main.operations, "prune_dangling_build_cache",
                           side_effect=RuntimeError("Docker refused builder prune")):
             with self.assertRaises(main.HTTPException) as raised:
-                await main.api_system_maintenance({"action": "prune_build_cache"})
+                await system_routes.api_system_maintenance({"action": "prune_build_cache"})
         self.assertEqual(raised.exception.status_code, 502)
         self.assertIn("Docker refused", raised.exception.detail)
 
@@ -327,7 +328,7 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(main.operations, "prune_old_mdd_images", return_value={
                 "ok": True, "removed_images": 2, "space_reclaimed_bytes": 8192}) as prune, \
                 patch.object(main.sysinfo, "collect", return_value={"disk": {}}):
-            result = await main.api_system_maintenance({"action": "prune_old_images"})
+            result = await system_routes.api_system_maintenance({"action": "prune_old_images"})
         self.assertEqual(result["action"], "prune_old_images")
         self.assertEqual(result["removed_images"], 2)
         prune.assert_called_once_with()
@@ -666,22 +667,22 @@ class HostAlertSuppressionTests(unittest.TestCase):
         self._temp.cleanup()
 
     def test_state_survives_a_restart(self):
-        main._save_host_alert_state({"undervoltage_seen": {"at": 1000.0}})
-        self.assertEqual(main._load_host_alert_state(),
+        app_state._save_host_alert_state({"undervoltage_seen": {"at": 1000.0}})
+        self.assertEqual(app_state._load_host_alert_state(),
                          {"undervoltage_seen": {"at": 1000.0}})
 
     def test_a_missing_state_file_is_not_an_error(self):
-        self.assertEqual(main._load_host_alert_state(), {})
+        self.assertEqual(app_state._load_host_alert_state(), {})
 
     def test_a_corrupt_state_file_does_not_break_the_poller(self):
-        with open(main._host_alert_state_path(), "w", encoding="utf-8") as handle:
+        with open(app_state._host_alert_state_path(), "w", encoding="utf-8") as handle:
             handle.write("{not json")
-        self.assertEqual(main._load_host_alert_state(), {})
+        self.assertEqual(app_state._load_host_alert_state(), {})
 
     def test_acknowledged_host_alert_stays_hidden_while_condition_persists(self):
         alerts = [{"code": "undervoltage_seen", "severity": "warning"}]
-        self.assertEqual(main._visible_host_alerts(alerts, {}), alerts)
-        self.assertEqual(main._visible_host_alerts(
+        self.assertEqual(app_state._visible_host_alerts(alerts, {}), alerts)
+        self.assertEqual(app_state._visible_host_alerts(
             alerts, {"undervoltage_seen": {"acknowledged": True}}), [])
 
     def test_clear_host_alerts_persists_acknowledgement(self):
@@ -690,11 +691,11 @@ class HostAlertSuppressionTests(unittest.TestCase):
             app_state.hub.host_alerts = [{"code": "undervoltage_seen", "severity": "warning"}]
             app_state.hub.host_alert_state = {}
 
-            result = main.api_host_alerts_clear()
+            result = system_routes.api_host_alerts_clear()
 
             self.assertEqual(result["cleared"], ["undervoltage_seen"])
             self.assertEqual(app_state.hub.host_alerts, [])
-            saved = main._load_host_alert_state()
+            saved = app_state._load_host_alert_state()
             self.assertTrue(saved["undervoltage_seen"]["acknowledged"])
         finally:
             app_state.hub.host_alerts, app_state.hub.host_alert_state = old_alerts, old_state

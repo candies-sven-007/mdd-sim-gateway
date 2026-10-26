@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from fastapi import HTTPException, APIRouter
 
 from .. import config as cfg
 from .. import egress
+from .. import state as app_state
 
 router = APIRouter()
 
@@ -19,20 +19,7 @@ def api_egress_status():
 
 @router.post("/api/egress/refresh")
 def api_egress_refresh():
-    cache = os.path.join(cfg.DATA_DIR, "orchestrator", "subscription.yaml")
-    try:
-        os.remove(cache)
-    except FileNotFoundError:
-        pass
-    cache_dir = os.path.join(cfg.DATA_DIR, "orchestrator", "subscriptions")
-    try:
-        for name in os.listdir(cache_dir):
-            if name.endswith(".yaml"):
-                os.remove(os.path.join(cache_dir, name))
-    except FileNotFoundError:
-        pass
-    egress.publish()
-    return {"ok": True, "requested_at": int(time.time())}
+    return app_state.refresh_egress()
 
 
 def _egress_not_ready_reason(country: str, latest: dict) -> str:

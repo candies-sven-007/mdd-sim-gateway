@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from contextlib import asynccontextmanager
 
 import docker
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+from fastapi import FastAPI, WebSocket, HTTPException, Request
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -27,13 +27,12 @@ from . import config as cfg
 from . import (store, engine, status as status_mod, sim, card, usbreader, egress, device_state,
                operations, sysinfo, failover, carrier_id, softphone_ws, vowifi_support, gate,
                media, authz)
-
-from .version import SOURCE_URL, VERSION
 from . import state as app_state
 from .routers import auth as auth_routes
 from .routers import egress as egress_routes
 from .routers import esim as esim_routes
 from .routers import logs as logs_routes
+from .routers import system as system_routes
 
 STATUS_OK_GRACE_SECONDS = 20
 STATUS_POLL_FAST_SECONDS = 4.0
@@ -76,8 +75,6 @@ LINE_HISTORY_PRUNE_INTERVAL_SECONDS = 3600
 LINE_STATE_WRITE_INTERVAL_SECONDS = 30
 
 _line_state_written: dict[str, tuple[str, float]] = {}
-
-_background_tasks: set[asyncio.Task] = set()
 
 
 logging.basicConfig(level=logging.INFO,
@@ -905,12 +902,6 @@ def _host_alert_summary(alerts: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _visible_host_alerts(alerts: list[dict], state: dict) -> list[dict]:
-    """Hide acknowledged conditions until the poller observes a sustained recovery."""
-    return [item for item in alerts
-            if not (state.get(item["code"]) or {}).get("acknowledged")]
-
-
 async def host_health_poller():
     """Announce host conditions that take every line down at once.
 
@@ -924,7 +915,7 @@ async def host_health_poller():
     appliance is restarted for upgrades far more often than these conditions change.
     """
     if app_state.hub.host_alert_state is None:
-        app_state.hub.host_alert_state = _load_host_alert_state()
+        app_state.hub.host_alert_state = app_state._load_host_alert_state()
     state = app_state.hub.host_alert_state
     streaks: dict[str, int] = {}
     previous_alerts = None
@@ -947,7 +938,7 @@ async def host_health_poller():
                 missing_since = entry.setdefault("missing_since", now)
                 if now - missing_since >= HOST_ALERT_CLEAR_SECONDS:
                     state.pop(code, None)       # genuinely recovered; a return may notify again
-            visible = _visible_host_alerts(alerts, state)
+            visible = app_state._visible_host_alerts(alerts, state)
             app_state.hub.host_snapshot, app_state.hub.host_alerts = snapshot, visible
             fresh = [item for item in visible
                      if now - float((state.get(item["code"]) or {}).get("at", 0))
@@ -961,7 +952,7 @@ async def host_health_poller():
                                      "alerts": [item["code"] for item in fresh]})
             if fresh or codes != previous_alerts:
                 previous_alerts = codes
-                await asyncio.to_thread(_save_host_alert_state, state)
+                await asyncio.to_thread(app_state._save_host_alert_state, state)
         except Exception as exc:  # noqa
             log.debug("host health poll failed: %r", exc)
         await asyncio.sleep(HOST_ALERT_POLL_SECONDS)
@@ -1172,30 +1163,6 @@ def _judge_exit_failure(iid: str, inst: dict, st: dict, stable_for: float) -> st
         text = failover.summarise(ledger, action, country, pinned)
         log.warning("line %s: %s", iid, text)
     return action
-
-
-def _host_alert_state_path() -> str:
-    return os.path.join(cfg.DATA_DIR, "host-alert-state.json")
-
-
-def _load_host_alert_state() -> dict:
-    try:
-        with open(_host_alert_state_path(), encoding="utf-8") as handle:
-            loaded = json.load(handle)
-        return {str(k): v for k, v in loaded.items() if isinstance(v, dict)}
-    except (OSError, ValueError, AttributeError):
-        return {}
-
-
-def _save_host_alert_state(state: dict) -> None:
-    path = _host_alert_state_path()
-    try:
-        temporary = path + ".tmp"
-        with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(state, handle)
-        os.replace(temporary, path)
-    except OSError as exc:
-        log.debug("cannot persist host alert state: %r", exc)
 
 
 async def _poll_instance_status(inst: dict) -> None:
@@ -1671,6 +1638,7 @@ app.include_router(auth_routes.router)
 app.include_router(esim_routes.router)
 app.include_router(egress_routes.router)
 app.include_router(logs_routes.router)
+app.include_router(system_routes.router)
 
 
 def _audit_client(request: Request, settings: dict) -> str:
@@ -2573,185 +2541,6 @@ async def api_device_capabilities(device_id: str, body: dict):
         return next(item for item in refreshed if item["id"] == device_id)
 
 
-# ----------------------------- settings -----------------------------
-
-
-@app.get("/api/settings")
-def api_get_settings():
-    return {key: value for key, value in cfg.get_settings().items() if key != "system_name"}
-
-
-@app.put("/api/settings")
-def api_put_settings(body: dict):
-    # Ignore the legacy field from older cached clients. Product identity is fixed.
-    body.pop("system_name", None)
-    proxy = body.get("proxy")
-    if proxy is not None:
-        if not isinstance(proxy, dict) or not isinstance(proxy.get("profiles", {}), dict) \
-                or not isinstance(proxy.get("exits", {}), dict):
-            raise HTTPException(400, "invalid proxy library")
-        profiles = proxy.get("profiles") or {}
-        for profile_id, profile in profiles.items():
-            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", str(profile_id)) \
-                    or not isinstance(profile, dict):
-                raise HTTPException(400, "invalid proxy profile id")
-            if str(profile.get("type") or "") not in {"subscription", "node", "socks5", "existing"}:
-                raise HTTPException(400, "invalid proxy profile type")
-            if not str(profile.get("name") or "").strip():
-                raise HTTPException(400, "proxy profile name is required")
-        for country, exit_cfg in (proxy.get("exits") or {}).items():
-            if not egress.normalize_country(country) or not isinstance(exit_cfg, dict):
-                raise HTTPException(400, "invalid country exit")
-            profile_id = str(exit_cfg.get("profile_id") or "")
-            if profile_id and profile_id not in profiles:
-                raise HTTPException(400, f"country exit references unknown proxy {profile_id!r}")
-    if "timezone" in body:
-        try:
-            ZoneInfo(str(body.get("timezone") or ""))
-        except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise HTTPException(400, "unknown timezone") from exc
-    # Settings that belonged to modem hardware are not accepted any more.
-    body.pop("device_defaults", None)
-    body.pop("hardware", None)
-    saved = cfg.update_settings(body)
-    egress.publish(settings=saved)
-    return {key: value for key, value in saved.items() if key != "system_name"}
-
-
-@app.get("/api/system/status")
-def api_system_status():
-    settings = cfg.get_settings()
-    # Served from the poller's sample: collecting here would shell out to vcgencmd/dmesg on
-    # every page load of an already power-constrained box.
-    host = app_state.hub.host_snapshot or sysinfo.collect(
-        cfg.DATA_DIR, include_docker_storage=False)
-    return {
-        "system_name": "MDD Sim Gateway",
-        "host": host,
-        "host_alerts": app_state.hub.host_alerts if app_state.hub.host_snapshot else sysinfo.alerts(host),
-
-        "timezone": settings.get("timezone") or "UTC",
-        "version": VERSION,
-        "deployment": {
-            "container_stack": operations.container_stack_enabled(),
-            "host_restart_available": not operations.container_stack_enabled(),
-        },
-        "repository_url": SOURCE_URL,
-        "backups": operations.list_local_backups(),
-        "security": {
-            "https": True,
-            "certificate_mode": "self-signed" if (settings.get("tls") or {}).get("self_signed") else "custom",
-            "audit_enabled": bool((settings.get("security") or {}).get("audit_enabled", True)),
-        },
-    }
-
-
-@app.delete("/api/system/host-alerts")
-def api_host_alerts_clear():
-    """Acknowledge active host alerts until each condition genuinely clears."""
-    if app_state.hub.host_alert_state is None:
-        app_state.hub.host_alert_state = _load_host_alert_state()
-    now = time.time()
-    cleared = []
-    for item in app_state.hub.host_alerts:
-        code = str(item.get("code") or "")
-        if not code:
-            continue
-        entry = app_state.hub.host_alert_state.setdefault(code, {})
-        entry["acknowledged"] = True
-        entry["acknowledged_at"] = now
-        entry.setdefault("at", now)
-        cleared.append(code)
-    app_state.hub.host_alerts = []
-    _save_host_alert_state(app_state.hub.host_alert_state)
-    return {"ok": True, "cleared": cleared}
-
-
-@app.post("/api/system/backups")
-async def api_system_backup():
-    settings = cfg.get_settings()
-    return await asyncio.to_thread(
-        operations.create_local_backup, "mdd-sim-gateway")
-
-
-@app.delete("/api/system/backups/{name}")
-async def api_system_backup_delete(name: str):
-    try:
-        return await asyncio.to_thread(operations.delete_local_backup, name)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="backup not found") from exc
-
-
-@app.post("/api/system/maintenance")
-async def api_system_maintenance(body: dict):
-    action = str(body.get("action") or "")
-    if action in {"prune_build_cache", "prune_old_images"}:
-        try:
-            operation = (operations.prune_dangling_build_cache
-                         if action == "prune_build_cache" else operations.prune_old_mdd_images)
-            result = await asyncio.to_thread(operation)
-        except RuntimeError as exc:
-            # Keep Docker's actionable reason instead of returning a generic Internal Error.
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        # Refresh immediately so the button's follow-up status request shows the reclaimed
-        # space. Keep alert acknowledgement semantics instead of resurrecting a cleared banner.
-        previous = app_state.hub.host_snapshot or None
-        snapshot = await asyncio.to_thread(sysinfo.collect, cfg.DATA_DIR)
-        current_alerts = sysinfo.alerts(snapshot, previous)
-        state = app_state.hub.host_alert_state or _load_host_alert_state()
-        app_state.hub.host_snapshot = snapshot
-        app_state.hub.host_alerts = _visible_host_alerts(current_alerts, state)
-        return {**result, "action": action}
-
-    if action == "refresh_egress":
-        return egress_routes.api_egress_refresh()
-    if action == "restart_lines":
-        restarted, failed = [], {}
-        # A saved line may be offline because its SIM is absent or its physical device has
-        # VoWiFi disabled. Snapshot only containers that were actually running when the
-        # operator requested a restart; never turn a restart operation into "start all saved".
-        running = []
-        for inst in cfg.list_instances():
-            if await asyncio.to_thread(engine.is_running, str(inst["id"])):
-                running.append(inst)
-        for inst in running:
-            iid = str(inst["id"])
-            try:
-                await asyncio.to_thread(engine.stop, iid)
-                await app_state.hub.drop_ami(iid)
-                await asyncio.to_thread(app_state._start_engine_checked, inst, cfg.get_settings(),
-                                        dev_mounts=os.environ.get("MDD_DEV_MOUNTS", "") == "1")
-                restarted.append(iid)
-            except Exception as exc:
-                failed[iid] = str(getattr(exc, "detail", exc))
-        return {"ok": not failed, "action": action, "restarted": restarted, "failed": failed}
-    # Publish one shared request contract. The Pi host orchestrator consumes it externally;
-    # container mode launches its bounded Docker executor after the response has been flushed.
-    scope = {"restart_control": "control", "restart_services": "services",
-             "restart_host": "host"}.get(action)
-    if scope:
-        result = await asyncio.to_thread(operations.request_service_restart, scope)
-        if result.get("ok") and operations.container_stack_enabled():
-            async def restart_after_response():
-                # Let Uvicorn flush the accepted response before the Docker daemon stops us.
-                await asyncio.sleep(.75)
-                await asyncio.to_thread(operations.perform_container_service_restart, scope)
-            task = asyncio.create_task(restart_after_response())
-            _background_tasks.add(task)
-            task.add_done_callback(_background_tasks.discard)
-        return {**result, "action": action}
-    raise HTTPException(400, "unknown maintenance action")
-
-
-@app.get("/api/system/maintenance/restart-progress")
-def api_system_restart_progress():
-    """Whether the orchestrator has taken the restart request; the restart itself is observed
-    by the API going away and coming back."""
-    return operations.service_restart_status()
-
-
 # ----------------------------- instances -----------------------------
 @app.get("/api/instances")
 async def api_instances(request: Request):
@@ -3441,21 +3230,6 @@ async def push_status(iid: str):
         await app_state.hub.broadcast({"type": "status", "instance": str(iid), **st})
     except Exception as e:  # noqa
         log.debug("push_status error: %r", e)
-
-
-# ----------------------------- WebSocket -----------------------------
-@app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket):
-    # Signed-out browsers are closed with 4401 by the gateway middleware (gate.py).
-    await ws.accept()
-    app_state.hub.clients.add(ws)
-    try:
-        while True:
-            await ws.receive_text()  # keepalive / ignore inbound
-    except WebSocketDisconnect:
-        app_state.hub.clients.discard(ws)
-    except Exception:
-        app_state.hub.clients.discard(ws)
 
 
 # ----------------------------- static WebUI -----------------------------
