@@ -85,7 +85,7 @@ BASELINE_WEBSOCKET = frozenset({
     "/ws",
 })
 
-# Served by FastAPI itself (documentation), outside /api/ and not part of the baseline.
+# FastAPI's own documentation routes; disabled (P-1), listed so a return is noticed.
 FRAMEWORK_PATHS = frozenset({"/docs", "/docs/oauth2-redirect", "/openapi.json", "/redoc"})
 SPA_PATH = "/{full_path:path}"
 
@@ -125,6 +125,14 @@ class RouteSetTests(unittest.TestCase):
     def test_no_route_of_another_kind(self):
         _, _, other = current_routes()
         self.assertEqual(other, set())
+
+    def test_framework_documentation_is_not_served(self):
+        # SLIM_PLAN P-1: outside /api/ the gate lets anyone through.
+        paths = {getattr(route, "path", "") for route in api_routes(main.app)}
+        self.assertEqual(paths & FRAMEWORK_PATHS, set())
+        self.assertIsNone(main.app.openapi_url)
+        self.assertIsNone(main.app.docs_url)
+        self.assertIsNone(main.app.redoc_url)
 
     def test_every_http_route_is_under_api(self):
         self.assertTrue(all(path.startswith("/api/") for _, path in BASELINE_HTTP))

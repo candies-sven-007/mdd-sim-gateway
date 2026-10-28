@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from control.app import sysinfo
 
@@ -134,102 +134,13 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(value["free_bytes"], 5 * 1024 ** 3)
         self.assertEqual(value["used_percent"], 75.0)
 
-    def test_project_storage_keeps_shared_builder_cache_separate(self):
-        with patch.object(sysinfo, "_project_paths", return_value=["/data", "/repo"]), \
-                patch.object(sysinfo, "_path_usage_bytes", side_effect=[100, 200]), \
-                patch.object(sysinfo, "_docker_storage", return_value={
-                    "docker_images_bytes": 300,
-                    "docker_image_layers_bytes": 250,
-                    "docker_images_all_managed": True,
-                    "container_writable_bytes": 40,
-                    "build_cache_bytes": 500,
-                    "build_cache_reclaimable_bytes": 50,
-                }):
-            value = sysinfo.project_storage("/data")
-        self.assertEqual(value["files_bytes"], 300)
-        self.assertEqual(value["known_total_bytes"], 590)
-        self.assertFalse(value["known_total_is_logical"])
-        self.assertEqual(value["build_cache_bytes"], 500)
-        self.assertEqual(value["build_cache_reclaimable_bytes"], 50)
-        self.assertNotEqual(value["known_total_bytes"], 1090)
-
-    def test_docker_usage_counts_unique_mdd_images_and_marks_unused_cache(self):
-        report = {
-            "Images": [
-                {"Id": "mdd", "RepoTags": ["mdd-sim-gateway/engine:latest"],
-                 "Labels": {}, "Size": 100},
-                {"Id": "mdd", "RepoTags": ["mdd-sim-gateway/engine:previous"],
-                 "Labels": {}, "Size": 100},
-                {"Id": "other", "RepoTags": ["other/app:latest"],
-                 "Labels": {}, "Size": 900},
-            ],
-            "Containers": [
-                {"Id": "line", "Image": "sha256:mdd",
-                 "Labels": {"io.mdd-sim-gateway.managed": "true"}, "SizeRw": 20},
-            ],
-            "BuildCache": [
-                {"Size": 70, "InUse": False, "Shared": True},
-                {"Size": 30, "InUse": True, "Shared": True},
-                {"Size": 10, "InUse": False, "Shared": False},
-            ],
-            "ImageUsage": {"TotalSize": 700, "Reclaimable": 250},
-            "BuildCacheUsage": {"TotalSize": 110, "Reclaimable": 10},
-        }
-        client = Mock()
-        client.df.return_value = report
-        docker_module = SimpleNamespace(from_env=Mock(return_value=client))
-        with patch.dict("sys.modules", {"docker": docker_module}):
-            value = sysinfo._docker_storage(refresh=True)
-        self.assertEqual(value["docker_images_bytes"], 100)
-        self.assertEqual(value["docker_image_layers_bytes"], 700)
-        self.assertEqual(value["docker_image_reclaimable_bytes"], 250)
-        self.assertFalse(value["docker_images_all_managed"])
-        self.assertEqual(value["mdd_old_image_count"], 1)
-        self.assertIsNone(value["mdd_old_images_reclaimable_bytes"])
-        self.assertEqual(value["container_writable_bytes"], 20)
-        self.assertEqual(value["build_cache_bytes"], 110)
-        self.assertEqual(value["build_cache_reclaimable_bytes"], 10)
-        client.close.assert_called_once_with()
-
-    def test_all_mdd_unused_images_publish_exact_manual_cleanup_amount(self):
-        report = {
-            "Images": [
-                {"Id": "current", "RepoTags": ["mdd-sim-gateway/engine:latest"],
-                 "Labels": {}, "Size": 100, "Containers": 2},
-                {"Id": "rollback", "RepoTags": ["mdd-sim-gateway/engine:previous"],
-                 "Labels": {}, "Size": 90, "Containers": 0},
-            ],
-            "Containers": [],
-            "ImageUsage": {"TotalSize": 150, "Reclaimable": 50},
-        }
-        client = Mock()
-        client.df.return_value = report
-        docker_module = SimpleNamespace(from_env=Mock(return_value=client))
-        with patch.dict("sys.modules", {"docker": docker_module}):
-            value = sysinfo._docker_storage(refresh=True)
-        self.assertTrue(value["docker_images_all_managed"])
-        self.assertEqual(value["mdd_old_image_count"], 1)
-        self.assertEqual(value["mdd_old_images_reclaimable_bytes"], 50)
-
-    def test_docker_storage_reuses_cache_between_host_health_samples(self):
-        report = {"Images": [], "Containers": [], "ImageUsage": {}, "BuildCache": []}
-        client = Mock()
-        client.df.return_value = report
-        docker_module = SimpleNamespace(from_env=Mock(return_value=client))
-        with patch.dict("sys.modules", {"docker": docker_module}), \
-                patch.object(sysinfo, "_docker_storage_cache", {}), \
-                patch.object(sysinfo, "_docker_storage_cached_at", 0.0):
-            first = sysinfo._docker_storage()
-            second = sysinfo._docker_storage()
-        self.assertEqual(first, second)
-        client.df.assert_called_once_with()
-
-    def test_health_collection_can_skip_expensive_docker_storage_scan(self):
-        with patch.object(sysinfo, "_project_paths", return_value=[]), \
-                patch.object(sysinfo, "_docker_storage") as docker_storage:
-            value = sysinfo.project_storage("/data", include_docker_storage=False)
-        self.assertEqual(value["files_bytes"], 0)
-        docker_storage.assert_not_called()
+    def test_project_storage_counts_the_gateways_own_files(self):
+        with patch.object(sysinfo, "_project_paths", return_value=["/a", "/b"]), \
+                patch.object(sysinfo, "_path_usage_bytes", side_effect=[100, 23]):
+            storage = sysinfo.project_storage("/data")
+        self.assertEqual(storage, {"files_bytes": 123, "known_total_bytes": 123,
+                                   "known_total_is_logical": False})
+        self.assertFalse(any(key.startswith("docker") for key in storage))
 
     def test_absent_platform_fields_are_omitted_rather_than_faked(self):
         with patch.object(sysinfo, "_vcgencmd", return_value=""), \

@@ -413,6 +413,9 @@ def main():
         put("MDD_ID", ctx["id"])
         put("MANAGER_URL", ctx["manager_url"])
         put("MANAGER_EVENT_TOKEN", cfg.get("manager_event_token", ""))
+        # Policy that used to arrive as container environment.
+        put("SWU_LIVENESS_PERIOD", cfg.get("liveness_period", 0))
+        put("SWU_PCSCF_APPLY_MODE", cfg.get("pcscf_apply_mode") or "restart")
         if ctx["media_relay"]:
             put("MDD_MEDIA_MODE", "relay")
             put("MDD_MEDIA_IF", ctx["media_if"])

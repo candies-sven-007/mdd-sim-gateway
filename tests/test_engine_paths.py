@@ -1,331 +1,15 @@
 import importlib
 import json
-import sys
 import tempfile
 import unittest
-from datetime import timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import call, patch
-
-
-def _docker_errors():
-    """Mirror docker-py's hierarchy: ImageNotFound is a subclass of NotFound there, so a
-    stub that makes them unrelated would hide a handler catching the wrong one."""
-    not_found = type("NotFound", (Exception,), {})
-    return SimpleNamespace(
-        NotFound=not_found,
-        ImageNotFound=type("ImageNotFound", (not_found,), {}),
-    )
+from unittest.mock import patch
 
 
 class EnginePathTests(unittest.TestCase):
-    def test_old_engine_cannot_silently_ignore_proxy_before_replacement(self):
-        engine = self.engine_module()
-        from unittest.mock import Mock
-        client = Mock()
-        client.images.get.return_value.attrs = {"Config": {"Labels": {}}}
-        with patch.object(engine, "ENGINE_NETWORK", "mdd-control"), \
-                patch.object(engine, "_client", return_value=client), \
-                patch.object(engine.egress, "ensure_line", return_value={
-                    "transport": "socks5", "proxy_url": "socks5://mdd-egress:22157"}), \
-                patch.object(engine.cfg, "write_instance_json") as write:
-            with self.assertRaisesRegex(engine.egress.EgressError, "rebuild required"):
-                engine.start({"id": "sim1"}, {})
-        write.assert_not_called()
-        client.containers.get.assert_not_called()
-        client.containers.run.assert_not_called()
-
-    def test_a_missing_registry_engine_image_is_fetched_once(self):
-        """Compose only knows the three base services, so nothing brings the Engine image
-        down before the first line needs it."""
-        engine = self.engine_module()
-        from unittest.mock import Mock
-        fetched = SimpleNamespace(
-            id="sha256:pulled", attrs={"Config": {"Labels": {engine.ENGINE_LABEL: "socks5"}}})
-        client = Mock()
-        client.images.get.side_effect = [
-            engine.docker.errors.ImageNotFound("absent"), fetched]
-
-        with patch.object(engine, "IMAGE", "ghcr.io/owner/mdd-sim-gateway-engine:v1"):
-            self.assertIs(engine.ensure_image(client), fetched)
-
-        client.images.pull.assert_called_once_with("ghcr.io/owner/mdd-sim-gateway-engine:v1")
-
-    def test_a_present_image_is_never_re_fetched(self):
-        engine = self.engine_module()
-        from unittest.mock import Mock
-        client = Mock()
-        client.images.get.return_value = SimpleNamespace(id="sha256:local", attrs={})
-
-        with patch.object(engine, "IMAGE", "ghcr.io/owner/mdd-sim-gateway-engine:v1"):
-            engine.ensure_image(client)
-
-        client.images.pull.assert_not_called()
-
-    def test_a_locally_built_tag_is_not_looked_for_in_a_registry(self):
-        """`mdd-sim-gateway/engine` is what a host-assisted install builds. Pulling it
-        would ask Docker Hub for a repository that does not exist, replacing a clear
-        "the image was never built" with a confusing registry error."""
-        engine = self.engine_module()
-        from unittest.mock import Mock
-        client = Mock()
-        client.images.get.side_effect = engine.docker.errors.ImageNotFound("absent")
-
-        with patch.object(engine, "IMAGE", "mdd-sim-gateway/engine"):
-            with self.assertRaises(engine.docker.errors.ImageNotFound):
-                engine.ensure_image(client)
-
-        client.images.pull.assert_not_called()
-
-    def test_supported_engine_is_pinned_to_inspected_image_and_receives_proxy(self):
-        engine = self.engine_module()
-        from unittest.mock import Mock
-        client = Mock()
-        client.images.get.return_value = SimpleNamespace(
-            id="sha256:verified", attrs={"Config": {"Labels": {engine.ENGINE_LABEL: "socks5"}}})
-        client.containers.get.side_effect = engine.docker.errors.NotFound("sim1")
-        client.containers.run.return_value = SimpleNamespace(id="new", name="engine")
-        with tempfile.TemporaryDirectory() as temp, \
-                patch.object(engine, "_client", return_value=client), \
-                patch.object(engine, "ENGINE_NETWORK", "mdd-control"), \
-                patch.object(engine, "_instance_paths", return_value=(temp, temp)), \
-                patch.object(engine, "_clear_runtime_state"), \
-                patch.object(engine.egress, "resolve_ipv4_via_socks",
-                             return_value="198.51.100.10"), \
-                patch.object(engine.egress, "ensure_line", return_value={
-                    "transport": "socks5", "proxy_url": "socks5://mdd-egress:22157"}), \
-                patch.object(engine.cfg, "write_instance_json") as write:
-            engine.start({"id": "sim1"}, {})
-        self.assertEqual(client.containers.run.call_args.args[0], "sha256:verified")
-        self.assertEqual(client.containers.run.call_args.kwargs["environment"]["SWU_EGRESS_PROXY"],
-                         "socks5://mdd-egress:22157")
-        self.assertEqual(client.containers.run.call_args.kwargs["sysctls"][
-            "net.ipv6.conf.all.disable_ipv6"], "0")
-        self.assertEqual(client.containers.run.call_args.kwargs["sysctls"][
-            "net.ipv6.conf.default.disable_ipv6"], "0")
-        written = write.call_args.args[0]
-        self.assertEqual(written["epdg"], "198.51.100.10")
-
-    def test_named_network_and_host_pcsc_directory_reach_docker(self):
-        engine = self.engine_module()
-        from unittest.mock import Mock
-        client = Mock()
-        client.containers.get.side_effect = engine.docker.errors.NotFound("sim1")
-        client.containers.run.return_value = SimpleNamespace(id="new", name="engine")
-        with tempfile.TemporaryDirectory() as temp, \
-                patch.object(engine, "_client", return_value=client), \
-                patch.object(engine, "ENGINE_NETWORK", "mdd-control"), \
-                patch.object(engine, "HOST_PCSCD_DIR", "/volume1/mdd/run/pcscd"), \
-                patch.object(engine, "_instance_paths", return_value=(temp, temp)), \
-                patch.object(engine, "_clear_runtime_state"), \
-                patch.object(engine.egress, "ensure_line"), \
-                patch.object(engine.cfg, "write_instance_json"):
-            engine.start({"id": "sim1"}, {})
-        options = client.containers.run.call_args.kwargs
-        self.assertEqual(options["network"], "mdd-control")
-        self.assertEqual(options["volumes"]["/volume1/mdd/run/pcscd"]["bind"], "/run/pcscd")
-
-    def test_named_pcsc_volume_reaches_dynamic_engine(self):
-        engine = self.engine_module()
-        from unittest.mock import Mock
-        client = Mock()
-        client.containers.get.side_effect = engine.docker.errors.NotFound("sim1")
-        client.containers.run.return_value = SimpleNamespace(id="new", name="engine")
-        with tempfile.TemporaryDirectory() as temp, \
-                patch.object(engine, "_client", return_value=client), \
-                patch.object(engine, "PCSCD_VOLUME", "mdd-sim-gateway-pcscd"), \
-                patch.object(engine, "_instance_paths", return_value=(temp, temp)), \
-                patch.object(engine, "_clear_runtime_state"), \
-                patch.object(engine.egress, "ensure_line"), \
-                patch.object(engine.cfg, "write_instance_json"):
-            engine.start({"id": "sim1"}, {})
-        volumes = client.containers.run.call_args.kwargs["volumes"]
-        self.assertEqual(volumes["mdd-sim-gateway-pcscd"],
-                         {"bind": "/run/pcscd", "mode": "rw"})
-
-    def test_explicit_direct_line_joins_the_configured_uplink(self):
-        engine = self.engine_module()
-        from unittest.mock import Mock
-        client = Mock()
-        client.containers.get.side_effect = engine.docker.errors.NotFound("sim1")
-        container = SimpleNamespace(id="new", name="engine")
-        client.containers.run.return_value = container
-        uplink = client.networks.get.return_value
-        with tempfile.TemporaryDirectory() as temp, \
-                patch.object(engine, "_client", return_value=client), \
-                patch.object(engine, "ENGINE_NETWORK", "mdd-engine"), \
-                patch.object(engine, "DIRECT_NETWORK", "mdd-uplink"), \
-                patch.object(engine, "_instance_paths", return_value=(temp, temp)), \
-                patch.object(engine, "_clear_runtime_state"), \
-                patch.object(engine.egress, "ensure_line", return_value={}), \
-                patch.object(engine.cfg, "write_instance_json"):
-            engine.start({"id": "sim1"}, {})
-        self.assertIn(call("mdd-uplink"), client.networks.get.call_args_list)
-        uplink.connect.assert_called_once_with(container)
-
-    def test_proxy_line_never_joins_direct_uplink(self):
-        engine = self.engine_module()
-        from unittest.mock import Mock
-        client = Mock()
-        client.images.get.return_value = SimpleNamespace(
-            id="sha256:verified", attrs={"Config": {"Labels": {
-                engine.ENGINE_LABEL: "socks5"}}})
-        client.containers.get.side_effect = engine.docker.errors.NotFound("sim1")
-        client.containers.run.return_value = SimpleNamespace(id="new", name="engine")
-        with tempfile.TemporaryDirectory() as temp, \
-                patch.object(engine, "_client", return_value=client), \
-                patch.object(engine, "ENGINE_NETWORK", "mdd-engine"), \
-                patch.object(engine, "DIRECT_NETWORK", "mdd-uplink"), \
-                patch.object(engine, "_instance_paths", return_value=(temp, temp)), \
-                patch.object(engine, "_clear_runtime_state"), \
-                patch.object(engine.egress, "resolve_ipv4_via_socks",
-                             return_value="198.51.100.10"), \
-                patch.object(engine.egress, "ensure_line", return_value={
-                    "transport": "socks5", "proxy_url": "socks5://mdd-egress:22157"}), \
-                patch.object(engine.cfg, "write_instance_json"):
-            engine.start({"id": "sim1"}, {})
-        # The Engine network is looked up (is it internal?), the uplink never.
-        self.assertNotIn(call("mdd-uplink"), client.networks.get.call_args_list)
-        client.networks.get.return_value.connect.assert_not_called()
-
-    def test_proxy_dns_failure_keeps_existing_engine(self):
-        engine = self.engine_module()
-        from unittest.mock import Mock
-        client = Mock()
-        client.images.get.return_value = SimpleNamespace(
-            id="sha256:verified", attrs={"Config": {"Labels": {
-                engine.ENGINE_LABEL: "socks5"}}})
-        with patch.object(engine, "_client", return_value=client), \
-                patch.object(engine, "ENGINE_NETWORK", "mdd-engine"), \
-                patch.object(engine.egress, "resolve_ipv4_via_socks",
-                             side_effect=engine.egress.EgressError(
-                                 "ePDG DNS resolution failed through country exit")), \
-                patch.object(engine.egress, "ensure_line", return_value={
-                    "transport": "socks5", "proxy_url": "socks5://mdd-egress:22157"}), \
-                patch.object(engine.cfg, "write_instance_json") as write:
-            with self.assertRaisesRegex(engine.egress.EgressError, "DNS resolution failed"):
-                engine.start({"id": "sim1", "mcc": "310", "mnc": "240"}, {})
-        write.assert_not_called()
-        client.containers.get.assert_not_called()
-        client.containers.run.assert_not_called()
-
-    def test_rejects_host_network_before_replacing_existing_engine(self):
-        engine = self.engine_module()
-        with patch.object(engine, "ENGINE_NETWORK", "host"), \
-                patch.object(engine, "_client") as client:
-            with self.assertRaises(ValueError):
-                engine.start({"id": "sim1"}, {})
-            client.assert_not_called()
-
-    def test_ami_selects_named_network_not_first_inspected_network(self):
-        engine = self.engine_module()
-        from unittest.mock import Mock
-        client = Mock()
-        client.containers.get.return_value = SimpleNamespace(
-            status="running", id="engine", attrs={"NetworkSettings": {"Networks": {
-                "unrelated": {"IPAddress": "192.0.2.2"},
-                "mdd-control": {"IPAddress": "198.51.100.2"}}}})
-        with patch.object(engine, "_client", return_value=client), \
-                patch.object(engine, "ENGINE_NETWORK", "mdd-control"):
-            self.assertEqual(engine.container_ip("sim1"), "198.51.100.2")
-        with patch.object(engine, "_client", return_value=client), \
-                patch.object(engine, "ENGINE_NETWORK", "missing"):
-            self.assertIsNone(engine.container_ip("sim1"))
-
     @staticmethod
     def engine_module():
-        fake_docker = SimpleNamespace(
-            from_env=lambda: None,
-            errors=_docker_errors(),
-        )
-        with patch.dict(sys.modules, {"docker": fake_docker}):
-            sys.modules.pop("control.app.engine", None)
-            return importlib.import_module("control.app.engine")
-
-    def test_normal_docker_calls_reuse_one_client(self):
-        engine = self.engine_module()
-        client = SimpleNamespace(close=lambda: None)
-        with patch.object(engine.docker, "from_env", return_value=client) as factory:
-            self.assertIs(engine._client(), client)
-            self.assertIs(engine._client(), client)
-            factory.assert_called_once_with(timeout=30)
-            engine.close_client()
-
-    def test_ami_debug_port_is_published_on_loopback_only(self):
-        """The optional AMI diagnostic port must never reach the LAN."""
-        engine = self.engine_module()
-        captured = {}
-
-        class _Containers:
-            def get(self, name):
-                raise engine.docker.errors.NotFound(name)
-
-            def run(self, image, **kwargs):
-                captured.update(kwargs)
-                return SimpleNamespace(id="container-id", name=kwargs.get("name", ""))
-
-        client = SimpleNamespace(containers=_Containers())
-        inst = {"id": "sim1", "ports": {"sip_udp": 5060, "sip_tls": 5061, "webrtc": 8089,
-                                        "ami": 5038, "rtp_start": 10000}}
-        with tempfile.TemporaryDirectory() as temp, \
-                patch.object(engine, "_client", lambda: client), \
-                patch.object(engine, "ENGINE_NETWORK", ""), \
-                patch.object(engine, "_instance_paths", lambda iid: (temp, temp)), \
-                patch.object(engine, "_clear_runtime_state", lambda base: None), \
-                patch.object(engine.egress, "ensure_line", lambda i, s: None), \
-                patch.object(engine.cfg, "write_instance_json", lambda i, s: None):
-            engine.start(inst, {"debug": {"ami": True}})
-
-        bindings = captured["ports"]
-        self.assertEqual(bindings["5038/tcp"], ("127.0.0.1", 5038))
-        self.assertEqual(captured["volumes"]["/etc/localtime"],
-                         {"bind": "/etc/localtime", "mode": "ro"})
-        # Only RTP stays reachable; no SIP listener is published, including the softphone's
-        # WebSocket, which the control surface relays over the docker bridge.
-        self.assertNotIsInstance(bindings["10000/udp"], tuple)
-        for private in ("8088/tcp", "8089/tcp", "5060/udp", "5061/tcp"):
-            self.assertNotIn(private, bindings)
-        self.assertFalse(any(v.get("bind", "").startswith("/etc/asterisk/certificate")
-                             for v in captured["volumes"].values()))
-
-    def test_default_engine_has_no_host_ami_mapping_and_uses_configured_rtp_span(self):
-        engine = self.engine_module()
-        captured = {}
-
-        class _Containers:
-            def get(self, name):
-                raise engine.docker.errors.NotFound(name)
-
-            def run(self, image, **kwargs):
-                captured.update(kwargs)
-                return SimpleNamespace(id="container-id", name=kwargs.get("name", ""))
-
-        client = SimpleNamespace(containers=_Containers())
-        inst = {"id": "sim1", "ports": {"sip_udp": 5060, "sip_tls": 5061,
-                "webrtc": 8089, "ami": 5038, "rtp_start": 10000, "rtp_span": 12}}
-        with tempfile.TemporaryDirectory() as temp, \
-                patch.object(engine, "_client", lambda: client), \
-                patch.object(engine, "ENGINE_NETWORK", ""), \
-                patch.object(engine, "_instance_paths", lambda iid: (temp, temp)), \
-                patch.object(engine, "_clear_runtime_state", lambda base: None), \
-                patch.object(engine.egress, "ensure_line", lambda i, s: None), \
-                patch.object(engine.cfg, "write_instance_json", lambda i, s: None):
-            engine.start(inst, {})
-
-        bindings = captured["ports"]
-        self.assertNotIn("5038/tcp", bindings)
-        self.assertEqual(len([key for key in bindings if key.endswith("/udp")]), 12)
-        self.assertIn("10011/udp", bindings)
-        self.assertNotIn("10012/udp", bindings)
-        self.assertEqual(captured["sysctls"], {
-            "net.ipv6.conf.all.accept_ra": "0",
-            "net.ipv6.conf.default.accept_ra": "0",
-            "net.ipv6.conf.all.autoconf": "0",
-            "net.ipv6.conf.default.autoconf": "0",
-            "net.ipv6.conf.all.use_tempaddr": "0",
-            "net.ipv6.conf.default.use_tempaddr": "0",
-        })
+        return importlib.import_module("control.app.engine")
 
     def test_engine_recreation_clears_stale_runtime_observations(self):
         engine = self.engine_module()
@@ -341,34 +25,6 @@ class EnginePathTests(unittest.TestCase):
 
             self.assertTrue(all(not (run / name).exists() for name in stale))
             self.assertEqual((run / "charon.log").read_text(), "keep diagnostics")
-
-    def test_docker_log_event_time_is_rendered_in_local_ike_format(self):
-        engine = self.engine_module()
-        raw = ("2026-08-07T03:17:18.123456789Z [Aug  7 11:17:18] "
-               "REGISTER sip:ims.example SIP/2.0\n"
-               "2026-08-07T03:17:19Z Via: SIP/2.0/TCP example\n")
-        rendered = engine._format_docker_logs(raw, timezone(timedelta(hours=8)))
-        self.assertEqual(rendered,
-                         "[2026-08-07 11:17:18+0800] REGISTER sip:ims.example SIP/2.0\n"
-                         "[2026-08-07 11:17:19+0800] Via: SIP/2.0/TCP example\n")
-
-    def test_engine_log_read_requests_docker_source_timestamps(self):
-        engine = self.engine_module()
-        captured = {}
-
-        class _Container:
-            def logs(self, **kwargs):
-                captured.update(kwargs)
-                return b"2026-08-07T03:17:18Z Asterisk Ready.\n"
-
-        client = SimpleNamespace(containers=SimpleNamespace(
-            get=lambda name: _Container()))
-        with patch.object(engine, "_client", lambda: client):
-            rendered = engine.logs("1", 25, since=123)
-
-        self.assertEqual(captured, {"tail": 25, "timestamps": True, "since": 123})
-        self.assertRegex(rendered,
-                         r"^\[2026-08-07 \d{2}:17:18[+-]\d{4}\] Asterisk Ready\.\n$")
 
 
 class DiagnosticCaptureTests(unittest.TestCase):
@@ -488,23 +144,21 @@ class DiagnosticCaptureTests(unittest.TestCase):
         order = []
         with tempfile.TemporaryDirectory() as temp:
             base = self._instance_dir(temp)
-            with patch.object(engine, "_instance_paths", lambda iid: (str(base), str(base))), \
+            with patch.object(engine, "_instance_paths", lambda iid: str(base)), \
                     patch.object(engine, "capture_diagnostics",
                                  lambda iid, inst, b, reason: order.append(("capture", reason))), \
                     patch.object(engine, "stop", lambda iid: order.append(("stop", iid)) or True):
                 engine.capture_and_stop("1", {"mcc": "310"}, "health-freeze:registering")
         self.assertEqual(order, [("capture", "health-freeze:registering"), ("stop", "1")])
 
-    def test_late_capture_never_removes_a_replacement_container(self):
+    def test_late_capture_never_stops_a_replacement_engine(self):
         engine = EnginePathTests.engine_module()
-        current = SimpleNamespace(id="new", name="mdd-sim-gateway-engine-1",
-                                  attrs={"Config": {"Labels": {
-                                      engine.MANAGED_LABEL: "true"}}})
-        current.remove = lambda force: self.fail("replacement container was removed")
-        client = SimpleNamespace(containers=SimpleNamespace(get=lambda name: current))
         with tempfile.TemporaryDirectory() as temp, \
-                patch.object(engine, "_client", lambda: client), \
-                patch.object(engine, "_instance_paths", lambda iid: (temp, temp)), \
+                patch.object(engine, "unit_runtime",
+                             lambda iid: {"running": True, "generation": "new"}), \
+                patch.object(engine, "_enginectl",
+                             side_effect=AssertionError("replacement engine was stopped")), \
+                patch.object(engine, "_instance_paths", lambda iid: temp), \
                 patch.object(engine, "capture_diagnostics") as capture:
             stopped = engine.capture_and_stop(
                 "1", {"mcc": "310"}, "health-freeze:registering", "old")
@@ -516,7 +170,7 @@ class DiagnosticCaptureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             base = self._instance_dir(temp)
             with patch.object(engine, "registration_state",
-                              side_effect=RuntimeError("docker is unreachable")):
+                              side_effect=RuntimeError("asterisk is unreachable")):
                 engine.capture_diagnostics("1", {}, str(base), "rebuild")
             self.assertFalse((base / "logs" / "diagnostics.jsonl").exists())
 

@@ -9,7 +9,6 @@ from websockets.asyncio.server import serve
 
 from control.app import main, softphone_ws
 from control.app.routers import softphone as softphone_routes
-import docker
 
 
 class _Browser:
@@ -68,10 +67,10 @@ class SoftphoneRelayTests(unittest.IsolatedAsyncioTestCase):
 
     def patched(self, *, instance=None, runtime=None, port=None):
         instance = {"id": "sim1", "sip": {"webrtc": {"enable": True}}} if instance is None else instance
-        runtime = runtime or {"running": True, "ip": "127.0.0.1", "container_id": "c1"}
+        runtime = runtime or {"running": True, "ip": "127.0.0.1", "generation": "c1"}
         for p in (
             patch.object(main.cfg, "get_instance", return_value=instance),
-            patch.object(main.engine, "container_runtime", return_value=runtime),
+            patch.object(main.engine, "unit_runtime", return_value=runtime),
             patch.object(softphone_ws, "ENGINE_WS_PORT", self.port if port is None else port),
         ):
             p.start()
@@ -111,7 +110,7 @@ class SoftphoneRelayTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(code, 1008)
 
     async def test_stopped_engine_is_refused(self):
-        code = await self.refused(runtime={"running": False, "ip": None, "container_id": None})
+        code = await self.refused(runtime={"running": False, "ip": None, "generation": None})
         self.assertEqual(code, 1013)
 
     async def test_unreachable_engine_fails_the_handshake(self):
@@ -130,12 +129,12 @@ class SoftphoneRelayTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(softphone_routes.ws_softphone(_AcceptFailure(), "sim1"), 5)
         await asyncio.wait_for(self.engine_closed.wait(), 5)
 
-    async def test_docker_failure_is_temporarily_unavailable(self):
+    async def test_systemd_failure_is_temporarily_unavailable(self):
         self.patched()
         browser = _Browser()
         with patch.object(
-                main.engine, "container_runtime",
-                side_effect=docker.errors.DockerException("daemon unavailable")):
+                main.engine, "unit_runtime",
+                side_effect=OSError("systemctl unavailable")):
             await asyncio.wait_for(softphone_routes.ws_softphone(browser, "sim1"), 5)
         self.assertIsNone(browser.accepted)
         self.assertEqual(browser.close_code, 1013)

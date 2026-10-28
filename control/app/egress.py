@@ -1,16 +1,17 @@
 """Country-aware ePDG egress coordination.
 
-The control plane never edits host routes from its container namespace.  Instead it publishes a
-small desired-state document under the shared data directory.  The host-side
-``mdd-sim-gateway-orchestrator`` resolves each line's ePDG and owns the per-country sing-box TUN + /32
-routes.  Engine startup waits for the corresponding line to become ready, preventing an IKE
-attempt from leaking through the wrong country's default route.
+The control plane is unprivileged and never edits host routes.  Instead it publishes a small
+desired-state document under the data directory.  The root ``mdd-orchestrator`` owns the
+per-country sing-box TUNs and each line's route and nftables rules (host/mdd_netns.py).  Engine
+startup waits for the line to become ready, and the engine gets its ePDG as an address
+resolved through that country's exit (resolve_epdg): it has no DNS of its own.
 
 The opt-in container transport instead consumes a separate, versioned SOCKS status.
 That status confirms listener readiness only; it never claims a host route exists.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import importlib.util
 import os
@@ -576,6 +577,16 @@ def epdg_for(inst: dict) -> str:
     return f"epdg.epc.mnc{mnc}.mcc{mcc}.pub.3gppnetwork.org"
 
 
+def rtp_range(inst: dict) -> list[int] | None:
+    """The line's browser-call RTP ports, which the orchestrator DNATs into its namespace."""
+    ports = inst.get("ports") or {}
+    try:
+        start = int(ports["rtp_start"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return [start, start + cfg.rtp_span(ports) - 1]
+
+
 def desired_document(instances: list[dict], settings: dict) -> dict:
     proxy = deepcopy(settings.get("proxy") or {})
     lines = []
@@ -588,8 +599,10 @@ def desired_document(instances: list[dict], settings: dict) -> dict:
             "mnc": str(inst.get("mnc", "")),
             "country": line_country(inst),
             "epdg": epdg_for(inst),
+            "rtp": rtp_range(inst),
         })
-    return {"version": 1, "updated_at": int(time.time()), "proxy": proxy, "lines": lines}
+    return {"version": 1, "updated_at": int(time.time()), "proxy": proxy, "lines": lines,
+            "control_port": int(settings.get("http_port") or 8443)}
 
 
 def publish(instances: list[dict] | None = None, settings: dict | None = None) -> dict:
@@ -707,6 +720,37 @@ def report_stalled_exit(country: str, node: str, reason: str, line: str) -> bool
                           "node": str(node or ""), "line": str(line or "")}
     _atomic_json(_STALLED, {"version": 1, "countries": countries})
     return True
+
+
+def resolve_epdg(inst: dict, line_state: dict) -> str:
+    """The line's ePDG as an IPv4 address, for an engine that has no DNS of its own.
+
+    A line behind a country exit resolves through that exit (D6: the answer must come from the
+    SIM's country, not from a resolver in the gateway's); a direct line uses the host's
+    resolver. An address saved on the line is used as it is.
+    """
+    name = epdg_for(inst)
+    if not name:
+        raise EgressError("cannot derive the ePDG from the SIM's MCC/MNC; set it on the line")
+    try:
+        return str(ipaddress.IPv4Address(name))
+    except ValueError:
+        pass
+    if line_state.get("route") == "tun":
+        country = line_country(inst)
+        current = (status().get("exits") or {}).get(country) or {}
+        host, port = str(current.get("proxy_host") or ""), int(current.get("proxy_port") or 0)
+        if not host or not port:
+            raise EgressError(f"{country.upper()} exit has no local SOCKS endpoint for the "
+                              "ePDG lookup")
+        return resolve_ipv4_via_socks(f"socks5://{host}:{port}", name)
+    try:
+        answers = socket.getaddrinfo(name, None, socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError as exc:
+        raise EgressError(f"ePDG {name} did not resolve: {exc}") from exc
+    for _family, _type, _proto, _name, address in answers:
+        return str(address[0])
+    raise EgressError(f"ePDG {name} has no IPv4 address")
 
 
 def ensure_line(inst: dict, settings: dict, timeout: float = 18.0) -> dict:

@@ -6,7 +6,7 @@ import unittest
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from control.app import config, operations
 from control.app import state as app_state
@@ -14,51 +14,11 @@ from control.app.routers import logs as logs_routes
 
 try:
     from control.app import main
-except ImportError:      # the Docker SDK is a manager runtime dependency this does not need
+except ImportError:
     main = None
 
 
 class OperationsTests(unittest.TestCase):
-    def test_old_image_cleanup_keeps_live_current_and_trusted_images(self):
-        def image(image_id, tags, managed=True):
-            value = Mock(id=image_id, tags=tags)
-            value.attrs = {"Config": {"Labels": {
-                "io.mdd-sim-gateway.managed": "true" if managed else "false"}}}
-            return value
-
-        current = image("current", ["mdd-sim-gateway/engine:latest",
-                                     "mdd-sim-gateway/engine:previous"])
-        base = image("base", ["mdd-sim-gateway/engine-base:trusted"])
-        live_old = image("live-old", ["mdd-sim-gateway/engine:emergency"])
-        rollback = image("rollback", ["mdd-sim-gateway/engine:previous",
-                                       "mdd-sim-gateway/engine:old-test"])
-        unrelated = image("other", ["other/app:latest"], managed=False)
-        client = Mock()
-        client.df.side_effect = [
-            {"ImageUsage": {"TotalSize": 10_000}},
-            {"ImageUsage": {"TotalSize": 6_000}},
-        ]
-        client.images.list.return_value = [current, base, live_old, rollback, unrelated]
-        client.containers.list.return_value = [Mock(image=live_old)]
-        with patch.object(operations.docker, "from_env", return_value=client):
-            result = operations.prune_old_mdd_images()
-
-        self.assertEqual(result, {"ok": True, "removed_images": 1,
-                                  "space_reclaimed_bytes": 4_000})
-        client.images.remove.assert_called_once_with(
-            "rollback", force=True, noprune=False)
-        client.containers.list.assert_called_once_with(all=True)
-        client.close.assert_called_once_with()
-
-    def test_build_cache_cleanup_uses_dangling_mode_without_all(self):
-        client = Mock()
-        client.api.prune_builds.return_value = {"SpaceReclaimed": 12345}
-        with patch.object(operations.docker, "from_env", return_value=client):
-            result = operations.prune_dangling_build_cache()
-        self.assertEqual(result, {"ok": True, "space_reclaimed_bytes": 12345})
-        client.api.prune_builds.assert_called_once_with(all=False)
-        client.close.assert_called_once_with()
-
     def test_engine_sources_do_not_log_authentication_secrets(self):
         root = Path(__file__).resolve().parents[1]
         sources = "\n".join(
@@ -644,8 +604,11 @@ class OperationsTests(unittest.TestCase):
                 "sip": {"webrtc": {"enable": True, "password": "random-web-secret"}},
             }
             path = config.write_instance_json(inst, {})
-            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
-            self.assertEqual(os.stat(temp).st_mode & 0o777, 0o700)
+            # The engine runs as root in group mdd without CAP_DAC_OVERRIDE (SLIM_PLAN 12.3):
+            # it reaches its line only through the group, and nothing is open to others.
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o640)
+            self.assertEqual(os.stat(temp).st_mode & 0o777, 0o750)
+            self.assertEqual(os.stat(os.path.dirname(path)).st_mode & 0o777, 0o770)
 
     def test_engine_configuration_fails_closed_without_generated_credentials(self):
         inst = {"id": "sim1", "imsi": "001010123456789", "mcc": "001", "mnc": "01"}
@@ -747,86 +710,17 @@ class ServiceRestartTests(unittest.TestCase):
     def test_no_request_and_no_history_reads_as_idle(self):
         self.assertEqual(operations.service_restart_status()["state"], "idle")
 
-    def test_a_container_restart_that_never_completes_is_reported_failed(self):
-        self.root.mkdir(parents=True)
-        (self.root / "service-restart-status.json").write_text(json.dumps({
-            "state": "running", "scope": "control", "executor": "container",
-            "updated_at": int(time.time()) - 300}))
-        status = operations.service_restart_status()
-        self.assertEqual(status["state"], "failed")
-        self.assertEqual(status["error_code"], "restart.error.failed")
-
-    def test_container_mode_rejects_host_reboot_without_publishing_a_request(self):
+    def test_host_reboot_is_always_requested_from_the_orchestrator(self):
         with patch.dict(os.environ, {"MDD_CONTAINER_STACK": "1"}):
             result = operations.request_service_restart("host")
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["error_code"], "restart.error.host_unavailable")
-        self.assertFalse((self.root / "service-restart-request.json").exists())
+        self.assertTrue(result["ok"])
+        self.assertTrue((self.root / "service-restart-request.json").exists())
 
-    def test_container_service_restart_checks_ownership_and_orders_base_services_first(self):
-        restarted = []
-
-        class Container:
-            def __init__(self, component):
-                self.attrs = {"Config": {"Labels": {
-                    "io.mdd-sim-gateway.managed": "true",
-                    "io.mdd-sim-gateway.component": component}}}
-                self.component = component
-                self.image = Mock(id=f"sha256:{component}")
-            def restart(self, timeout):
-                self.assert_timeout = timeout
-                restarted.append(self.component)
-
-        containers = {name: Container(component) for component, name in {
-            "control": "mdd-sim-gateway-control",
-            "hardware": "mdd-sim-gateway-hardware",
-            "egress": "mdd-sim-gateway-egress"}.items()}
-        client = Mock()
-        client.containers.get.side_effect = containers.__getitem__
-        with patch.dict(os.environ, {"MDD_CONTAINER_STACK": "1"}):
-            operations.request_service_restart("services")
-            result = operations.perform_container_service_restart("services", client)
-
-        self.assertEqual(result["state"], "running")
-        self.assertEqual(restarted, ["egress", "hardware"])
-        client.containers.run.assert_called_once()
-        helper = client.containers.run.call_args
-        self.assertEqual(helper.args[0], "sha256:control")
-        self.assertEqual(helper.kwargs["network_mode"], "none")
-        self.assertEqual(helper.kwargs["healthcheck"], {"test": ["NONE"]})
-        self.assertEqual(len(helper.kwargs["command"]), 1)
-        self.assertIn("mdd-sim-gateway-control", helper.kwargs["command"][0])
-        self.assertIn("target.restart(timeout=30)", helper.kwargs["command"][0])
-        self.assertTrue((self.root / "pcsc-maintenance").is_file())
-        self.assertFalse((self.root / "service-restart-request.json").exists())
-
-    def test_container_restart_refuses_a_foreign_named_container(self):
-        foreign = Mock()
-        foreign.attrs = {"Config": {"Labels": {}}}
-        client = Mock()
-        client.containers.get.return_value = foreign
-        operations.request_service_restart("control")
-        result = operations.perform_container_service_restart("control", client)
-        self.assertEqual(result["state"], "failed")
-        self.assertIn("unowned", result["error"])
-        foreign.restart.assert_not_called()
-
-    def test_container_restart_reports_an_unavailable_docker_daemon(self):
-        operations.request_service_restart("control")
-        with patch.object(operations.docker, "from_env",
-                          side_effect=RuntimeError("daemon unavailable")):
-            result = operations.perform_container_service_restart("control")
-        self.assertEqual(result["state"], "failed")
-        self.assertEqual(result["error_code"], "restart.error.failed")
-        self.assertIn("daemon unavailable", result["error"])
-
-    def test_returning_control_process_settles_container_restart(self):
-        status_path = self.root / "service-restart-status.json"
-        self.root.mkdir(parents=True)
-        status_path.write_text(json.dumps({
-            "state": "running", "scope": "control", "executor": "container"}))
-        status = operations.settle_container_service_restart()
-        self.assertEqual(status["state"], "success")
+    def test_no_container_executor_is_left(self):
+        for name in ("container_stack_enabled", "perform_container_service_restart",
+                     "settle_container_service_restart", "prune_old_mdd_images",
+                     "prune_dangling_build_cache"):
+            self.assertFalse(hasattr(operations, name), name)
 
 
 if __name__ == "__main__":

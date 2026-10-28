@@ -408,6 +408,14 @@ nft table inet mdd:
   - 沙箱内核没有 IPv6，`up` 改为：IPv6 的 sysctl 失败只告警，rp_filter 等其余步骤失败就退出。
 - 2026-10-28 §12.11 第 2 项完成：`packaging/systemd/mdd-netns@.service`、`mdd-engine@.service`、`packaging/sbin/mdd-enginectl`、`packaging/sudoers.d/mdd` + `tests/test_packaging.py`（15 个；含 `visudo -cf` 与 `systemd-analyze verify`，工具不存在时跳过）。与 §12.3 的差异：引擎单元去掉了 `/var/run/asterisk`、`/var/log/asterisk` 两个临时挂载（Asterisk 的控制套接字和日志按 P-4 放在线路自己的 run/logs 目录），增加 `MDD_AST_LOGDIR`。
 - 2026-10-28 §12.11 第 3 项完成：orchestrator 每轮调用 `mdd_netns.reconcile()`（代理关闭时也调用，线路按直连处理），删除 /32 ePDG 路由、ePDG 解析与地址保留（`EpdgAddressRetentionTests` 5 个测试随功能删除）；国家 SOCKS 默认监听 127.0.0.1；sing-box/Xray 自行退出时立即醒来重建；服务重启改用 `mdd-control.service`/`mdd-orchestrator.service`（`services` 范围用 `systemd-run` 临时单元执行 `systemctl restart`，不再调用 install.sh）。`proxy-status.json` 的 `lines[N]` 增加 `route`/`netns`/`netns_present`，去掉 `addresses`/`routed_addresses`。新增 `tests/test_orchestrator_lines.py`（12 个）。
+- 2026-10-28 §12.11 第 4 项完成：控制面改为 systemd 后端。
+  - `engine.py`：`sudo -n mdd-enginectl`（start 前先 stop→清运行文件→写 instance.json→reset-failed→start，出口或 ePDG 解析失败时不动正在运行的引擎）；`systemctl show` 读状态，`InvocationID` 作为"代"（运行时字典的 `container_id` 改名 `generation`）；`journalctl` 读日志；`asterisk -r -s <线路 run 目录>/asterisk/asterisk.ctl -x` 执行 CLI；删除线路前 `enginectl down`。
+  - `runtime.py`：每 3 秒一次 `systemctl show` 轮询代替 Docker 事件流。
+  - `egress.resolve_epdg()`：TUN 线路经本国 SOCKS（127.0.0.1）解析，直连线路用宿主解析；`desired.json` 增加每线路 `rtp` 与 `control_port`。
+  - `config.py`：`PRODUCT_MAX_LINES = 2`（源码硬上限）、`settings.max_lines` 默认 1；`manager_url` 默认 `https://10.88.<线路>.1:<端口>`，忽略旧的 `host.docker.internal`；数据目录 0750、线路目录 0770、instance.json 0640（引擎无 `CAP_DAC_OVERRIDE`，经组 mdd 访问；config.yaml、auth.json 仍是 0600）。原来经容器环境变量传给引擎的 `SWU_LIVENESS_PERIOD`、`SWU_PCSCF_APPLY_MODE` 改为写进 instance.json，由 render.py 写入 engine.env（默认值不变）。
+  - 删除：`rtp_forward.py`、media relay 全部代码（`media.py` 只剩 direct）、`media_supervisor` 后台任务、requirements 里的 `docker`；docker 依赖去掉后，operations/sysinfo/system 路由里的镜像清理、构建缓存、容器重启执行器、Docker 存储统计也在本项一起删除（WebUI 部分留在第 6 项）。设置接口校验 `max_lines` ∈ {1,2}，调小后立即停止超出的线路。
+  - P-1：关闭 `/docs`、`/redoc`、`/openapi.json`，加测试。
+  - 测试：删除 `test_media_relay`、`test_rtp_forward`；Docker 机制相关的用例随功能删除；新增 `tests/test_engine_systemd.py`（27 个）；`test_runtime_registry`、`test_media_control`、`test_engine_manager_url`、`test_product_boundaries` 按新行为重写。全量 1009 个通过。
 
 ---
 

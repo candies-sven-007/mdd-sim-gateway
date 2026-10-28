@@ -1,9 +1,8 @@
 """Engine -> Control event delivery.
 
-A Pi migrated from a native install to the container stack kept
-settings.manager_url = https://host.docker.internal:8443. The explicit setting won over the
-container's MDD_MANAGER_URL, the Engine (on an internal network) could not reach the host,
-and notify.py swallowed every timeout: inbound SMS reached the Engine but never the web UI.
+The engine lives in its own network namespace; the only host address it can reach is its
+veth peer, 10.88.<line>.1. A host.docker.internal URL saved by a Docker install would make
+every event time out while notify.py swallowed the error, so it is ignored.
 """
 import importlib.util
 import io
@@ -22,35 +21,35 @@ from control.app import config
 ROOT = Path(__file__).resolve().parents[1]
 
 LEGACY = "https://host.docker.internal:8443"
-CONTAINER = "https://mdd-control:8443"
 
 
 class ManagerUrlTests(unittest.TestCase):
-    def url(self, settings, env):
+    def url(self, settings, env, iid="2"):
         with patch.dict(os.environ, env, clear=False):
-            for key in ("MDD_CONTAINER_STACK", "MDD_MANAGER_URL"):
-                if key not in env:
-                    os.environ.pop(key, None)
-            return config._engine_manager_url(settings)
+            if "MDD_MANAGER_URL" not in env:
+                os.environ.pop("MDD_MANAGER_URL", None)
+            return config._engine_manager_url(settings, iid)
 
-    def test_container_stack_ignores_a_saved_host_url(self):
-        self.assertEqual(
-            self.url({"manager_url": LEGACY},
-                     {"MDD_CONTAINER_STACK": "1", "MDD_MANAGER_URL": CONTAINER}),
-            CONTAINER)
+    def test_default_is_the_lines_veth_peer_on_the_control_port(self):
+        self.assertEqual(self.url({}, {}), "https://10.88.2.1:8443")
+        self.assertEqual(self.url({"http_port": 9443}, {}, iid="1"), "https://10.88.1.1:9443")
 
-    def test_native_install_keeps_the_explicit_setting(self):
-        self.assertEqual(
-            self.url({"manager_url": "https://10.0.0.5:9443"},
-                     {"MDD_MANAGER_URL": LEGACY}),
-            "https://10.0.0.5:9443")
+    def test_explicit_setting_then_environment_win(self):
+        self.assertEqual(self.url({"manager_url": "https://10.0.0.5:9443"},
+                                  {"MDD_MANAGER_URL": "https://e:1"}), "https://10.0.0.5:9443")
+        self.assertEqual(self.url({}, {"MDD_MANAGER_URL": "https://e:1"}), "https://e:1")
 
-    def test_native_install_falls_back_to_env_then_default(self):
-        self.assertEqual(self.url({}, {"MDD_MANAGER_URL": LEGACY}), LEGACY)
-        self.assertEqual(self.url({"http_port": 9443}, {}), "https://host.docker.internal:9443")
+    def test_a_saved_docker_url_is_ignored(self):
+        self.assertEqual(self.url({"manager_url": LEGACY}, {}), "https://10.88.2.1:8443")
 
-    def test_container_stack_without_env_keeps_the_old_fallbacks(self):
-        self.assertEqual(self.url({"manager_url": LEGACY}, {"MDD_CONTAINER_STACK": "1"}), LEGACY)
+    def test_rendered_into_instance_json(self):
+        inst = {"id": "1", "imsi": "001010000000000", "mcc": "001", "mnc": "01",
+                "ami_secret": "a", "sip": {"webrtc": {"enable": True, "password": "p"}}}
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MDD_MANAGER_URL", None)
+            with patch.object(config, "internal_event_token", return_value="t"):
+                rendered = config.render_instance_json(inst, {"http_port": 8443})
+        self.assertEqual(rendered["manager_url"], "https://10.88.1.1:8443")
 
 
 def _load_notify():

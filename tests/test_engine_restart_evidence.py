@@ -1,6 +1,6 @@
 """Evidence for engine bounces that nothing used to record.
 
-The engine containers were being restarted by Docker's restart policy several times a day —
+The engines were being restarted by their restart policy several times a day —
 Asterisk went away a few seconds after the P-CSCF reload that follows an ePDG teardown — and
 none of it reached the timeline: the bounce resolves faster than the health policy's threshold,
 so no recovery is scheduled and lifecycle.jsonl stays empty. These tests cover the three pieces
@@ -10,7 +10,6 @@ import importlib
 import json
 import re
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,13 +22,7 @@ ENTRYPOINT = REPO / "engine" / "entrypoint.sh"
 
 
 def engine_module():
-    fake_docker = SimpleNamespace(
-        from_env=lambda: None,
-        errors=SimpleNamespace(NotFound=type("NotFound", (Exception,), {})),
-    )
-    with patch.dict(sys.modules, {"docker": fake_docker}):
-        sys.modules.pop("control.app.engine", None)
-        return importlib.import_module("control.app.engine")
+    return importlib.import_module("control.app.engine")
 
 
 class SupervisorRecordTests(unittest.TestCase):
@@ -68,18 +61,16 @@ class SupervisorRecordTests(unittest.TestCase):
         self.assertEqual(written["reason_code"], "engine_exit")
 
     def test_runtime_reports_restart_count(self):
-        """A restart-policy bounce increments RestartCount on the same container; a rebuild
-        the manager performs starts a fresh one at zero. Only the counter separates them."""
+        """A bounce systemd performs on its own increments NRestarts; it is the only counter
+        that separates it from a start the manager asked for."""
         engine = engine_module()
-        container = SimpleNamespace(
-            status="running", id="abc",
-            attrs={"NetworkSettings": {"Networks": {"bridge": {"IPAddress": "172.17.0.4"}}},
-                   "RestartCount": 6, "State": {"StartedAt": "2026-09-15T07:09:02Z"}})
-        client = SimpleNamespace(containers=SimpleNamespace(get=lambda _name: container))
-        with patch.object(engine, "_client", return_value=client):
-            runtime = engine.container_runtime("7")
+        props = {"ActiveState": "active", "SubState": "running", "NRestarts": "6",
+                 "InvocationID": "abc", "ActiveEnterTimestamp": "Tue 2026-09-15 15:09:02 CST"}
+        runtime = engine.runtime_from_show("7", props)
         self.assertEqual(runtime["restart_count"], 6)
-        self.assertEqual(runtime["started_at"], "2026-09-15T07:09:02Z")
+        self.assertEqual(runtime["started_at"], "Tue 2026-09-15 15:09:02 CST")
+        self.assertEqual(runtime["generation"], "abc")
+        self.assertEqual(runtime["ip"], "10.88.7.2")
 
 
 class SupportBundleBoundaryTests(unittest.TestCase):
@@ -195,14 +186,23 @@ class PcscfApplyModeTests(unittest.TestCase):
     def test_apply_mode_is_settable_per_line_with_a_global_fallback(self):
         """The crash is a use-after-free that does not fire on every reload, so switching one
         line proves nothing unless the others stay on the old path as a control group."""
-        source = (REPO / "control" / "app" / "engine.py").read_text()
-        start = source.index('"SWU_PCSCF_APPLY_MODE"')
-        clause = source[start:start + 320]
-        self.assertIn('inst.get("pcscf_apply_mode")', clause)
-        # Per-line value must win over the global one.
-        self.assertLess(clause.index('inst.get("pcscf_apply_mode")'),
-                        clause.index('settings.get("engine")'))
-        self.assertIn('or "restart"', clause)
+        from control.app import config
+        inst = {"id": "1", "imsi": "001010000000000", "mcc": "001", "mnc": "01",
+                "ami_secret": "a", "sip": {"webrtc": {"enable": True, "password": "p"}}}
+        with patch.object(config, "internal_event_token", return_value="t"):
+            render = config.render_instance_json
+            self.assertEqual(render(inst, {})["pcscf_apply_mode"], "restart")
+            self.assertEqual(render(inst, {"engine": {"pcscf_apply_mode": "reload"}})
+                             ["pcscf_apply_mode"], "reload")
+            self.assertEqual(render({**inst, "pcscf_apply_mode": "restart"},
+                                    {"engine": {"pcscf_apply_mode": "reload"}})
+                             ["pcscf_apply_mode"], "restart")
+            self.assertEqual(render(inst, {})["liveness_period"], 0)
+        # render.py hands both to swu_ike through engine.env.
+        source = (REPO / "engine" / "render.py").read_text()
+        self.assertIn('put("SWU_PCSCF_APPLY_MODE", cfg.get("pcscf_apply_mode") or "restart")',
+                      source)
+        self.assertIn('put("SWU_LIVENESS_PERIOD", cfg.get("liveness_period", 0))', source)
 
     def test_peer_initiated_teardown_is_reported_with_its_duration(self):
         """Which side ended the tunnel, and after how long, is the whole story behind the

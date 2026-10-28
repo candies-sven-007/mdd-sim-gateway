@@ -33,8 +33,10 @@ _loaded: tuple | None = None
 
 # Product safety boundary. This is intentionally a source-level limit rather than an environment
 # variable: operators must not be able to turn the gateway into a bulk-SIM service by changing
-# deployment configuration.
-MAX_SIM_LINES = 10
+# deployment configuration. Within it, settings.max_lines (1 by default) is what the device's
+# memory allows; it can be raised to the ceiling once a second line has been measured to fit.
+PRODUCT_MAX_LINES = 2
+DEFAULT_MAX_LINES = 1
 
 # Values added by the instances API for display only. They may ride back on a complete WebUI
 # form, but they are not part of the desired line configuration and must never reach config.yaml.
@@ -56,12 +58,6 @@ class LineLimitError(ValueError):
     pass
 
 
-def _private_dir(path: str) -> None:
-    """Create a runtime directory and keep it inaccessible to non-root host users."""
-    os.makedirs(path, mode=0o700, exist_ok=True)
-    os.chmod(path, 0o700)
-
-
 def _private_text_writer(path: str):
     """Open a file for atomic private-state writes without a world-readable umask window."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -72,6 +68,7 @@ DEFAULTS = {
     "internal": {},
     "settings": {
         "timezone": "Asia/Shanghai",
+        "max_lines": DEFAULT_MAX_LINES,
         "http_port": 8443,
         "bind": "0.0.0.0",
         "tls": {"self_signed": True, "domain": "", "cert_path": "", "key_path": ""},
@@ -214,7 +211,7 @@ def ice_advertise_address(settings: dict) -> str:
 
 
 def _ensure():
-    _private_dir(DATA_DIR)
+    _group_dir(DATA_DIR, 0o750)
     if not os.path.exists(CONFIG_PATH):
         with _private_text_writer(CONFIG_PATH) as f:
             yaml.safe_dump(DEFAULTS, f)
@@ -325,7 +322,7 @@ def save(data: dict):
     global _loaded
     with _lock:
         _loaded = None
-        _private_dir(DATA_DIR)
+        _group_dir(DATA_DIR, 0o750)
         tmp = CONFIG_PATH + ".tmp"
         with _private_text_writer(tmp) as f:
             yaml.safe_dump(data, f, sort_keys=False)
@@ -554,9 +551,10 @@ def _upsert_instance_locked(inst: dict, unique_name: bool = False) -> dict:
     # edit look operational, unnecessarily rebuilding the running engine.
     inst = {k: v for k, v in inst.items() if k not in RUNTIME_ONLY_INSTANCE_FIELDS}
     existing = data["instances"].get(iid, {})
-    if not existing and len(data["instances"]) >= MAX_SIM_LINES:
+    limit = max_lines(data.get("settings"))
+    if not existing and len(data["instances"]) >= limit:
         raise LineLimitError(
-            f"MDD Sim Gateway supports at most {MAX_SIM_LINES} SIM lines")
+            f"MDD Sim Gateway is set to at most {limit} SIM line(s)")
     if "index" not in existing:
         inst["index"] = next_index(data)
     else:
@@ -615,12 +613,22 @@ def _upsert_instance_locked(inst: dict, unique_name: bool = False) -> dict:
     return merged
 
 
-def line_allowed(iid: str) -> bool:
-    """Whether a saved line is inside the product's deterministic five-line set.
+def max_lines(settings: dict | None = None) -> int:
+    """How many lines may exist and run: settings.max_lines, 1..PRODUCT_MAX_LINES."""
+    settings = settings if settings is not None else get_settings()
+    try:
+        value = int((settings or {}).get("max_lines", DEFAULT_MAX_LINES))
+    except (TypeError, ValueError):
+        value = DEFAULT_MAX_LINES
+    return max(1, min(PRODUCT_MAX_LINES, value))
 
-    Old/self-use installations may already contain more than five records. Keep their data so
-    an upgrade is non-destructive, but prevent every engine start path from using line six and
-    above. Existing UI order (`index`) wins; ids break ties deterministically.
+
+def line_allowed(iid: str) -> bool:
+    """Whether a saved line is inside the deterministic set of max_lines() lines.
+
+    A configuration may hold more records than the limit (it was lowered, or carried over).
+    Keep their data so nothing is lost, but prevent every engine start path from using the
+    lines beyond it. Existing UI order (`index`) wins; ids break ties deterministically.
     """
     def order(item: dict):
         try:
@@ -630,7 +638,7 @@ def line_allowed(iid: str) -> bool:
         return index, str(item.get("id") or "")
 
     allowed = {str(item.get("id")) for item in
-               sorted(list_instances(), key=order)[:MAX_SIM_LINES]}
+               sorted(list_instances(), key=order)[:max_lines()]}
     return str(iid) in allowed
 
 
@@ -903,41 +911,24 @@ def cp_mode_order_for(mcc: str, mnc: str) -> str:
     return ",".join(order)
 
 
-def _engine_manager_url(settings: dict) -> str:
-    """Where engine notify.py POSTs events (SMS, calls, tunnel state).
+def _engine_manager_url(settings: dict, iid: str) -> str:
+    """Where engine notify.py POSTs events (calls, registration, tunnel state).
 
-    Explicit setting wins; else MDD_MANAGER_URL env (the installer sets this to the PUBLISHED
-    host port when the control plane runs in a bridge-networked container with a different
-    host port); else the default assumes a 1:1 host.docker.internal:<http_port> mapping.
-
-    In the container stack the Engine sits on an internal network with no route to the host,
-    so only the Control's own MDD_MANAGER_URL is reachable. A saved setting carried over from a
-    native install (host.docker.internal) would make every event time out while notify.py
-    swallows the error: inbound SMS reached the Engine but never the web UI."""
-    env_url = os.environ.get("MDD_MANAGER_URL")
-    if os.environ.get("MDD_CONTAINER_STACK") == "1" and env_url:
-        return env_url
-    return (settings.get("manager_url")
-            or env_url
-            or f"https://host.docker.internal:{settings.get('http_port', 10443)}")
+    Explicit setting wins; else MDD_MANAGER_URL; else the host's end of the line's veth,
+    10.88.<line>.1, the only host address the engine's namespace can reach (the nft input
+    chain admits the control port there). A saved host.docker.internal URL from a Docker
+    install would make every event time out while notify.py swallows the error, so it is
+    ignored."""
+    saved = str(settings.get("manager_url") or "")
+    if "host.docker.internal" in saved:
+        saved = ""
+    return (saved or os.environ.get("MDD_MANAGER_URL")
+            or f"https://10.88.{iid}.1:{settings.get('http_port', 8443)}")
 
 
 def render_instance_json(inst: dict, settings: dict) -> dict:
     """Convert a stored instance into the engine /config/instance.json contract."""
-    rendered = _render_instance_json(inst, settings)
-    # Relay media mode (media.engine_attachment, one-run copy like "epdg"): every engine uses
-    # the same RTP range on its own media address, so the line's own block is not used, and
-    # stays saved for a return to direct mode. Absent in direct mode.
-    relay = inst.get("media")
-    if relay:
-        rendered["media"] = dict(relay)
-        rendered["rtp_start"] = relay["rtp_start"]
-        rendered["rtp_end"] = relay["rtp_end"]
-    # The Engine network the control surface relays the softphone over (engine.start, one-run
-    # copy). Absent outside the container stack.
-    if inst.get("engine_subnet"):
-        rendered["engine_subnet"] = inst["engine_subnet"]
-    return rendered
+    return _render_instance_json(inst, settings)
 
 
 def _render_instance_json(inst: dict, settings: dict) -> dict:
@@ -991,8 +982,17 @@ def _render_instance_json(inst: dict, settings: dict) -> dict:
         "epdg": inst.get("epdg", ""),
         "ami_user": inst.get("ami_user", "vowifi"),
         "ami_secret": ami_secret,
-        "manager_url": _engine_manager_url(settings),
+        "manager_url": _engine_manager_url(settings, str(inst["id"])),
         "manager_event_token": internal_event_token(),
+        # Formerly container environment. Liveness probing stays off unless a line asks for it
+        # (0, as before). How a new P-CSCF is pushed into Asterisk on reconnect: "restart"
+        # (default, Asterisk-internal cold restart) or "reload" (the old path, which crashes --
+        # see swu_apply_pcscf). Settable per line, then globally, so a line can be moved back
+        # for comparison without touching the others.
+        "liveness_period": inst.get("liveness_period", 0),
+        "pcscf_apply_mode": str(inst.get("pcscf_apply_mode")
+                                or (settings.get("engine") or {}).get("pcscf_apply_mode")
+                                or "restart"),
         "domain": settings.get("tls", {}).get("domain", ""),
         "rtp_start": ports["rtp_start"],
         # The engine publishes only the configured RTP span (engine.start),
@@ -1066,15 +1066,26 @@ def _render_instance_json(inst: dict, settings: dict) -> dict:
     }
 
 
+def _group_dir(path: str, mode: int) -> None:
+    """A directory the engine reaches through group mdd (it runs as root without
+    CAP_DAC_OVERRIDE, so owner-only modes would lock it out)."""
+    os.makedirs(path, mode=mode, exist_ok=True)
+    try:
+        os.chmod(path, mode)
+    except PermissionError:
+        pass
+
+
 def write_instance_json(inst: dict, settings: dict) -> str:
     d = os.path.join(DATA_DIR, "instances", str(inst["id"]))
-    _private_dir(DATA_DIR)
-    _private_dir(os.path.join(DATA_DIR, "instances"))
-    _private_dir(d)
+    _group_dir(DATA_DIR, 0o750)
+    _group_dir(os.path.join(DATA_DIR, "instances"), 0o750)
+    _group_dir(d, 0o770)
     path = os.path.join(d, "instance.json")
     tmp = path + ".tmp"
-    with _private_text_writer(tmp) as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+    os.fchmod(fd, 0o640)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(render_instance_json(inst, settings), f, indent=2)
     os.replace(tmp, path)
-    os.chmod(path, 0o600)
     return path

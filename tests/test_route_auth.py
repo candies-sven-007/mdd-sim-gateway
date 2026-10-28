@@ -148,6 +148,13 @@ class _SignedOut(unittest.TestCase):
         self.assertEqual(auth.configured(), self.configured)
         self.assertEqual(auth._sessions, {})
 
+    def test_no_api_schema_for_anyone(self):
+        for path in ("/openapi.json", "/docs", "/redoc"):
+            with self.subTest(path=path):
+                response = self.client.get(path)
+                self.assertNotIn('"paths"', response.text)
+                self.assertNotIn("swagger", response.text.lower())
+
     def connect(self, path, **kwargs):
         """The close code the gate answers a handshake with, or None if it was accepted."""
         headers = {"origin": f"https://{HOST}", **kwargs.pop("headers", {})}

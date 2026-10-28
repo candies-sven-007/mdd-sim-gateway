@@ -2,9 +2,9 @@
 main.py - MDD Sim Gateway control surface (FastAPI).
 
 Serves the management REST API + WebSocket live feed + the built WebUI, and (for the
-browser softphone) proxies provisioning. Runs natively or in a container; talks to
-engine containers via the Docker SDK (engine.py) and Asterisk AMI (ami.py). HTTPS with
-an auto-generated self-signed cert by default.
+browser softphone) relays signalling. Runs as the unprivileged user mdd; starts and stops the
+per-line engine units through mdd-enginectl (engine.py) and talks to Asterisk over AMI
+(ami.py). HTTPS with an auto-generated self-signed cert by default.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
-from . import store, engine, egress, operations, gate
+from . import store, engine, egress, gate
 from . import state as app_state
 from . import tasks as app_tasks
 from .routers import auth as auth_routes
@@ -64,10 +64,8 @@ def _host_alert_summary(alerts: list[dict]) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if operations.container_stack_enabled():
-        await asyncio.to_thread(operations.settle_container_service_restart)
     store.init()
-    # An upgrade from an older/self-use build may inherit more than five running containers.
+    # A saved configuration may hold more lines than the current limit (settings.max_lines).
     # Keep every saved record, but stop excess engines before background recovery begins.
     for saved_line in cfg.list_instances():
         iid = str(saved_line.get("id") or "")
@@ -84,23 +82,22 @@ async def lifespan(app: FastAPI):
     poller = asyncio.create_task(app_tasks.status_poller())
     monitor = asyncio.create_task(app_tasks.card_monitor())
     host_poller = asyncio.create_task(app_tasks.host_health_poller())
-    media_task = asyncio.create_task(app_tasks.media_supervisor())
     yield
     poller.cancel()
     monitor.cancel()
     host_poller.cancel()
-    media_task.cancel()
     # Reap the cancelled tasks (the monitor may be parked in a to_thread wait for up to
     # its timeout; awaiting keeps shutdown deterministic instead of leaking the error).
-    await asyncio.gather(poller, monitor, host_poller, media_task,
-                         return_exceptions=True)
+    await asyncio.gather(poller, monitor, host_poller, return_exceptions=True)
     await app_state.hub.runtime.close()
     for c in app_state.hub.ami.values():
         await c.close()
-    await asyncio.to_thread(engine.close_client)
 
 
-app = FastAPI(title="MDD Sim Gateway", lifespan=lifespan)
+# No /docs, /redoc or /openapi.json: they sit outside /api/, where the gate lets anyone
+# through, and would hand out the whole API surface (SLIM_PLAN P-1).
+app = FastAPI(title="MDD Sim Gateway", lifespan=lifespan, docs_url=None, redoc_url=None,
+              openapi_url=None)
 
 # Authentication for every API request and WebSocket handshake; see gate.py.
 app.add_middleware(gate.Gate)

@@ -1,6 +1,5 @@
 import tempfile
 import unittest
-import yaml
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,17 +16,32 @@ class ProductBoundaryTests(unittest.TestCase):
         )
         return temp, paths
 
+    def test_the_ceiling_is_two_and_the_default_one(self):
+        # A source-level ceiling: no setting can turn the gateway into a bulk-SIM service.
+        self.assertEqual(config.PRODUCT_MAX_LINES, 2)
+        self.assertEqual(config.DEFAULT_MAX_LINES, 1)
+        self.assertEqual(config.DEFAULTS["settings"]["max_lines"], 1)
+        for raw, expected in ((None, 1), (1, 1), (2, 2), (3, 2), (10, 2), (0, 1), (-1, 1),
+                              ("2", 2), ("x", 1)):
+            settings = {} if raw is None else {"max_lines": raw}
+            with self.subTest(raw=raw):
+                self.assertEqual(config.max_lines(settings), expected)
+
     def test_line_past_the_limit_is_refused_but_existing_lines_remain_editable(self):
-        self.assertEqual(config.MAX_SIM_LINES, 10)
         temp, paths = self.temp_config()
         with temp, paths:
-            for iid in range(1, config.MAX_SIM_LINES + 1):
-                config.upsert_instance({"id": str(iid), "name": f"SIM {iid}"})
-            extra = str(config.MAX_SIM_LINES + 1)
+            config.upsert_instance({"id": "1", "name": "SIM 1"})
             with self.assertRaises(config.LineLimitError):
-                config.upsert_instance({"id": extra, "name": f"SIM {extra}"})
-            edited = config.upsert_instance({"id": "5", "name": "kept"})
-            self.assertEqual(edited["name"], "kept")
+                config.upsert_instance({"id": "2", "name": "SIM 2"})
+            self.assertEqual(config.upsert_instance({"id": "1", "name": "kept"})["name"], "kept")
+            config.update_settings({"max_lines": 2})
+            config.upsert_instance({"id": "2", "name": "SIM 2"})
+            with self.assertRaises(config.LineLimitError):
+                config.upsert_instance({"id": "3", "name": "SIM 3"})
+            # Even a hand-edited setting above the ceiling allows no more than two.
+            config.update_settings({"max_lines": 10})
+            with self.assertRaises(config.LineLimitError):
+                config.upsert_instance({"id": "3", "name": "SIM 3"})
 
     def test_stale_remote_controls_are_removed_on_load_and_save(self):
         temp, paths = self.temp_config()
@@ -56,16 +70,16 @@ class ProductBoundaryTests(unittest.TestCase):
             self.assertEqual(config.load()["settings"]["feishu"]["channels"], [])
 
 
-    def test_only_the_first_legacy_lines_up_to_the_limit_are_startable(self):
+    def test_only_the_first_lines_up_to_the_limit_are_startable(self):
         temp, paths = self.temp_config()
-        limit = config.MAX_SIM_LINES
         with temp, paths:
-            config.save({"instances": {
-                str(iid): {"id": str(iid), "index": iid}
-                for iid in range(1, limit + 3)
-            }})
-            self.assertTrue(config.line_allowed(str(limit)))
-            self.assertFalse(config.line_allowed(str(limit + 1)))
+            config.save({"settings": {}, "instances": {
+                str(iid): {"id": str(iid), "index": iid} for iid in range(1, 5)}})
+            self.assertTrue(config.line_allowed("1"))
+            self.assertFalse(config.line_allowed("2"))
+            config.update_settings({"max_lines": 2})
+            self.assertTrue(config.line_allowed("2"))
+            self.assertFalse(config.line_allowed("3"))
 
 
 if __name__ == "__main__":

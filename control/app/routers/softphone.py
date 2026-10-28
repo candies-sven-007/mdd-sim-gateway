@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 
-import docker
 from fastapi import WebSocket, HTTPException, Request, APIRouter
 
 from .. import config as cfg
@@ -14,15 +13,6 @@ from .. import state as app_state
 
 log = logging.getLogger("vowifi.main")
 router = APIRouter()
-
-
-def _line_media_report(iid: str) -> dict:
-    """The engine's own report on its media interface (engine/entrypoint.sh), relay mode."""
-    return engine.read_run_json(iid, "media.json") or {}
-
-
-def _line_media_state(iid: str) -> str:
-    return str(_line_media_report(iid).get("state") or "starting")
 
 
 # ----------------------------- Calls -----------------------------
@@ -87,13 +77,8 @@ def api_softphone(iid: str, request: Request):
     sip = inst.get("sip", {}) or {}
     wr = sip.get("webrtc", {}) or {}
     host = (request.headers.get("host") or "").split(":")[0] or request.url.hostname
-    # Media: nothing in direct mode (the engine's published RTP ports); in relay mode the TURN
-    # relay with fresh credentials, which clients re-read before every call. The relay is
-    # named by the host the client reached this API by, unless the operator set another.
+    # Media needs nothing: the line's RTP range is reachable on the host's LAN address.
     media_prov = media.provisioning(str(iid), request.url.hostname or host)
-    if media_prov["media_mode"] == media.RELAY:
-        media_prov["relay_ready"] = bool(media_prov["relay_ready"]) and \
-            _line_media_state(str(iid)) == "ready"
     return {
         "enabled": bool(wr.get("enable", True)),
         "username": wr.get("username", "webrtc"),
@@ -108,36 +93,8 @@ def api_softphone(iid: str, request: Request):
 
 @router.get("/api/media")
 def api_media():
-    """The media mode and the relay's state, for display. The mode is switched by the
-    installer (install.sh media), since it rebuilds every line."""
-    state = media.load_state()
-    current = media.mode(state)
-    result = {"mode": current, "relay": media.relay_status()}
-    if current == media.RELAY:
-        lines, line_filters = {}, {}
-        for iid in (str(inst["id"]) for inst in cfg.list_instances()):
-            line_mode = engine.media_mode_of(iid)
-            if line_mode == media.RELAY_PENDING:
-                lines[iid] = "no_media_network"
-            elif line_mode == media.RELAY:
-                report = _line_media_report(iid)
-                lines[iid] = str(report.get("state") or "starting")
-                # What the engine actually loaded; absent from engines older than the
-                # iptables-legacy fallback, and while the line is still starting.
-                line_filters[iid] = str(report.get("filter") or "")
-        kind = media.recorded_filter(state)
-        result.update({
-            "port": state.get("port"),
-            "public_host": state.get("public_host") or "",
-            "public_port": state.get("public_port"),
-            "lines": lines,
-            # The engines' media filter, as probed when relay mode was enabled, and whether it
-            # tells the browser leg from the IMS leg (iptables-legacy goes by port only).
-            "filter": kind,
-            "filter_separates_legs": media.filter_separates_legs(kind),
-            "line_filters": line_filters,
-        })
-    return result
+    """The media mode, for display. Direct is the only one left."""
+    return {"mode": media.mode()}
 
 
 @router.websocket("/api/instances/{iid}/softphone/ws")
@@ -153,8 +110,8 @@ async def ws_softphone(ws: WebSocket, iid: str):
         await ws.close(code=1008)
         return
     try:
-        runtime = await asyncio.to_thread(engine.container_runtime, str(iid))
-    except docker.errors.DockerException as exc:
+        runtime = await asyncio.to_thread(engine.unit_runtime, str(iid))
+    except Exception as exc:  # noqa: BLE001 - an id outside 1-10, or systemctl unavailable
         log.warning("softphone relay: cannot inspect engine %s: %s", iid, exc)
         await ws.close(code=1013)
         return

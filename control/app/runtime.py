@@ -1,84 +1,72 @@
-"""Event-backed cache of engine container runtime state.
+"""Cache of each line's engine runtime, kept fresh from systemd.
 
-The status poller used to inspect each container every four seconds. Docker already publishes
-authoritative lifecycle events, so keep a small cache hot from those events and retain a slow
-inspect as a self-healing fallback when the event stream disconnects or an event is missed.
+One ``systemctl show`` for every configured line every POLL_SECONDS replaces the Docker event
+stream: it needs no privileges and costs one short-lived process. A change of state or of
+generation (systemd's InvocationID, new on every start) is reported to ``on_change`` the way
+Docker events used to be, so a restart systemd performed on its own is still noticed.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import threading
 import time
 from collections.abc import Awaitable, Callable
 
-import docker
-
+from . import config as cfg
 from . import engine
 
 log = logging.getLogger("mdd.runtime")
 
-EVENT_CACHE_SECONDS = 60.0
-FALLBACK_CACHE_SECONDS = 4.0
-_STOP_ACTIONS = {"die", "destroy", "kill", "stop"}
-_START_ACTIONS = {"start", "restart", "unpause"}
+POLL_SECONDS = 3.0
+# A cached entry older than this is inspected again on demand (the poller normally refreshes
+# it long before).
+CACHE_SECONDS = 2 * POLL_SECONDS
+
+
+def _configured_lines() -> list[str]:
+    found = []
+    for inst in cfg.list_instances():
+        iid = str(inst.get("id") or "")
+        try:
+            engine.line_number(iid)
+        except ValueError:
+            continue
+        found.append(iid)
+    return found
 
 
 class RuntimeRegistry:
-    def __init__(self, inspector=engine.container_runtime):
+    def __init__(self, inspector=engine.unit_runtime, batch=engine.units_runtime,
+                 lines=_configured_lines):
         self._inspector = inspector
+        self._batch = batch
+        self._lines = lines
         self._cache: dict[str, dict] = {}
         self._locks: dict[str, asyncio.Lock] = {}
-        self._queue: asyncio.Queue[dict] = asyncio.Queue()
-        self._processor: asyncio.Task | None = None
-        self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
-        self._stream_lock = threading.Lock()
-        self._event_client = None
-        self._event_stream = None
+        self._poller: asyncio.Task | None = None
         self._on_change: Callable[[str, dict, str], Awaitable[None]] | None = None
-        self.events_connected = False
 
     async def start(self, on_change=None) -> None:
-        if self._thread and self._thread.is_alive():
+        if self._poller and not self._poller.done():
             return
         self._on_change = on_change
-        self._stop.clear()
-        loop = asyncio.get_running_loop()
-        self._processor = asyncio.create_task(self._process_events())
-        self._thread = threading.Thread(
-            target=self._watch_events, args=(loop,), name="mdd-docker-events", daemon=True)
-        self._thread.start()
+        self._poller = asyncio.create_task(self._poll_forever())
 
     async def close(self) -> None:
-        self._stop.set()
-        with self._stream_lock:
-            stream, client = self._event_stream, self._event_client
-        for value in (stream, client):
-            if value is not None:
-                try:
-                    await asyncio.to_thread(value.close)
-                except Exception:
-                    pass
-        if self._processor:
-            self._processor.cancel()
-            await asyncio.gather(self._processor, return_exceptions=True)
-            self._processor = None
-        if self._thread:
-            await asyncio.to_thread(self._thread.join, 2.0)
-            self._thread = None
-        self.events_connected = False
+        if self._poller:
+            self._poller.cancel()
+            await asyncio.gather(self._poller, return_exceptions=True)
+            self._poller = None
 
     async def get(self, iid: str, force: bool = False) -> dict:
         iid = str(iid)
-        max_age = EVENT_CACHE_SECONDS if self.events_connected else FALLBACK_CACHE_SECONDS
         cached = self._cache.get(iid)
-        if not force and cached and time.monotonic() - cached["observed_at"] < max_age:
+        if not force and cached and time.monotonic() - cached["observed_at"] < CACHE_SECONDS:
             return dict(cached)
         lock = self._locks.setdefault(iid, asyncio.Lock())
         async with lock:
             cached = self._cache.get(iid)
-            if not force and cached and time.monotonic() - cached["observed_at"] < max_age:
+            if not force and cached and time.monotonic() - cached["observed_at"] < CACHE_SECONDS:
                 return dict(cached)
             runtime = await asyncio.to_thread(self._inspector, iid)
             runtime = {**runtime, "observed_at": time.monotonic()}
@@ -88,72 +76,31 @@ class RuntimeRegistry:
     def invalidate(self, iid: str) -> None:
         self._cache.pop(str(iid), None)
 
-    async def handle_event(self, event: dict) -> None:
-        """Apply one decoded Docker event. Public for deterministic unit testing."""
-        actor = event.get("Actor") or {}
-        attrs = actor.get("Attributes") or {}
-        name = str(attrs.get("name") or "")
-        prefix = "mdd-sim-gateway-engine-"
-        if not name.startswith(prefix):
+    async def poll_once(self) -> None:
+        """Refresh every configured line and report what changed. Public for tests."""
+        iids = self._lines()
+        if not iids:
             return
-        iid = name[len(prefix):]
-        action = str(event.get("Action") or event.get("status") or "").lower()
-        if action in _STOP_ACTIONS:
-            # Keep the same keys an inspect returns; callers read restart_count unconditionally.
-            runtime = {"running": False, "ip": None,
-                       "container_id": event.get("id") or actor.get("ID"),
-                       "restart_count": int((self._cache.get(iid) or {}).get("restart_count") or 0),
-                       "started_at": str((self._cache.get(iid) or {}).get("started_at") or ""),
-                       "observed_at": time.monotonic()}
-            self._cache[iid] = runtime
-        elif action in _START_ACTIONS:
-            runtime = await self.get(iid, force=True)
-        else:
-            return
-        if self._on_change:
-            await self._on_change(iid, dict(runtime), action)
+        observed = await asyncio.to_thread(self._batch, iids)
+        now = time.monotonic()
+        for iid in iids:
+            runtime = observed.get(iid)
+            if runtime is None:
+                continue
+            previous = self._cache.get(iid)
+            self._cache[iid] = {**runtime, "observed_at": now}
+            if previous is None:
+                continue
+            changed = (bool(previous.get("running")) != bool(runtime.get("running"))
+                       or previous.get("generation") != runtime.get("generation"))
+            if changed and self._on_change:
+                action = "start" if runtime.get("running") else "die"
+                await self._on_change(iid, dict(self._cache[iid]), action)
 
-    async def _process_events(self) -> None:
+    async def _poll_forever(self) -> None:
         while True:
-            event = await self._queue.get()
             try:
-                await self.handle_event(event)
-            except Exception as exc:  # noqa
-                log.warning("Docker event handling failed: %s", exc)
-
-    def _watch_events(self, loop: asyncio.AbstractEventLoop) -> None:
-        backoff = 2.0
-        while not self._stop.is_set():
-            client = stream = None
-            connected_at = time.monotonic()
-            try:
-                # This is a deliberately idle streaming request; a finite HTTP read timeout
-                # would tear down a perfectly healthy connection whenever no container changed.
-                client = docker.from_env(timeout=None)
-                stream = client.events(decode=True, filters={
-                    "type": "container", "label": f"{engine.MANAGED_LABEL}=true"})
-                with self._stream_lock:
-                    self._event_client, self._event_stream = client, stream
-                self.events_connected = True
-                for event in stream:
-                    if self._stop.is_set():
-                        break
-                    loop.call_soon_threadsafe(self._queue.put_nowait, event)
-            except Exception as exc:  # noqa
-                if not self._stop.is_set():
-                    log.warning("Docker event stream disconnected: %s", exc)
-            finally:
-                self.events_connected = False
-                with self._stream_lock:
-                    self._event_client = self._event_stream = None
-                for value in (stream, client):
-                    if value is not None:
-                        try:
-                            value.close()
-                        except Exception:
-                            pass
-            if time.monotonic() - connected_at > 30:
-                backoff = 2.0
-            elif not self._stop.is_set():
-                backoff = min(30.0, backoff * 2)
-            self._stop.wait(backoff)
+                await self.poll_once()
+            except Exception as exc:  # noqa: BLE001 - the next pass retries
+                log.warning("engine state poll failed: %s", exc)
+            await asyncio.sleep(POLL_SECONDS)

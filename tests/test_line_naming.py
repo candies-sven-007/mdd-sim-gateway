@@ -27,6 +27,8 @@ class TempConfig:
         self._patch = patch.multiple(config, DATA_DIR=root,
                                      CONFIG_PATH=str(Path(root) / "config.yaml"))
         self._patch.start()
+        # Naming is about telling lines apart, so these tests need room for two.
+        config.update_settings({"max_lines": config.PRODUCT_MAX_LINES})
         return self
 
     def __exit__(self, *exc):
@@ -62,10 +64,12 @@ class UniquenessTests(unittest.TestCase):
             # Same carrier AND same last four digits — rare, but only four digits exist.
             second = config.upsert_instance({"id": "2", "name": "234-10-4409"},
                                             unique_name=True)
-            third = config.upsert_instance({"id": "3", "name": "234-10-4409"},
-                                           unique_name=True)
         self.assertEqual(second["name"], "234-10-4409 (2)")
-        self.assertEqual(third["name"], "234-10-4409 (3)")
+        # A third line no longer fits under the line ceiling; the suffix keeps counting.
+        data = {"instances": {"1": {"id": "1", "name": "234-10-4409"},
+                              "2": {"id": "2", "name": "234-10-4409 (2)"}}}
+        self.assertEqual(config._free_instance_name(data, "234-10-4409", "3"),
+                         "234-10-4409 (3)")
 
     def test_suffixing_ignores_case_the_way_the_bot_matches_names(self):
         with TempConfig() as cfg_temp:

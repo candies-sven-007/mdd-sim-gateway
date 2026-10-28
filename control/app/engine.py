@@ -1,31 +1,28 @@
 """
-engine.py - Per-SIM engine container lifecycle via the Docker SDK.
+engine.py - per-line engine lifecycle through systemd (docs/SLIM_PLAN.md section 12).
 
-Each instance runs one `mdd-sim-gateway/engine` container that owns its ePDG tunnel + Asterisk.
-The manager renders instance.json, starts/stops/recreates the container with the right
-mounts/caps/ports, and reads the engine's runtime status files (bind-mounted run dir):
-the swu_ike daemon publishes swu_status.json {state: CONNECTED} for tunnel state.
+Each line N runs ``mdd-engine@N.service`` in network namespace ``mdd-N``; it owns the line's
+ePDG tunnel and Asterisk. The control plane is not root: it starts and stops engines only
+through ``sudo -n /usr/local/sbin/mdd-enginectl``, and reads their state with ``systemctl show``
+and their output with ``journalctl``, neither of which needs privileges. The engine reaches
+the control plane at 10.88.N.1, and the control plane reaches the engine's AMI, softphone
+WebSocket and Asterisk control socket at 10.88.N.2 or in the line's run directory.
 
-PC/SC: engine containers are pcscd CLIENTS — they mount the HOST pcscd socket (/run/pcscd).
-The pcsc-lite client library in the engine image is pinned to the SAME version as the host
-pcscd (Dockerfile PCSC_VERSION == install.sh PCSC_VERSION) so client/server protocol matches.
+PC/SC: engines are clients of the host pcscd (/run/pcscd), built from the same pcsc-lite.
 """
 from __future__ import annotations
 
-from datetime import datetime
-import ipaddress
 import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
+from datetime import datetime
 
-import docker
-
-from . import config as cfg, egress, media, rtp_forward, sysinfo
-from .egress_contract import ENGINE_LABEL
+from . import config as cfg, egress, sysinfo
 
 log = logging.getLogger("mdd.engine")
 
@@ -36,7 +33,7 @@ LIFECYCLE_RECORDS = 500
 LIFECYCLE_EVENTS = {
     "recovery_scheduled", "recovery_blocked", "recovery_started", "recovery_failed",
     "recovery_succeeded", "recovery_cancelled", "vowifi_disabled",
-    # Docker's restart policy restarted the engine without the manager asking it to, i.e. the
+    # systemd restarted the engine without the manager asking it to (Restart=always), i.e. the
     # engine process died on its own. reason_code carries how it left (engine_exit /
     # engine_signal / unknown) as reported by the entrypoint supervisor.
     "engine_restarted",
@@ -44,8 +41,6 @@ LIFECYCLE_EVENTS = {
     # reason_code carries the closed code (no_card / pin_required / pin_invalid /
     # card_mismatch / card_unreadable); the ICCID itself never enters this public record.
     "preflight_blocked",
-    # Rebuilt because the gateway's media mode changed; reason_code is the new mode.
-    "media_mode_rebuild",
 }
 _LIFECYCLE_REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _LIFECYCLE_INSTANCE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -54,7 +49,7 @@ _lifecycle_jsonl_lock = threading.Lock()
 # Asterisk writes colour escapes even when captured to a file; strip them so the stored
 # record stays greppable.
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
-# Lines worth keeping from a container that is about to be destroyed: the IMS registration
+# Lines worth keeping from an engine that is about to be restarted: the IMS registration
 # exchange and the reasons Asterisk gives for not completing it. Matching on words such as
 # "registration" or the endpoint name pulls in DEBUG chatter instead — nearly every debug
 # line names res_pjsip_outbound_registration.c — which then crowds the real evidence out of
@@ -71,126 +66,81 @@ _SIP_EVIDENCE = re.compile(
 _DEBUG_LINE = re.compile(r"\bDEBUG\b")
 _DISPLAY_TIMESTAMP = re.compile(
     r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4}\] ")
-_DOCKER_TIMESTAMP = re.compile(
-    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2}) (.*)$")
+# journalctl -o short-iso: "2026-08-07T11:17:18+0800 host entrypoint.sh[42]: message".
+_JOURNAL_LINE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})([+-]\d{4}) \S+ [^:]+: ?(.*)$")
 _ASTERISK_TIMESTAMP = re.compile(r"^\[[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\]\s*")
 # Enough to cover a full REGISTER exchange plus the failures around it.
 SIP_EVIDENCE_LINES = 40
 
 DATA_DIR = cfg.DATA_DIR
-IMAGE = os.environ.get("MDD_ENGINE_IMAGE", "mdd-sim-gateway/engine")
-PCSCD_SOCK = os.environ.get("MDD_PCSCD_DIR", "/run/pcscd")
-# Absolute host path to the project data dir (needed for bind mounts when the manager
-# itself runs in a container; defaults to DATA_DIR on the host).
-HOST_DATA_DIR = os.environ.get("MDD_HOST_DATA", DATA_DIR)
-# Container-native deployments share their own pcscd directory and Docker network.
-# The mount source is a Docker-host path, distinct from Control's client socket path.
-HOST_PCSCD_DIR = os.environ.get("MDD_HOST_PCSCD_DIR", PCSCD_SOCK)
-PCSCD_VOLUME = os.environ.get("MDD_PCSCD_VOLUME", "").strip()
-ENGINE_NETWORK = os.environ.get("MDD_ENGINE_NETWORK", "").strip()
-DIRECT_NETWORK = os.environ.get("MDD_ENGINE_DIRECT_NETWORK", "").strip()
-MANAGED_LABEL = "io.mdd-sim-gateway.managed"
+ENGINECTL = os.environ.get("MDD_ENGINECTL", "/usr/local/sbin/mdd-enginectl")
+ASTERISK = os.environ.get("MDD_ASTERISK", "/opt/mdd/current/asterisk/sbin/asterisk")
+MAX_LINE = 10
+ENGINECTL_TIMEOUT = 90
+QUERY_TIMEOUT = 10
+CLI_TIMEOUT = 5
+SHOW_PROPERTIES = ("ActiveState", "SubState", "MainPID", "NRestarts", "InvocationID",
+                   "ActiveEnterTimestamp", "ExecMainCode", "ExecMainStatus")
 
 
-def _owned(container) -> bool:
-    labels = (container.attrs.get("Config") or {}).get("Labels") or {}
-    image = str((container.attrs.get("Config") or {}).get("Image") or "")
-    return labels.get(MANAGED_LABEL) == "true" or image.startswith("mdd-sim-gateway/")
+def line_number(iid) -> int:
+    """1-10, the only ids an engine unit, a namespace and an address exist for."""
+    text = str(iid)
+    if not re.fullmatch(r"[1-9][0-9]?", text) or int(text) > MAX_LINE:
+        raise ValueError(f"line id must be 1-{MAX_LINE}")
+    return int(text)
 
 
-_docker_client = None
-_docker_client_lock = threading.Lock()
+def unit_name(iid) -> str:
+    return f"mdd-engine@{line_number(iid)}.service"
 
 
-def _client():
-    """Reuse the Docker HTTP connection pool instead of rebuilding it on every status sample."""
-    global _docker_client
-    if _docker_client is None:
-        with _docker_client_lock:
-            if _docker_client is None:
-                _docker_client = docker.from_env(timeout=30)
-    return _docker_client
+def engine_address(iid) -> str:
+    """The line's address inside its namespace (host/mdd_netns.Line.ns_addr)."""
+    return f"10.88.{line_number(iid)}.2"
 
 
-def close_client():
-    """Release the shared Docker client during control-plane shutdown."""
-    global _docker_client
-    with _docker_client_lock:
-        client, _docker_client = _docker_client, None
-    if client is not None:
-        try:
-            client.close()
-        except Exception:
-            pass
+def manager_address(iid) -> str:
+    """The host's end of the line's veth, where the engine reaches the control plane."""
+    return f"10.88.{line_number(iid)}.1"
 
 
-def container_name(iid: str) -> str:
-    return f"mdd-sim-gateway-engine-{iid}"
-
-
-_internal_networks: dict[str, bool] = {}
-
-
-def _engine_network_is_internal(client) -> bool:
-    """Whether the Engine network is internal (the container stack's is). Docker publishes no
-    port of a container that is only on internal networks."""
-    if not ENGINE_NETWORK:
-        return False
-    if ENGINE_NETWORK not in _internal_networks:
-        attrs = client.networks.get(ENGINE_NETWORK).attrs or {}
-        _internal_networks[ENGINE_NETWORK] = bool(attrs.get("Internal"))
-    return _internal_networks[ENGINE_NETWORK]
-
-
-def _engine_network_subnet(client) -> str:
-    """The Engine network's IPv4 subnet, or "" when there is none or it cannot be read.
-
-    The relay (softphone_ws) reaches each engine on this network, but a line going direct also
-    joins the uplink, which then holds the default route, and the engine's own address probe
-    lands there (#195). The engine binds its softphone listener inside this subnet instead."""
-    if not ENGINE_NETWORK:
-        return ""
+def _enginectl(action: str, iid) -> None:
+    """The one privileged operation: ask mdd-enginectl to act on a line's unit."""
+    command = ["sudo", "-n", ENGINECTL, action, str(line_number(iid))]
     try:
-        for entry in ((client.networks.get(ENGINE_NETWORK).attrs or {}).get("IPAM")
-                      or {}).get("Config") or []:
-            subnet = ipaddress.ip_network(entry.get("Subnet") or "")
-            if subnet.version == 4:
-                return str(subnet)
-    except Exception as exc:  # noqa: BLE001 - the engine falls back to its probed address
-        log.warning("engine network %s subnet unreadable: %s", ENGINE_NETWORK, exc)
-    return ""
+        result = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=ENGINECTL_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"mdd-enginectl {action} {iid} failed: {exc}") from exc
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "").strip()[:300]
+        raise RuntimeError(f"mdd-enginectl {action} {iid} failed: {detail}")
 
 
-def reconcile_rtp_forward(client=None, exclude: str = "") -> None:
-    """Keep the RTP forwarder (rtp_forward.py) in step with the lines behind an exit. Best
-    effort: a line's registration and SMS never depend on it."""
-    if not ENGINE_NETWORK:
-        return
+def _private_group_dir(path: str, mode: int) -> None:
+    """A line directory the engine (root, group mdd, no CAP_DAC_OVERRIDE) can use."""
+    os.makedirs(path, mode=mode, exist_ok=True)
     try:
-        client = client or _client()
-        if not _engine_network_is_internal(client):
-            return
-        configured = {container_name(str(inst["id"])) for inst in cfg.list_instances()
-                      if inst.get("id") is not None and inst.get("enabled", True)}
-        rtp_forward.reconcile(client, ENGINE_NETWORK, configured, exclude)
-    except Exception as exc:  # noqa: BLE001 - retried by the media supervisor
-        log.warning("RTP forwarder not updated: %s", exc)
+        os.chmod(path, mode)
+    except PermissionError:
+        pass    # created by the engine; already group-writable through its UMask
 
 
-def _instance_paths(iid: str):
+def _instance_paths(iid: str) -> str:
     base = os.path.join(DATA_DIR, "instances", str(iid))
-    host_base = os.path.join(HOST_DATA_DIR, "instances", str(iid))
-    os.makedirs(os.path.join(base, "run"), exist_ok=True)
-    os.makedirs(os.path.join(base, "logs"), exist_ok=True)
-    return base, host_base
+    for path in (base, os.path.join(base, "run"), os.path.join(base, "logs")):
+        _private_group_dir(path, 0o770)
+    return base
 
 
 def _clear_runtime_state(base: str):
     """Remove observations owned by the previous engine process.
 
-    Runtime files are bind-mounted outside the container and therefore survive a container
-    recreation.  Keeping an old CONNECTED marker makes the new process look online before it
-    has completed IKE and IMS registration.
+    Runtime files live in the line's directory and therefore survive an engine restart.
+    Keeping an old CONNECTED marker makes the new process look online before it has completed
+    IKE and IMS registration.
     """
     run_dir = os.path.join(base, "run")
     for name in ("swu_status.json", "pcscf", "pcscf.applied", "pin_status.json",
@@ -233,9 +183,9 @@ def ike_evidence(iid: str) -> dict:
     """Retransmit/timeout counts for one line, without building a whole diagnostic snapshot.
 
     The failover policy needs to know whether the tunnel's own signalling was answered; it
-    runs on the freeze path, where reading the container's logs would be far too heavy.
+    runs on the freeze path, where reading the engine's journal would be far too heavy.
     """
-    base, _host_base = _instance_paths(str(iid))
+    base = _instance_paths(str(iid))
     return _charon_evidence(base)
 
 
@@ -264,7 +214,7 @@ def registration_failure_evidence(log_tail: str) -> dict:
 
 
 def _sip_evidence(raw: str) -> list[str]:
-    """Keep the SIP protocol lines and registration failures from a container log."""
+    """Keep the SIP protocol lines and registration failures from an engine log."""
     kept = []
     for line in raw.splitlines():
         line = _ANSI.sub("", line).rstrip()
@@ -370,12 +320,12 @@ def record_lifecycle(iid: str, event: str, *, reason_code: str = "", **facts) ->
 
 
 def capture_diagnostics(iid: str, inst: dict, base: str, reason: str):
-    """Persist the evidence that recreating the container is about to destroy.
+    """Persist the evidence that restarting the engine is about to destroy.
 
-    Container logs and Asterisk's live registration view disappear with ``remove()``. A line
-    stuck in the health policy's rebuild loop destroys its own evidence every couple of
-    minutes, which is precisely when that evidence is needed. Never raises: a failed capture
-    must not block the rebuild it is documenting.
+    Asterisk's live registration view disappears with the process, and the journal keeps only
+    a bounded tail. A line stuck in the health policy's rebuild loop destroys its own evidence
+    every couple of minutes, which is precisely when that evidence is needed. Never raises: a
+    failed capture must not block the rebuild it is documenting.
     """
     try:
         record = {"ts": int(time.time()), "instance": str(iid), "reason": reason,
@@ -401,263 +351,72 @@ def capture_diagnostics(iid: str, inst: dict, base: str, reason: str):
         log.warning("diagnostic capture failed for instance %s: %s", iid, exc)
 
 
-def _names_a_registry(reference: str) -> bool:
-    """Whether pulling this reference would reach a registry rather than a local build.
-
-    Docker treats the first segment as a registry host only when it contains a dot or a
-    colon. ``mdd-sim-gateway/engine`` is the tag a host-assisted install builds locally;
-    pulling it would ask Docker Hub for a repository that does not exist, turning a clear
-    "the image was never built" into a confusing registry error.
-    """
-    head, _, rest = reference.partition("/")
-    return bool(rest) and ("." in head or ":" in head or head == "localhost")
-
-
-def ensure_image(client, reference: str = "") -> object:
-    """The Engine image, fetched once when this deployment names a registry copy.
-
-    Compose knows only the three base services. ``MDD_ENGINE_IMAGE`` is an environment
-    variable of the Control service, so neither Compose nor the container manager ever
-    fetches the Engine image, and nothing else does either: the container update helper
-    imports release archives instead. Without this, a container deployment comes up with
-    three healthy base services and every line failing on ImageNotFound.
-    """
-    reference = reference or IMAGE
-    try:
-        return client.images.get(reference)
-    except docker.errors.ImageNotFound:
-        if not _names_a_registry(reference):
-            raise
-    log.info("engine image %s is absent; fetching it once", reference)
-    client.images.pull(reference)
-    return client.images.get(reference)
-
-
 def start(inst: dict, settings: dict, dev_mounts: bool = False, reason: str = "rebuild"):
-    """(Re)create and start the engine container for an instance."""
-    if ENGINE_NETWORK in {"host", "none"}:
-        raise ValueError("MDD_ENGINE_NETWORK must be a Docker bridge network")
-    if DIRECT_NETWORK in {"host", "none"} or (DIRECT_NETWORK and DIRECT_NETWORK == ENGINE_NETWORK):
-        raise ValueError("MDD_ENGINE_DIRECT_NETWORK must be a separate Docker bridge network")
-    network_options = {"network": ENGINE_NETWORK} if ENGINE_NETWORK else {}
-    engine_sysctls = {
-        # These six settings predate the full-container runtime and remain part of the native
-        # Pi Engine isolation policy.
-        "net.ipv6.conf.all.accept_ra": "0",
-        "net.ipv6.conf.default.accept_ra": "0",
-        "net.ipv6.conf.all.autoconf": "0",
-        "net.ipv6.conf.default.autoconf": "0",
-        "net.ipv6.conf.all.use_tempaddr": "0",
-        "net.ipv6.conf.default.use_tempaddr": "0",
-    }
-    if ENGINE_NETWORK:
-        # Docker disables IPv6 inside containers attached only to an IPv4 bridge. Many IMS
-        # PDNs assign only an IPv6 inner address and P-CSCF, so container mode re-enables it.
-        engine_sysctls.update({
-            "net.ipv6.conf.all.disable_ipv6": "0",
-            "net.ipv6.conf.default.disable_ipv6": "0",
-        })
+    """(Re)start a line's engine; returns the new generation (systemd InvocationID).
+
+    Everything that can refuse -- the line id, the exit, the ePDG lookup -- is settled before
+    a running engine is touched, so a refusal leaves a working line as it was.
+    """
     iid = str(inst["id"])
-    client = _client()
-    # Check readiness before replacing a working container. Host mode requires the ePDG
-    # route; container mode requires the current country's SOCKS listener and image support.
-    selected_exit = egress.ensure_line(inst, settings) or {}
-    proxy_environment = {}
-    selected_image = IMAGE
-    rendered_inst = inst
-    if selected_exit.get("transport") == "socks5":
-        if not ENGINE_NETWORK:
-            raise egress.EgressError("SOCKS egress requires MDD_ENGINE_NETWORK")
-        # Old images ignore unknown environment variables and would silently go direct.
-        # Inspect before writing configuration or removing the previous container.
-        image = ensure_image(client)
-        supported = (image.attrs.get("Config", {}).get("Labels") or {}).get(ENGINE_LABEL, "")
-        if "socks5" not in supported.split(","):
-            raise egress.EgressError("engine image does not support SOCKS egress; rebuild required")
-        selected_image = image.id
-        proxy_environment["SWU_EGRESS_PROXY"] = selected_exit["proxy_url"]
-        epdg = egress.epdg_for(inst)
-        try:
-            ipaddress.IPv4Address(epdg)
-            epdg_ip = epdg
-        except ValueError:
-            epdg_ip = egress.resolve_ipv4_via_socks(selected_exit["proxy_url"], epdg)
-        # The Engine network is internal and deliberately cannot query public DNS.
-        # Render a one-run copy with the resolved peer; the saved line keeps its hostname.
-        rendered_inst = {**inst, "epdg": epdg_ip}
-    direct_network = None
-    if not proxy_environment and DIRECT_NETWORK:
-        # Resolve this before replacing an existing Engine. A missing deployment
-        # network must not destroy a line which is already running.
-        direct_network = client.networks.get(DIRECT_NETWORK)
-    # Relay media mode: the line joins the media network and publishes nothing. None in
-    # direct mode, which leaves everything below exactly as it was.
-    media_attachment = media.engine_attachment(client)
-    if media_attachment is not None:
-        rendered_inst = {**rendered_inst, "media": media_attachment["instance"]}
-    engine_subnet = _engine_network_subnet(client)
-    if engine_subnet:
-        rendered_inst = {**rendered_inst, "engine_subnet": engine_subnet}
-    cfg.write_instance_json(rendered_inst, settings)
-    base, host_base = _instance_paths(iid)
-    ports = inst.get("ports", {})
-    # remove any existing container
-    try:
-        old = client.containers.get(container_name(iid))
-        if not _owned(old):
-            raise RuntimeError(f"refusing to replace foreign container {old.name}")
+    line_number(iid)
+    line_state = egress.ensure_line(inst, settings) or {}
+    # The engine has no DNS of its own: the ePDG goes in as an address, resolved through the
+    # line's country exit, or by the host for a direct line.
+    epdg = egress.resolve_epdg(inst, line_state)
+    rendered = {**inst, "epdg": epdg} if epdg else inst
+    base = _instance_paths(iid)
+    if is_running(iid):
         # Only a replacement destroys evidence; a first start has none to keep.
         capture_diagnostics(iid, inst, base, reason)
-        old.remove(force=True)
-    except docker.errors.NotFound:
-        pass
-
+        _enginectl("stop", iid)
     _clear_runtime_state(base)
-
-    volumes = {
-        os.path.join(host_base, "instance.json"): {"bind": "/config/instance.json", "mode": "ro"},
-        os.path.join(host_base, "logs"): {"bind": "/logs", "mode": "rw"},
-        os.path.join(host_base, "run"): {"bind": "/run/mdd-sim-gateway", "mode": "rw"},
-        (PCSCD_VOLUME or HOST_PCSCD_DIR): {"bind": "/run/pcscd", "mode": "rw"},
-    }
-    # The image has no timezone, so every engine log (IKE, Asterisk) was stamped in UTC while
-    # the timeline, the WebUI and the operator's shell read local time. Correlating a rekey or
-    # a teardown with an outage meant doing the offset in your head. Give the container the
-    # host's zone; nothing parses these timestamps, so this is display only.
-    if os.path.exists("/etc/localtime"):
-        volumes["/etc/localtime"] = {"bind": "/etc/localtime", "mode": "ro"}
-    if dev_mounts:
-        eng = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "engine")
-        for f in ["pin_keeper.py", "ami_usim.py", "render.py", "notify.py", "swu_ike.py",
-                  "log_capture.py"]:
-            volumes[os.path.join(eng, f)] = {"bind": f"/usr/local/bin/{f}", "mode": "ro"}
-        volumes[os.path.join(eng, "entrypoint.sh")] = {"bind": "/entrypoint.sh", "mode": "ro"}
-        volumes[os.path.join(eng, "templates")] = {"bind": "/opt/mdd-sim-gateway/templates", "mode": "ro"}
-
-    # No SIP signalling is published to the host. The browser softphone's WebSocket reaches
-    # Asterisk on the container's bridge address through the control surface relay
-    # (softphone_ws), and standalone SIP UDP/TCP/TLS listeners are not published either.
-    port_bindings = {}
-    # AMI grants system/command/originate. The manager dials the container bridge directly, so a
-    # host mapping is unnecessary in normal operation and costs another docker-proxy. Keep the
-    # loopback-only mapping as an explicit diagnostic option.
-    if (settings.get("debug") or {}).get("ami", False):
-        port_bindings[f"{5038}/tcp"] = ("127.0.0.1", ports.get("ami", 5038))
-    # RTP range. In relay mode media arrives through the relay on the media network instead.
-    # A line behind a SOCKS exit on an internal Engine network cannot publish ports: the RTP
-    # forwarder publishes its range and relays to it (rtp_forward.py).
-    forwarded = (media_attachment is None and bool(proxy_environment)
-                 and _engine_network_is_internal(client))
-    rtp_start = ports.get("rtp_start", 10000)
-    rtp_last = rtp_start + cfg.rtp_span(ports) - 1
-    if media_attachment is None and not forwarded:
-        for p in range(rtp_start, rtp_last + 1):
-            port_bindings[f"{p}/udp"] = p
-    labels = {MANAGED_LABEL: "true", "io.mdd-sim-gateway.component": "engine"}
-    if forwarded:
-        labels[rtp_forward.FORWARD_LABEL] = rtp_forward.label_value(rtp_start, rtp_last)
-    elif ENGINE_NETWORK and port_bindings:
-        # This line now publishes its own ports; the forwarder must let go of them first.
-        reconcile_rtp_forward(client, exclude=container_name(iid))
-    if media_attachment is not None:
-        labels[media.MODE_LABEL] = (media.RELAY if media_attachment.get("network") is not None
-                                    else media.RELAY_PENDING)
-
-    options = dict(
-        name=container_name(iid),
-        cap_add=["NET_ADMIN"],
-        devices=["/dev/net/tun:/dev/net/tun:rwm"],
-        volumes=volumes,
-        ports=port_bindings,
-        restart_policy={"Name": "unless-stopped"},
-        labels=labels,
-        # Asterisk is started with -g, so if it is ever killed by a signal a core lands in the
-        # container's working directory. The engine bounces observed so far report ExitCode=0
-        # with no kernel crash record, which is not what a signal death looks like — this exists
-        # so the other possibility is not silently unrecorded.
-        ulimits=[{"name": "core", "soft": -1, "hard": -1}],
-        environment={
-            "MDD_ID": iid,
-            "SWU_LIVENESS_PERIOD": str(inst.get("liveness_period", 0)),
-            "SWU_TUN_MTU": os.environ.get("SWU_TUN_MTU", "1400"),
-            **proxy_environment,
-            # How a new P-CSCF is pushed into Asterisk on reconnect: "restart" (default,
-            # Asterisk-internal cold restart) or "reload" (the old path, which crashes — see
-            # swu_apply_pcscf). Settable per line, then globally, so a line can be moved back
-            # for comparison without touching the others.
-            "SWU_PCSCF_APPLY_MODE": str(
-                inst.get("pcscf_apply_mode")
-                or (settings.get("engine") or {}).get("pcscf_apply_mode")
-                or "restart"),
-        },
-        extra_hosts={"host.docker.internal": "host-gateway"},  # so notify.py can reach the manager
-        sysctls=engine_sysctls,
-        **network_options,
-    )
-    media_network = (media_attachment or {}).get("network")
-    if media_network is None:
-        c = client.containers.run(selected_image, detach=True, **options)
-    else:
-        # The media interface must exist when the entrypoint renders Asterisk's configuration
-        # and loads its firewall, so attach it before the first start.
-        c = client.containers.create(selected_image, **options)
-        try:
-            media_network.connect(c)
-            c.start()
-        except Exception:
-            c.remove(force=True)
-            raise
-    if direct_network is not None:
-        try:
-            direct_network.connect(c)
-        except Exception:
-            c.remove(force=True)
-            raise
-    log.info("started engine container %s", c.name)
-    if forwarded:
-        reconcile_rtp_forward(client)
-    return c.id
-
-
-def stop(iid: str, expected_container_id: str | None = None):
+    cfg.write_instance_json(rendered, settings)
     try:
-        c = _client().containers.get(container_name(iid))
-        if not _owned(c):
-            raise RuntimeError(f"refusing to remove foreign container {c.name}")
-        if expected_container_id and str(c.id) != str(expected_container_id):
-            log.info("not stopping replacement engine %s (expected generation %s, found %s)",
-                     iid, expected_container_id, c.id)
-            return False
-        c.remove(force=True)
-        return True
-    except docker.errors.NotFound:
+        _enginectl("reset-failed", iid)
+    except RuntimeError:
+        pass    # nothing to reset
+    _enginectl("start", iid)
+    # The namespace exists now; tell the orchestrator so it routes the line without waiting
+    # for its next idle pass.
+    try:
+        egress.publish(settings=settings)
+    except OSError as exc:
+        log.warning("could not republish desired state after starting line %s: %s", iid, exc)
+    log.info("started engine %s", unit_name(iid))
+    return unit_runtime(iid).get("generation")
+
+
+def stop(iid: str, expected_generation: str | None = None) -> bool:
+    """Stop a line's engine. With ``expected_generation`` only that very run is stopped."""
+    runtime = unit_runtime(iid)
+    if expected_generation and str(runtime.get("generation")) != str(expected_generation):
+        log.info("not stopping replacement engine %s (expected generation %s, found %s)",
+                 iid, expected_generation, runtime.get("generation"))
         return False
+    if runtime.get("active_state") in (None, "", "inactive") and not runtime.get("running"):
+        return False
+    _enginectl("stop", iid)
+    return True
 
 
 def capture_and_stop(iid: str, inst: dict, reason: str,
-                     expected_container_id: str | None = None) -> bool:
-    """Snapshot a failing line, then remove its container.
+                     expected_generation: str | None = None) -> bool:
+    """Snapshot a failing line, then stop its engine.
 
-    The health policy gives up by stopping the container and only rebuilds it after a
-    cooldown, so by the time ``start()`` runs there is nothing left to read. This is the
-    path that destroys the evidence in practice, and it is also the exact moment worth
-    recording: the policy has just concluded the line cannot register.
+    The health policy gives up by stopping the engine and only restarts it after a cooldown,
+    so by the time ``start()`` runs there is nothing left to read. This is the path that
+    destroys the evidence in practice, and it is also the exact moment worth recording: the
+    policy has just concluded the line cannot register.
 
-    Blocking (Docker exec + log read); callers on the event loop must use a worker thread.
+    Blocking (CLI and journal reads); callers on the event loop must use a worker thread.
     """
-    if expected_container_id:
-        try:
-            current = _client().containers.get(container_name(iid))
-            if not _owned(current):
-                raise RuntimeError(f"refusing to inspect foreign container {current.name}")
-            if str(current.id) != str(expected_container_id):
-                return False
-        except docker.errors.NotFound:
+    if expected_generation:
+        if str(unit_runtime(iid).get("generation")) != str(expected_generation):
             return False
-    base, _ = _instance_paths(iid)
+    base = _instance_paths(iid)
     capture_diagnostics(iid, inst, base, reason)
-    return (stop(iid, expected_container_id=expected_container_id)
-            if expected_container_id else stop(iid))
+    return (stop(iid, expected_generation=expected_generation)
+            if expected_generation else stop(iid))
 
 
 def delete_instance_data(iid: str) -> bool:
@@ -666,66 +425,94 @@ def delete_instance_data(iid: str) -> bool:
     target = os.path.realpath(os.path.join(root, str(iid)))
     if os.path.dirname(target) != root:
         raise ValueError("invalid instance id")
+    try:
+        _enginectl("down", iid)     # the engine and the namespace
+    except (RuntimeError, ValueError) as exc:
+        log.info("line %s: no engine to take down before deleting its data: %s", iid, exc)
     if not os.path.isdir(target):
         return False
     shutil.rmtree(target)
     return True
 
 
+def parse_show(text: str) -> list[dict[str, str]]:
+    """``systemctl show`` output for one or more units, one dict per unit, in order."""
+    units, current = [], {}
+    for row in text.splitlines():
+        if not row.strip():
+            if current:
+                units.append(current)
+                current = {}
+            continue
+        key, _, value = row.partition("=")
+        current[key] = value
+    if current:
+        units.append(current)
+    return units
+
+
+def runtime_from_show(iid: str, props: dict[str, str]) -> dict:
+    active = props.get("ActiveState", "")
+    running = active == "active" and props.get("SubState", "") == "running"
+    try:
+        restarts = int(props.get("NRestarts") or 0)
+    except ValueError:
+        restarts = 0
+    return {"running": running, "ip": engine_address(iid) if running else None,
+            "generation": props.get("InvocationID") or None,
+            "restart_count": restarts,
+            "started_at": props.get("ActiveEnterTimestamp", "") if running else "",
+            "active_state": active, "sub_state": props.get("SubState", "")}
+
+
+def _stopped(iid: str) -> dict:
+    return {"running": False, "ip": None, "generation": None, "restart_count": 0,
+            "started_at": "", "active_state": "", "sub_state": ""}
+
+
+def units_runtime(iids: list[str]) -> dict[str, dict]:
+    """The runtime of several lines from one ``systemctl show`` (no privileges needed)."""
+    valid = []
+    for iid in iids:
+        try:
+            line_number(iid)
+            valid.append(str(iid))
+        except ValueError:
+            continue
+    result = {str(iid): _stopped(str(iid)) for iid in iids}
+    if not valid:
+        return result
+    command = ["systemctl", "show", "--property=" + ",".join(SHOW_PROPERTIES),
+               *[unit_name(iid) for iid in valid]]
+    try:
+        completed = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=QUERY_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("systemctl show failed: %s", exc)
+        return result
+    blocks = parse_show(completed.stdout) if completed.returncode == 0 else []
+    for iid, props in zip(valid, blocks):
+        result[iid] = runtime_from_show(iid, props)
+    return result
+
+
+def unit_runtime(iid: str) -> dict:
+    """Running state, address and generation of one line's engine."""
+    return units_runtime([str(iid)])[str(iid)]
+
+
 def is_running(iid: str) -> bool:
-    return container_runtime(iid)["running"]
-
-
-def container_runtime(iid: str) -> dict:
-    """Return running state and bridge address from one Docker inspect operation."""
-    try:
-        c = _client().containers.get(container_name(iid))
-        running = c.status == "running"
-        ip = None
-        if running:
-            networks = c.attrs.get("NetworkSettings", {}).get("Networks", {})
-            # Never the media network: the engine accepts only call media there.
-            candidates = ([networks.get(ENGINE_NETWORK, {})] if ENGINE_NETWORK
-                          else [v for k, v in networks.items() if k != media.NETWORK])
-            for network in candidates:
-                if network.get("IPAddress"):
-                    ip = network["IPAddress"]
-                    break
-        # Docker's restart policy bounces the container on its own when the engine process
-        # exits. Those bounces never reached the timeline: they resolve faster than the health
-        # policy's threshold, so no recovery is scheduled and lifecycle.jsonl stays silent while
-        # the line is in fact dropping calls for ~40s. Carry the counter so the caller can spot
-        # a bounce it did not perform itself.
-        return {"running": running, "ip": ip, "container_id": getattr(c, "id", None),
-                "restart_count": int(c.attrs.get("RestartCount") or 0),
-                "started_at": str((c.attrs.get("State") or {}).get("StartedAt") or "")}
-    except docker.errors.NotFound:
-        return {"running": False, "ip": None, "container_id": None,
-                "restart_count": 0, "started_at": ""}
-
-
-def media_mode_of(iid: str) -> str | None:
-    """The media mode a running engine was created in, or None when it is not running.
-    Containers from before relay mode existed carry no label and run in direct mode."""
-    try:
-        c = _client().containers.get(container_name(iid))
-    except docker.errors.NotFound:
-        return None
-    if c.status != "running":
-        return None
-    labels = (c.attrs.get("Config") or {}).get("Labels") or {}
-    return labels.get(media.MODE_LABEL) or media.DIRECT
+    return unit_runtime(iid)["running"]
 
 
 def last_engine_exit(iid: str) -> dict:
     """The entrypoint supervisor's last record of how Asterisk left, if any.
 
-    ``docker inspect`` reports ExitCode=0 for the engine bounces seen in the field, and the
-    kernel logged no crash — so the exit code alone cannot say whether Asterisk shut down
-    cleanly or died some other way. The supervisor writes the disposition it observed directly;
-    this reads it back.
+    The unit's exit status belongs to the supervisor script, not to Asterisk, so it cannot say
+    whether Asterisk shut down cleanly or died some other way. The supervisor writes the
+    disposition it observed directly; this reads it back.
     """
-    base, _ = _instance_paths(iid)
+    base = _instance_paths(iid)
     path = os.path.join(base, "logs", "asterisk", "supervisor.jsonl")
     try:
         for line in reversed(_tail_lines(path, 40)):
@@ -738,10 +525,6 @@ def last_engine_exit(iid: str) -> dict:
     except OSError:
         pass
     return {}
-
-
-def container_ip(iid: str) -> str | None:
-    return container_runtime(iid)["ip"]
 
 
 def read_run_json(iid: str, name: str) -> dict | None:
@@ -770,11 +553,25 @@ def tunnel_installed(iid: str) -> bool:
     return st is not None and st.get("state") == "CONNECTED"
 
 
+def control_socket(iid: str) -> str:
+    """Asterisk's control socket; asterisk.conf puts it in the line's run directory."""
+    return os.path.join(DATA_DIR, "instances", str(iid), "run", "asterisk", "asterisk.ctl")
+
+
+def _cli(iid: str, command: str, timeout: float = CLI_TIMEOUT) -> str:
+    """One Asterisk CLI command over the line's control socket. Raises on failure."""
+    completed = subprocess.run([ASTERISK, "-r", "-s", control_socket(iid), "-x", command],
+                               text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               timeout=timeout)
+    if completed.returncode:
+        raise RuntimeError((completed.stdout or "").strip()[:300] or
+                           f"asterisk exited {completed.returncode}")
+    return completed.stdout
+
+
 def exec_cli(iid: str, command: str) -> str:
     try:
-        c = _client().containers.get(container_name(iid))
-        rc, out = c.exec_run(["asterisk", "-rx", command])
-        return out.decode(errors="replace") if isinstance(out, bytes) else str(out)
+        return _cli(iid, command)
     except Exception as e:  # noqa
         return f"error: {e}"
 
@@ -785,25 +582,12 @@ def registration_state(iid: str) -> str:
     Some IMS-patched Asterisk builds accept AMI's PJSIPShowRegistrationsDetailed action but
     never complete it. Treating that management timeout as a carrier failure eventually stops
     an otherwise healthy line. The CLI is the authoritative local view and has proven reliable
-    on those same builds.
+    on those same builds. It can block behind an IMS TCP connect, hence the short timeout.
     """
-    client = None
     try:
-        # Use a short-lived client with an HTTP read timeout. Asterisk's remote CLI can block
-        # behind an IMS TCP connect; the normal shared helper intentionally has no global Docker
-        # timeout, so using it here would leave one worker thread behind on every status poll.
-        client = docker.from_env(timeout=5)
-        container = client.containers.get(container_name(iid))
-        rc, raw = container.exec_run(["asterisk", "-rx", "pjsip show registrations"])
-        output = raw.decode(errors="replace") if isinstance(raw, bytes) else str(raw)
+        output = _cli(iid, "pjsip show registrations")
     except Exception:
         return "unknown"
-    finally:
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
     if re.search(r"\bRejected\b", output, re.I):
         return "Rejected"
     if re.search(r"\bUnregistered\b", output, re.I):
@@ -813,38 +597,36 @@ def registration_state(iid: str) -> str:
     return "unknown"
 
 
-def _format_docker_logs(raw: str, local_tz=None) -> str:
-    """Render Docker's per-record UTC time in the same local format as the IKE log."""
+def _format_journal(raw: str) -> str:
+    """Render journal lines in the same local format as the IKE log."""
     rendered = []
     for line in raw.splitlines(keepends=True):
         content = line.rstrip("\r\n")
         ending = line[len(content):]
-        match = _DOCKER_TIMESTAMP.match(content)
+        match = _JOURNAL_LINE.match(content)
         if not match:
             rendered.append(line)
             continue
-        zone = "+00:00" if match.group(2) == "Z" else match.group(2)
-        event_time = datetime.fromisoformat(match.group(1) + zone)
-        event_time = event_time.astimezone(local_tz) if local_tz else event_time.astimezone()
-        message = _ASTERISK_TIMESTAMP.sub("", match.group(3), count=1)
-        rendered.append("[%s] %s%s" % (
-            event_time.strftime("%Y-%m-%d %H:%M:%S%z"), message, ending))
+        date, clock, zone, message = match.groups()
+        message = _ASTERISK_TIMESTAMP.sub("", message, count=1)
+        rendered.append(f"[{date} {clock}{zone}] {message}{ending}")
     return "".join(rendered)
 
 
 def logs(iid: str, tail: int = 200, since=None) -> str:
+    """The engine's recent output from the journal (the control plane's user is in the
+    systemd-journal group), timestamped at emission."""
     try:
-        c = _client().containers.get(container_name(iid))
-        # Docker records the emission time for every physical stdout/stderr line. Request that
-        # source timestamp rather than stamping at page-refresh time, then normalize it to the
-        # same local display format as charon.log.
-        kwargs = {"tail": tail, "timestamps": True}
+        command = ["journalctl", "-u", unit_name(iid), "-n", str(int(tail)), "-o", "short-iso",
+                   "--no-pager", "-q"]
         if since is not None:
-            # docker SDK accepts an int (unix ts) or datetime; used by the SMS delivery
-            # watcher to read only the lines emitted after a send.
-            kwargs["since"] = since
-        raw = c.logs(**kwargs).decode(errors="replace")
-        return _format_docker_logs(raw)
+            stamp = since.timestamp() if isinstance(since, datetime) else float(since)
+            command += ["--since", f"@{int(stamp)}"]
+        completed = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=QUERY_TIMEOUT)
+        if completed.returncode:
+            return f"error: {(completed.stderr or '').strip()[:300]}"
+        return _format_journal(completed.stdout)
     except Exception as e:  # noqa
         return f"error: {e}"
 

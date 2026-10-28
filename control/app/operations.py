@@ -16,7 +16,6 @@ import tarfile
 import time
 import zipfile
 
-import docker
 import yaml
 
 from . import config as cfg
@@ -176,87 +175,6 @@ SUPPORT_BUNDLE_MAX_BYTES = 10 * 1024 * 1024
 # still measured and pruned below; this budget keeps that fallback exceptional.
 SUPPORT_BUNDLE_CONTENT_BYTES = 8 * 1024 * 1024
 
-_MDD_IMAGE_PREFIXES = ("mdd-sim-gateway/", "ghcr.io/mddidd/mdd-sim-gateway-")
-_CURRENT_IMAGE_TAGS = {
-    "mdd-sim-gateway/engine:latest",
-    "mdd-sim-gateway/control:latest",
-    "mdd-sim-gateway/engine-base:trusted",
-}
-
-
-def _managed_image(image) -> bool:
-    tags = [str(tag) for tag in (getattr(image, "tags", None) or [])]
-    attrs = getattr(image, "attrs", None) or {}
-    labels = ((attrs.get("Config") or {}).get("Labels") or {})
-    return labels.get("io.mdd-sim-gateway.managed") == "true" or any(
-        tag.startswith(_MDD_IMAGE_PREFIXES) for tag in tags)
-
-
-def _image_layer_bytes(report: dict) -> int:
-    usage = report.get("ImageUsage") or {}
-    return max(0, int(usage.get("TotalSize") or report.get("LayersSize") or 0))
-
-
-def prune_old_mdd_images() -> dict:
-    """Delete unused MDD history while preserving current/base and every live container.
-
-    This is deliberately separate from automatic one-generation rollback retention: an
-    administrator invokes it when free space matters more than one-click rollback. Removing by
-    image ID with ``force=True`` drops historical aliases together, but only after the ID has
-    been excluded from every container and every stable current/base tag.
-    """
-    client = docker.from_env(timeout=30)
-    try:
-        before = _image_layer_bytes(client.df())
-        protected_ids = {
-            str(container.image.id) for container in client.containers.list(all=True)
-            if getattr(container, "image", None) is not None
-        }
-        images = client.images.list(all=True)
-        for image in images:
-            if any(tag in _CURRENT_IMAGE_TAGS for tag in (image.tags or [])):
-                protected_ids.add(str(image.id))
-        candidates = [image for image in images
-                      if _managed_image(image) and str(image.id) not in protected_ids]
-        removed = 0
-        for image in candidates:
-            client.images.remove(str(image.id), force=True, noprune=False)
-            removed += 1
-        after = _image_layer_bytes(client.df())
-    except docker.errors.DockerException as exc:
-        raise RuntimeError(f"could not remove old MDD images: {exc}") from exc
-    finally:
-        try:
-            client.close()
-        except docker.errors.DockerException:
-            pass
-    return {"ok": True, "removed_images": removed,
-            "space_reclaimed_bytes": max(0, before - after)}
-
-
-def prune_dangling_build_cache() -> dict:
-    """Remove only dangling Docker builder records and report the reclaimed bytes.
-
-    Legacy builder records have no MDD ownership labels. This deliberately mirrors
-    ``docker builder prune`` without ``--all``: images, containers, volumes, and reusable
-    cache records remain untouched.
-    """
-    client = docker.from_env(timeout=30)
-    try:
-        # ``all=False`` is Docker's dangling-only builder prune. Unlike image prune, the
-        # build/prune API does not accept a ``dangling`` filter (Docker 28 returns HTTP 400).
-        result = client.api.prune_builds(all=False) or {}
-    except docker.errors.DockerException as exc:
-        raise RuntimeError(f"could not prune Docker build cache: {exc}") from exc
-    finally:
-        try:
-            client.close()
-        except docker.errors.DockerException:
-            pass
-    return {"ok": True, "space_reclaimed_bytes": max(
-        0, int(result.get("SpaceReclaimed") or 0))}
-
-
 def call_event_evidence(text: str) -> str:
     """Extract just enough of the engine's call events to check a service-code verdict.
 
@@ -381,16 +299,6 @@ SERVICE_RESTART_SCOPES = ("control", "services", "host")
 # The orchestrator polls a few times a minute; a request still sitting here after this long
 # means nothing is consuming it, not that it is slow.
 _RESTART_PICKUP_SECONDS = 60
-# Egress and Hardware are restarted serially before Control. Even with their full Docker stop
-# timeout, the new Control process should settle this well before the fallback is reached.
-_CONTAINER_RESTART_SECONDS = 180
-
-
-def container_stack_enabled() -> bool:
-    return os.environ.get("MDD_CONTAINER_STACK", "").strip().lower() in {
-        "1", "true", "yes", "on"}
-
-
 def _service_restart_paths() -> tuple[Path, Path]:
     root = Path(cfg.DATA_DIR) / "orchestrator"
     return root / "service-restart-request.json", root / "service-restart-status.json"
@@ -413,18 +321,13 @@ def _read_json(path: Path) -> dict:
 
 
 def request_service_restart(scope: str) -> dict:
-    """Publish a service-restart request for the active deployment executor to carry out.
+    """Publish a service-restart request for the root orchestrator to carry out.
 
-    The request file keeps the API contract identical between the Pi host orchestrator and the
-    container executor. Both detach the operation that eventually stops this process.
+    The control plane is unprivileged; the orchestrator consumes the request and detaches the
+    operation that eventually stops this process.
     """
     if scope not in SERVICE_RESTART_SCOPES:
         return {"ok": False, "error_code": "restart.error.invalid_scope"}
-    # A container may restart the project containers through the already-mounted Docker
-    # socket, but rebooting the NAS remains a host administration action. Do not emulate it
-    # with a privileged helper container or a host namespace escape.
-    if scope == "host" and container_stack_enabled():
-        return {"ok": False, "error_code": "restart.error.host_unavailable"}
     request_path, status_path = _service_restart_paths()
     now = int(time.time())
     # Reset the visible status first so the previous restart's outcome cannot be read as this
@@ -432,99 +335,6 @@ def request_service_restart(scope: str) -> dict:
     _write_private_json(status_path, {"state": "requested", "scope": scope, "updated_at": now})
     _write_private_json(request_path, {"scope": scope, "requested_at": now})
     return {"ok": True, "scope": scope}
-
-
-def perform_container_service_restart(scope: str, client=None) -> dict:
-    """Consume a restart request and restart only named, ownership-checked MDD containers."""
-    request_path, status_path = _service_restart_paths()
-    request = _read_json(request_path)
-    if str(request.get("scope") or "") != scope or scope not in {"control", "services"}:
-        result = {"state": "failed", "scope": scope,
-                  "error_code": "restart.error.invalid_scope", "updated_at": int(time.time())}
-        _write_private_json(status_path, result)
-        return result
-    try:
-        request_path.unlink()
-    except OSError:
-        pass
-    running = {"state": "running", "scope": scope, "executor": "container",
-               "updated_at": int(time.time())}
-    _write_private_json(status_path, running)
-    own_client = client is None
-    docker_client = client
-    names = {
-        "control": os.environ.get("MDD_CONTROL_CONTAINER", "mdd-sim-gateway-control"),
-        "hardware": os.environ.get("MDD_HARDWARE_CONTAINER", "mdd-sim-gateway-hardware"),
-        "egress": os.environ.get("MDD_EGRESS_CONTAINER", "mdd-sim-gateway-egress"),
-    }
-    order = ["control"] if scope == "control" else ["egress", "hardware", "control"]
-    try:
-        if docker_client is None:
-            docker_client = docker.from_env()
-        containers = []
-        for component in order:
-            container = docker_client.containers.get(names[component])
-            labels = (container.attrs.get("Config") or {}).get("Labels") or {}
-            if (labels.get("io.mdd-sim-gateway.managed") != "true"
-                    or labels.get("io.mdd-sim-gateway.component") != component):
-                raise RuntimeError(f"refusing to restart unowned {component} container")
-            containers.append((component, container))
-        control_container = next(container for component, container in containers
-                                 if component == "control")
-        for component, container in containers:
-            if component == "control":
-                continue
-            if component == "hardware":
-                marker = Path(cfg.DATA_DIR) / "orchestrator" / "pcsc-maintenance"
-                marker.parent.mkdir(parents=True, exist_ok=True)
-                marker.write_text(str(int(time.time())), encoding="ascii")
-            container.restart(timeout=30)
-        # Docker cancels a synchronous restart when its caller lives in the target container:
-        # the daemon stops Control (and therefore the HTTP client driving the request) before
-        # it reaches the start half. A short-lived sibling performs the final restart instead.
-        target_name = json.dumps(names["control"])
-        helper = (
-            "import time,docker\n"
-            "time.sleep(1)\n"
-            "client=docker.from_env()\n"
-            f"target=client.containers.get({target_name})\n"
-            "labels=(target.attrs.get('Config') or {}).get('Labels') or {}\n"
-            "assert labels.get('io.mdd-sim-gateway.managed') == 'true'\n"
-            "assert labels.get('io.mdd-sim-gateway.component') == 'control'\n"
-            "target.restart(timeout=30)\n")
-        docker_client.containers.run(
-            # docker-py shell-splits a string command before sending it to the daemon.
-            # Keep the complete Python program as the one argument consumed by ``-c``.
-            control_container.image.id, command=[helper], entrypoint=["python", "-c"],
-            detach=True, auto_remove=True, network_mode="none",
-            healthcheck={"test": ["NONE"]},
-            volumes={"/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}},
-            labels={"io.mdd-sim-gateway.managed": "true",
-                    "io.mdd-sim-gateway.component": "restart-helper"},
-            name=f"mdd-sim-gateway-restart-{time.time_ns()}")
-        return running
-    except Exception as exc:  # noqa: Docker exposes several backend-specific exception types
-        result = {**running, "state": "failed", "error_code": "restart.error.failed",
-                  "error": str(exc)[:400], "updated_at": int(time.time())}
-        _write_private_json(status_path, result)
-        return result
-    finally:
-        if own_client and docker_client is not None:
-            try:
-                docker_client.close()
-            except Exception:  # noqa
-                pass
-
-
-def settle_container_service_restart() -> dict:
-    """This Control process coming back proves its container restart completed."""
-    _request_path, status_path = _service_restart_paths()
-    status = _read_json(status_path)
-    if (status.get("state") == "running" and status.get("executor") == "container"
-            and status.get("scope") in {"control", "services"}):
-        status = {**status, "state": "success", "updated_at": int(time.time())}
-        _write_private_json(status_path, status)
-    return status
 
 
 def service_restart_status() -> dict:
@@ -542,12 +352,6 @@ def service_restart_status() -> dict:
         if time.time() - requested_at > _RESTART_PICKUP_SECONDS:
             status["state"] = "stalled"
             status["error_code"] = "restart.error.not_picked_up"
-    elif (status.get("state") == "running" and status.get("executor") == "container"
-          and time.time() - int(status.get("updated_at") or 0) > _CONTAINER_RESTART_SECONDS):
-        # A detached helper that failed before stopping Control cannot report through its
-        # caller. Bound that otherwise-infinite running state for the still-live API.
-        status["state"] = "failed"
-        status["error_code"] = "restart.error.failed"
     return status
 
 

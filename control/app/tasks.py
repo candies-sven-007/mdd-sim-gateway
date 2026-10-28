@@ -10,7 +10,7 @@ import re
 import time
 
 from . import config as cfg
-from . import store, engine, status as status_mod, sim, card, usbreader, sysinfo, media
+from . import store, engine, status as status_mod, sim, card, usbreader, sysinfo
 from . import state as app_state
 
 log = logging.getLogger("vowifi.main")
@@ -194,7 +194,7 @@ async def _on_card_remove(entry: dict, reader_unplugged: bool = False) -> bool:
     if target:
         app_state.hub.reset_health(str(target["id"]), "no_card")
     if target and await asyncio.to_thread(engine.is_running, str(target["id"])):
-        # Stop the SIP server + docker container on card/reader removal.
+        # Stop the line's engine on card/reader removal.
         await asyncio.to_thread(engine.stop, str(target["id"]))
         await app_state.hub.drop_ami(str(target["id"]))
         await app_state.hub.broadcast({"type": "engine", "instance": target["id"],
@@ -604,98 +604,6 @@ def _status_poll_delay(instances: list[dict]) -> float:
             else STATUS_POLL_HEALTHY_SECONDS)
 
 
-MEDIA_SUPERVISE_SECONDS = 30
-MEDIA_CONVERGE_SECONDS = 15
-
-
-MEDIA_RETRY_FIRST_SECONDS = 60
-MEDIA_RETRY_MAX_SECONDS = 600
-# iid -> {"at": monotonic time of the next attempt, "failures": consecutive failures}
-_media_retry: dict[str, dict] = {}
-
-
-async def _media_converge_once() -> bool:
-    """Rebuild one running line whose container was made for the other media mode. One per
-    pass, so the lines re-register one after another instead of all at once. True if a line
-    was rebuilt.
-
-    A line that cannot be rebuilt (its exit is down, the uplink network is missing, the line
-    limit refuses it) fails before its old container is touched, so it would be picked again
-    on every pass and hold up every line after it. It backs off on its own instead, and the
-    pass moves on to the next line."""
-    wanted = media.mode()
-    now = time.monotonic()
-    for inst in cfg.list_instances():
-        iid = str(inst.get("id") or "")
-        if not iid:
-            continue
-        current = await asyncio.to_thread(engine.media_mode_of, iid)
-        if current is None or current == wanted:
-            _media_retry.pop(iid, None)
-            continue
-        retry = _media_retry.get(iid) or {}
-        if now < retry.get("at", 0.0):
-            continue
-        log.info("line %s: rebuilding for %s media mode", iid, wanted)
-        app_state._record_lifecycle(iid, "media_mode_rebuild", reason_code=wanted)
-        try:
-            await asyncio.to_thread(app_state._start_engine_checked, cfg.get_instance(iid) or inst,
-                                    cfg.get_settings(),
-                                    os.environ.get("MDD_DEV_MOUNTS", "") == "1", "media_mode")
-        except Exception as exc:  # noqa: BLE001 - this line waits, the others go on
-            _media_back_off(iid, retry, now, exc)
-            continue
-        # The old container is gone only now; its AMI connection goes with it.
-        await app_state.hub.drop_ami(iid)
-        app_state.hub.reset_health(iid, "configuration_restart")
-        started = await asyncio.to_thread(engine.media_mode_of, iid)
-        if started is not None and started != wanted:
-            # Started, but not in the wanted mode: relay-pending, because the media network
-            # could not be prepared. That start succeeded, so without this the line would be
-            # rebuilt, and made to register again, on every pass for as long as the cause
-            # lasts. It waits like a failure instead.
-            _media_back_off(iid, retry, now, f"started as {started}")
-        else:
-            _media_retry.pop(iid, None)
-        return True
-    return False
-
-
-def _media_back_off(iid: str, retry: dict, now: float, reason) -> None:
-    failures = int(retry.get("failures", 0)) + 1
-    delay = min(MEDIA_RETRY_MAX_SECONDS, MEDIA_RETRY_FIRST_SECONDS * 2 ** (failures - 1))
-    _media_retry[iid] = {"at": now + delay, "failures": failures}
-    log.warning("line %s: not in the recorded media mode, retrying in %ds: %s",
-                iid, delay, reason)
-
-
-async def media_supervisor():
-    """Keep the relay running in relay mode and move running lines to the recorded mode.
-
-    The mode is switched outside this process (python -m app.media), so it is read from its
-    file on every pass rather than cached. A change to that file is acted on at the next pass
-    instead of waiting for the next periodic check, so the relay counts as ready within
-    MEDIA_CONVERGE_SECONDS of a switch."""
-    last_supervise = 0.0
-    last_state_mtime = None
-    while True:
-        try:
-            try:
-                state_mtime = os.stat(media._state_path()).st_mtime
-            except OSError:
-                state_mtime = None
-            if (state_mtime != last_state_mtime
-                    or time.monotonic() - last_supervise >= MEDIA_SUPERVISE_SECONDS):
-                last_supervise = time.monotonic()
-                last_state_mtime = state_mtime
-                await asyncio.to_thread(media.supervise)
-                await asyncio.to_thread(engine.reconcile_rtp_forward)
-            await _media_converge_once()
-        except Exception as exc:  # noqa: BLE001 - supervision must never stop
-            log.warning("media supervision failed: %s", exc)
-        await asyncio.sleep(MEDIA_CONVERGE_SECONDS)
-
-
 async def status_poller():
     last_prune = 0.0
     while True:
@@ -748,11 +656,7 @@ async def host_health_poller():
     previous_alerts = None
     while True:
         try:
-            # Docker df walks every image-layer xattr on DSM and can occupy dockerd for minutes.
-            # The minute health sampler needs host health, not an inventory of reclaimable
-            # layers; explicit cleanup actions refresh that inventory after the operator asks.
-            snapshot = await asyncio.to_thread(
-                sysinfo.collect, cfg.DATA_DIR, include_docker_storage=False)
+            snapshot = await asyncio.to_thread(sysinfo.collect, cfg.DATA_DIR)
             # Rate-based conditions need the previous sample; the first pass reports none.
             alerts = sysinfo.alerts(snapshot, app_state.hub.host_snapshot or None)
             alerts = _sustained_alerts(alerts, streaks)
@@ -866,7 +770,7 @@ async def _poll_instance_status(inst: dict) -> None:
             asyncio.create_task(_verify_ims_msisdn(iid, inst))
 
         st = app_state._with_status_activity(
-            iid, app_state.apply_health(iid, inst, st, runtime.get("container_id")))
+            iid, app_state.apply_health(iid, inst, st, runtime.get("generation")))
         app_state.hub.status_cache[iid] = st
         if held_previous and previous_sampled_at is not None:
             # apply_health(OK) clears health and its related cache bookkeeping. Restore the

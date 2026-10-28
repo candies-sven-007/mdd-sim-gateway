@@ -12,7 +12,6 @@ from control.app import device_state
 from control.app.routers import lines as lines_routes
 from fastapi import HTTPException
 from control.app import status as status_mod
-from control.app import sysinfo
 from control.app import tasks as app_tasks
 
 
@@ -59,7 +58,6 @@ class DeletedCardSuppressionTests(unittest.TestCase):
     def test_lifecycle_records_are_bounded_and_reject_free_text(self):
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(engine, "DATA_DIR", temp), \
-                patch.object(engine, "HOST_DATA_DIR", temp), \
                 patch.object(engine, "LIFECYCLE_RECORDS", 3):
             Path(temp, "instances", "line-1", "logs").mkdir(parents=True)
             for index in range(5):
@@ -84,8 +82,7 @@ class DeletedCardSuppressionTests(unittest.TestCase):
         # Issue #33: a reg_rejected freeze reached the support bundle without the SIP code
         # that caused it, because every log holding it had already rotated.
         with tempfile.TemporaryDirectory() as temp, \
-                patch.object(engine, "DATA_DIR", temp), \
-                patch.object(engine, "HOST_DATA_DIR", temp):
+                patch.object(engine, "DATA_DIR", temp):
             Path(temp, "instances", "line-1", "logs").mkdir(parents=True)
             engine.record_lifecycle(
                 "line-1", "recovery_scheduled", reason_code="reg_rejected",
@@ -104,8 +101,7 @@ class DeletedCardSuppressionTests(unittest.TestCase):
 
     def test_lifecycle_never_recreates_a_deleted_instance_directory(self):
         with tempfile.TemporaryDirectory() as temp, \
-                patch.object(engine, "DATA_DIR", temp), \
-                patch.object(engine, "HOST_DATA_DIR", temp):
+                patch.object(engine, "DATA_DIR", temp):
             engine.record_lifecycle(
                 "deleted", "recovery_cancelled", reason_code="line_deleted")
             self.assertFalse(Path(temp, "instances", "deleted").exists())
@@ -309,36 +305,11 @@ class BackgroundStartGuardTests(unittest.IsolatedAsyncioTestCase):
         stop.assert_called_once_with("1")
         start.assert_called_once_with(running, {}, dev_mounts=False)
 
-    async def test_maintenance_can_prune_only_dangling_build_cache(self):
-        app_state.hub.host_snapshot = {"disk": {"used_percent": 99.0}}
-        app_state.hub.host_alerts = [{"code": "disk_critical"}]
-        with patch.object(main.operations, "prune_dangling_build_cache",
-                          return_value={"ok": True, "space_reclaimed_bytes": 4096}) as prune, \
-                patch.object(sysinfo, "collect",
-                             return_value={"disk": {"used_percent": 70.0}}):
-            result = await system_routes.api_system_maintenance({"action": "prune_build_cache"})
-        self.assertEqual(result["space_reclaimed_bytes"], 4096)
-        self.assertEqual(result["action"], "prune_build_cache")
-        self.assertEqual(app_state.hub.host_snapshot, {"disk": {"used_percent": 70.0}})
-        self.assertEqual(app_state.hub.host_alerts, [])
-        prune.assert_called_once_with()
-
-    async def test_build_cache_prune_failure_is_an_actionable_http_error(self):
-        with patch.object(main.operations, "prune_dangling_build_cache",
-                          side_effect=RuntimeError("Docker refused builder prune")):
+    async def test_docker_cleanup_actions_are_gone(self):
+        for action in ("prune_build_cache", "prune_old_images"):
             with self.assertRaises(HTTPException) as raised:
-                await system_routes.api_system_maintenance({"action": "prune_build_cache"})
-        self.assertEqual(raised.exception.status_code, 502)
-        self.assertIn("Docker refused", raised.exception.detail)
-
-    async def test_maintenance_can_drop_old_mdd_images_on_explicit_request(self):
-        with patch.object(main.operations, "prune_old_mdd_images", return_value={
-                "ok": True, "removed_images": 2, "space_reclaimed_bytes": 8192}) as prune, \
-                patch.object(sysinfo, "collect", return_value={"disk": {}}):
-            result = await system_routes.api_system_maintenance({"action": "prune_old_images"})
-        self.assertEqual(result["action"], "prune_old_images")
-        self.assertEqual(result["removed_images"], 2)
-        prune.assert_called_once_with()
+                await system_routes.api_system_maintenance({"action": action})
+            self.assertEqual(raised.exception.status_code, 400)
 
 
 class StatusActivityTests(unittest.TestCase):
@@ -519,7 +490,7 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         inst = {"id": "3", "enabled": False}
         with patch.object(main.cfg, "get_instance", return_value=inst), \
                 patch.object(app_state.hub.runtime, "get", new=AsyncMock(return_value={
-                    "running": True, "ip": "172.17.0.2", "container_id": "c3"})), \
+                    "running": True, "ip": "172.17.0.2", "generation": "c3"})), \
                 patch.object(main.engine, "stop") as stop, \
                 patch.object(app_state.hub, "drop_ami", new=AsyncMock()) as drop_ami, \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()) as broadcast, \
@@ -543,7 +514,7 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
                    "detail": {"registration": "unknown"}}
         with patch.object(main.cfg, "get_instance", return_value=current), \
                 patch.object(app_state.hub.runtime, "get", new=AsyncMock(return_value={
-                    "running": True, "ip": "172.17.0.2", "container_id": "race"})), \
+                    "running": True, "ip": "172.17.0.2", "generation": "race"})), \
                 patch.object(main.engine, "stop") as stop, \
                 patch.object(app_state.hub, "ami_for", new=AsyncMock(return_value=object())), \
                 patch.object(status_mod, "compute", new=AsyncMock(return_value=sampled)), \
@@ -611,7 +582,7 @@ class OfflineDeviceStatusTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(app_state.hub, "ami_for", new=AsyncMock(return_value=object())), \
                 patch.object(status_mod, "compute", new=AsyncMock(return_value=unknown)), \
                 patch.object(app_state.hub.runtime, "get", new=AsyncMock(return_value={
-                    "running": True, "ip": "172.17.0.2", "container_id": "grace"})), \
+                    "running": True, "ip": "172.17.0.2", "generation": "grace"})), \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()):
             await app_tasks._poll_instance_status(inst)
             self.assertEqual(app_state.hub.status_cache[iid]["state"], "OK")

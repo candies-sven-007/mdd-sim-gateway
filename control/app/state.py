@@ -160,7 +160,7 @@ class Hub:
         self.cards: dict[str, dict] = {}     # reader NAME -> detected card/reader info
         self.scanned = False                 # card_monitor completed its first scan
         self._learning: set[str] = set()     # instances currently learning MSISDN
-        # Last observed Docker RestartCount per instance, to tell a restart-policy bounce from
+        # Last observed restart count (systemd NRestarts) per instance, to tell a bounce from
         # a rebuild the manager performed itself.
         self._restart_counts: dict[str, int] = {}
         self._msisdn_tries: dict[str, int] = {}
@@ -252,7 +252,7 @@ class Hub:
 
     async def runtime_changed(self, iid: str, runtime: dict, _action: str) -> None:
         """Retire stale AMI immediately and wake the adaptive status sampler."""
-        generation = runtime.get("container_id")
+        generation = runtime.get("generation")
         if (not runtime.get("running")
                 or self.ami_generation.get(str(iid)) not in (None, generation)):
             await self.drop_ami(iid)
@@ -261,9 +261,9 @@ class Hub:
         self.status_wakeup.set()
 
     def seed_restart_baseline(self, iid: str, runtime: dict) -> None:
-        """Record the first RestartCount seen for a running line.
+        """Record the first restart count seen for a running line.
 
-        The baseline used to be set only from Docker start events, so after the manager itself
+        The baseline used to be set only from engine start events, so after the manager itself
         restarted, the first bounce of each line looked like a first sighting and was dropped —
         exactly what happened to line 5's 09-17 crash. The status poll sees every line within
         seconds of startup, so seed from there; only a missing baseline is filled in.
@@ -272,13 +272,12 @@ class Hub:
             self._restart_counts[iid] = int(runtime.get("restart_count") or 0)
 
     async def _note_unrequested_restart(self, iid: str, runtime: dict) -> None:
-        """Record engine bounces that Docker's restart policy performed on its own.
+        """Record engine bounces that systemd (Restart=always) performed on its own.
 
-        A rebuild the manager asks for creates a fresh container, so its RestartCount is 0. A
-        restart-policy bounce increments the counter on the same container. Only the latter is
-        invisible today: it completes well inside the health policy's threshold, so no recovery
-        is scheduled and nothing reaches the timeline even though the line just spent ~40s
-        unable to take a call.
+        Such a bounce increments the unit's NRestarts; a start the manager asks for does not.
+        It completes well inside the health policy's threshold, so no recovery is scheduled
+        and nothing would reach the timeline even though the line just spent ~40s unable to
+        take a call.
         """
         count = int(runtime.get("restart_count") or 0)
         previous = self._restart_counts.get(iid)
@@ -293,7 +292,7 @@ class Hub:
                 engine.record_lifecycle, iid, "engine_restarted", reason_code=reason)
         except Exception as exc:  # noqa
             log.debug("could not record engine restart instance=%s: %r", iid, exc)
-        log.warning("engine %s was restarted by Docker's restart policy "
+        log.warning("engine %s was restarted by systemd on its own "
                     "(restart_count %s -> %s, last exit: %s)", iid, previous, count,
                     exit_record or "unrecorded")
 
@@ -319,14 +318,14 @@ class Hub:
         lock = self._ami_locks.setdefault(iid, asyncio.Lock())
         async with lock:
             inst = cfg.get_instance(iid)
-            # Docker's API can pause for seconds when the daemon is busy. AMI discovery runs
-            # in the background, but synchronous Docker calls here still froze every HTTP
+            # Reading the runtime spawns systemctl and can take a moment. AMI discovery runs
+            # in the background, but synchronous reads here would still freeze every HTTP
             # request sharing this event loop.
             if runtime is None:
                 runtime = await self.runtime.get(iid)
             running = bool(inst) and bool(runtime.get("running"))
             ip = runtime.get("ip") if running else None
-            generation = runtime.get("container_id")
+            generation = runtime.get("generation")
             client = self.ami.get(iid)
             # Reuse only a healthy client still pointed at the current container.
             if (client and running and ip and client.connected and client.host == ip
@@ -358,7 +357,7 @@ def _start_engine_checked(inst: dict, settings: dict, dev_mounts: bool = False,
         raise HTTPException(409, {
             "code": "line_limit",
             "message": (f"MDD Sim Gateway supports at most "
-                        f"{cfg.MAX_SIM_LINES} SIM lines. Delete an existing line "
+                        f"{cfg.max_lines()} SIM line(s). Delete an existing line "
                         "before starting this one."),
         })
     try:
@@ -1041,7 +1040,7 @@ async def _auto_recover_instance(iid: str, inst: dict, delay: int):
             imei_source_matches=source_matches)
 
 
-def apply_health(iid, inst, st, container_id: str | None = None):
+def apply_health(iid, inst, st, generation: str | None = None):
     """Overlay bounded auto-retry state. After max attempts of continuous failure (with the
     SIM still present) the engine is stopped and the status frozen to ERROR + reason, until
     the user retries/re-provisions or the card is re-inserted."""
@@ -1100,7 +1099,7 @@ def apply_health(iid, inst, st, container_id: str | None = None):
                               retry_count=h.get("retry_count"), card_present=True)
             asyncio.create_task(asyncio.to_thread(
                 engine.capture_and_stop, iid, inst, "health-freeze:carrier_unsupported",
-                container_id))
+                generation))
             asyncio.create_task(hub.drop_ami(str(iid)))
             return _frozen(h, st, rmax)
     if state == "PIN_PROBLEM":
@@ -1120,7 +1119,7 @@ def apply_health(iid, inst, st, container_id: str | None = None):
     fast_unanswered = False
     if (st.get("reason_code") == "reg_unanswered"
             and (st.get("detail") or {}).get("active_channels") == 0
-            and container_id):
+            and generation):
         last_fast = hub.reg_unanswered_recovery_at.get(str(iid), float("-inf"))
         if now - last_fast >= REG_UNANSWERED_MIN_INTERVAL_SECONDS:
             fast_unanswered = True
@@ -1129,8 +1128,8 @@ def apply_health(iid, inst, st, container_id: str | None = None):
             # makes this observation exhaust only this reason's retry budget immediately.
             h["fail_start"] = now - (rmax * rint)
             log.warning("line %s IMS registration is unanswered with no active channels; "
-                        "fast recovery will rebuild container generation %s", iid,
-                        str(container_id)[:12])
+                        "fast recovery will restart engine generation %s", iid,
+                        str(generation)[:12])
 
     # EPDG_UNRESOLVED / TUNNEL_DOWN / REGISTERING -> the engine keeps retrying internally;
     # we bound the total time and then give up.
@@ -1157,7 +1156,7 @@ def apply_health(iid, inst, st, container_id: str | None = None):
         # before the rebuild. Any failure here still leaves the container for stop() to remove.
         asyncio.create_task(asyncio.to_thread(
             engine.capture_and_stop, iid, inst, f"health-freeze:{st['reason_code']}",
-            container_id))
+            generation))
         # Giving up on a line is a signal that its exit node may be the problem — but only
         # when the line never worked on it. A node that carried a registered line for a long
         # time and then broke is being blamed for something else (a carrier-side problem, or
@@ -1326,7 +1325,7 @@ async def push_status(iid: str):
         ami = await hub.ami_for(iid, runtime)
         st = await status_mod.compute(inst, ami, runtime)
         st = _with_status_activity(
-            iid, apply_health(iid, inst, st, runtime.get("container_id")))
+            iid, apply_health(iid, inst, st, runtime.get("generation")))
         hub.status_cache[str(iid)] = st
         hub.status_sampled_at[str(iid)] = time.monotonic()
         await hub.broadcast({"type": "status", "instance": str(iid), **st})
