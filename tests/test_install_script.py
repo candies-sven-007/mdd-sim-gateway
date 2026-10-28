@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -108,6 +109,23 @@ class BuildScriptTests(unittest.TestCase):
                     self.assertRegex(line, r'"\$\w+SHA256"\s*$')
         for name in ("PJPROJECT_COMMIT", "ASTERISK_COMMIT", "LPAC_COMMIT"):
             self.assertRegex(self.TEXT, rf"{name}=[0-9a-f]{{40}}\n")
+
+    def test_every_asterisk_patch_follows_ast_src(self):
+        """The patchers default to the old image's /home/asterisk-build; the build sets AST_SRC."""
+        self.assertIn('export AST_SRC="$WORK/asterisk"', self.TEXT)
+        self.assertLess(self.TEXT.index("export AST_SRC="),
+                        self.TEXT.index("engine/patches/asterisk/*.py"))
+        for script in sorted((ROOT / "engine" / "patches" / "asterisk").glob("*.py")):
+            with self.subTest(script=script.name):
+                self.assertIn("AST_SRC", script.read_text())
+                # Against an empty tree each one must stop on the missing source file, not on
+                # a Python error of its own.
+                with tempfile.TemporaryDirectory() as tree:
+                    done = subprocess.run([sys.executable, "-I", str(script)], cwd=tree,
+                                          capture_output=True, text=True, timeout=30,
+                                          env={**os.environ, "AST_SRC": tree})
+                self.assertNotRegex(done.stderr, r"(NameError|ImportError|SyntaxError)")
+                self.assertNotIn("/home/asterisk-build", done.stdout + done.stderr)
 
     def test_bundles_what_the_units_expect(self):
         for needle in ('ln -sfn python "$PREFIX/venv"', '"$PREFIX/bin/sing-box"',

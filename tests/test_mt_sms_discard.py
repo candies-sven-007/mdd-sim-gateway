@@ -13,6 +13,7 @@ RP-ACK leaves. mt_rpack_routing.py makes that RP-ACK reach the carrier (right ta
 arrival transport, no DNS on an IMS-internal FQDN).
 """
 import base64
+import os
 import re
 import sqlite3
 import subprocess
@@ -94,12 +95,11 @@ class RpAckPatchIsKeptAndApplies(unittest.TestCase):
     )
 
     def _apply(self, target: Path) -> str:
-        source = (PATCHES / "mt_rpack_routing.py").read_text()
-        default = "'/home/asterisk-build/asterisk/res/res_pjsip_messaging.c'"
-        self.assertEqual(source.count(default), 1)
-        script = source.replace(default, repr(str(target)))
-        done = subprocess.run([sys.executable, "-I", "-c", script], capture_output=True,
-                              text=True, check=True)
+        """Run the patcher the way the build does: AST_SRC names the Asterisk tree."""
+        self.assertEqual(target.parent.name, "res")
+        done = subprocess.run([sys.executable, "-I", str(PATCHES / "mt_rpack_routing.py")],
+                              capture_output=True, text=True, check=True,
+                              env={**os.environ, "AST_SRC": str(target.parent.parent)})
         return done.stdout
 
     def test_only_the_acknowledgement_patch_of_the_messaging_set_ships(self):
@@ -110,7 +110,8 @@ class RpAckPatchIsKeptAndApplies(unittest.TestCase):
 
     def test_send_rpack_is_replaced_and_nothing_else_is_touched(self):
         with tempfile.TemporaryDirectory() as temp:
-            target = Path(temp) / "res_pjsip_messaging.c"
+            target = Path(temp) / "res" / "res_pjsip_messaging.c"
+            target.parent.mkdir()
             target.write_text(self.STOCK)
             self.assertIn("patched OK", self._apply(target))
             patched = target.read_text()

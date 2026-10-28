@@ -436,6 +436,8 @@ nft table inet mdd:
 - 2026-10-28 build-arm64 第二次运行（run 40641838007，3ace8e0）：换源已生效，apt 通过；失败在编译。
   - pcsc-lite 2.3.3 链接 `libpcsclite.so.1` 时报 `undefined reference to pthread_once`（src/libredirect.c:182）：glibc 2.31 的 pthread 函数还在 libpthread 里，pcsc-lite 的 meson 没给这个库链接 threads，又带 `-Wl,--no-undefined`。修正：meson setup 加 `-Dc_link_args=-pthread`。
   - 脚本问题：`ninja -C build && ninja -C build install` 在 `set -e` 下，左边失败不会退出，所以 pcsc-lite 的错误被跳过，报错位置变成了后面 ccid 找不到 libpcsclite。修正：pcsc-lite 与 ccid 两处都拆成两行。其余 `&&` 已检查：重试循环里的条件判断、子 shell 内的 `cd && 命令`（子 shell 的退出码仍受 `set -e` 约束），不需要改。
+- 2026-10-28 build-arm64 第三次运行（run 40644627821，bef589b）：pcsc-lite 与 ccid 已编过；失败在 Asterisk 补丁。`ims_public_identity_log.py` 找不到 `/home/asterisk-build/asterisk/...`：补丁脚本的默认路径是原 Docker 镜像里的目录。4 个脚本读环境变量 `AST_SRC`，`mt_rpack_routing.py`、`resolve_config_docs.py` 写死路径。修正：build-arm64.sh 在应用补丁前 `export AST_SRC="$WORK/asterisk"`；那两个脚本也改为读 `AST_SRC`（默认值不变）；`test_mt_sms_discard` 改为通过 `AST_SRC` 运行补丁；`test_install_script` 新增检查：每个补丁脚本都读 `AST_SRC`，并且在空目录上只因缺源文件退出，不出现 Python 错误。
+  - 本地复现手段：沙箱里起 dockerd，用 amd64 `debian:bullseye`（gcc 10.2.1、glibc 2.31，与 CI 容器同版本）跑 build-arm64.sh 中 Python 之前的步骤。沙箱代理对 GitHub 源码归档返回 403，所以本地用 git 取 pcsc-lite/ccid 同一标签代替（CI 仍用固定 sha256 的归档）。本地已复现第三次的失败，修正后 6 个补丁都能打上，configure 通过；Asterisk 编译结果见下一条。
 
 ---
 

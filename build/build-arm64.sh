@@ -126,6 +126,7 @@ cd asterisk
 git config user.email build@mdd.invalid; git config user.name "mdd build"
 git -c http.version=HTTP/1.1 fetch -q --depth=2 origin "$ASTERISK_CHERRY_PICK"
 git cherry-pick "$ASTERISK_CHERRY_PICK"
+export AST_SRC="$WORK/asterisk"      # the patch scripts default to the old image's path
 for patch_script in "$REPO"/engine/patches/asterisk/*.py; do echo "applying $(basename "$patch_script")"; python3 "$patch_script"; done
 ln -s ../../../pjproject third-party/pjproject/source
 sh bootstrap.sh

@@ -9,7 +9,7 @@
 # The patched Asterisk runs as a separate process in the engine container and talks to the
 # GPL-3.0-only control plane over AMI/HTTP only; no GPL-3.0-only code is linked into it.
 
-import re, sys
+import os, re, sys
 
 # PATCH_RPACK_ROUTING2: fix MT (mobile-terminated) SMS RP-ACK so the carrier accepts it.
 #
@@ -191,7 +191,8 @@ FIXED_FN = r'''static pj_status_t send_rpack(pjsip_rx_data *rdata, unsigned char
 	return PJ_SUCCESS;
 }'''
 
-f = '/home/asterisk-build/asterisk/res/res_pjsip_messaging.c'
+f = os.path.join(os.environ.get('AST_SRC', '/home/asterisk-build/asterisk'),
+                 'res/res_pjsip_messaging.c')
 s = open(f).read()
 if 'PATCH_RPACK_ROUTING2' in s:
     print("already patched"); sys.exit(0)

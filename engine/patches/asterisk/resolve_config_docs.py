@@ -6,11 +6,13 @@ startup ERROR for the ``transport`` option.  The nodoc API has identical runtime
 semantics and is the intended interface for fields without XML documentation.
 """
 
-from pathlib import Path
+import os
 import sys
+from pathlib import Path
 
 
-SOURCE = Path("/home/asterisk-build/asterisk/res/res_pjsip/config_resolve.c")
+SOURCE = Path(os.environ.get("AST_SRC", "/home/asterisk-build/asterisk")) \
+    / "res/res_pjsip/config_resolve.c"
 
 
 def patch(source: str) -> str:
