@@ -4,7 +4,7 @@ const STORAGE_KEY = 'mdd-language'
 
 const zh = {
   'SIM lines': 'SIM 线路数量', 'At most {count} line(s)': '最多 {count} 条',
-  'Each line needs about 100 MB of memory. Raise the limit to 2 only after checking that a second line fits; lowering it stops the lines beyond it and keeps their settings.': '每条线路约占 100 MB 内存。确认第二条线路放得下后再把上限改为 2；调小上限会停止超出的线路，但保留它们的设置。',
+  'Only lines whose SIM is inserted run, and each running line needs about 100 MB of memory. Lines whose SIM is not inserted cost nothing, so with one reader any limit is safe; lowering it stops the lines beyond it and keeps their settings.': '只有插着卡的线路才会运行，每条运行中的线路约占 100 MB 内存。卡没插着的线路不占内存，所以只有一个读卡器时上限设多少都可以；调小上限会停止超出的线路，但保留它们的设置。',
   'Source code': '源代码', Backups: '备份',
   'Specified proxy': '指定代理',
   'SOCKS5 entries connect directly. Subscription and node entries reuse a ready country exit assigned to that proxy.': 'SOCKS5 条目可直接连接；订阅和节点条目会复用已分配该代理且已就绪的国家出口。',
@@ -250,7 +250,7 @@ const zh = {
   Enable: '启用', Disable: '禁用', 'Delete profile {iccid}?': '确定删除配置文件 {iccid}？', Notifications: '通知', 'Process all': '全部处理',
   'Click Load to list notifications.': '点击“读取”列出通知。', 'No pending notifications.': '没有待处理通知。', 'No notifications to show.': '没有可显示的通知。',
   Overview: '概览', Devices: '设备',  'Network exits': '网络出口', 'System settings': '系统设置', Diagnostics: '诊断', '4G + VoWiFi unified': '4G 与 VoWiFi 一体化', device: '个设备', devices: '个设备', 'Close menu': '关闭菜单', 'Live device control': '实时设备控制', 'Compatibility view': '兼容视图',
-  'Responsible use notice': '合规提示：仅限号码实名持有人在运营商允许的范围内自用，最多 2 条 SIM 线路。严禁诈骗、群呼、骚扰、验证码接收、出租线路、代拨转接或向第三人提供电信服务；使用者须遵守所在地法律与运营商协议。',
+  'Responsible use notice': '合规提示：仅限号码实名持有人在运营商允许的范围内自用，最多 10 条 SIM 线路。严禁诈骗、群呼、骚扰、验证码接收、出租线路、代拨转接或向第三人提供电信服务；使用者须遵守所在地法律与运营商协议。',
   'page.overview.subtitle': '所有模块、SIM 和通信能力的实时状态', 'page.devices.subtitle': '按物理模块管理 4G、VoWiFi、SIM 和硬件', 'page.calls.subtitle': '统一拨号、来电控制和通话记录',  'page.esim.subtitle': '管理 eUICC 配置文件与下载任务',  'page.egress.subtitle': '为每个 SIM 提供经过 UDP 验证的国家出口',  'page.settings.subtitle': '常规、Web、通话、安全、备份和维护', 'page.diagnostics.subtitle': '健康检查、实时日志和脱敏支持包',
   Network: '在网状态',
   Off: '未启用',
@@ -466,7 +466,7 @@ const zh = {
 }
 
 const en = {
-  'Responsible use notice': 'Compliance notice: for use only by the verified subscriber where the carrier permits it, with at most two SIM lines. No fraud, bulk or nuisance calling, verification-code collection, line rental, third-party call forwarding, or telecommunications service for others. Follow local law and carrier terms.',
+  'Responsible use notice': 'Compliance notice: for use only by the verified subscriber where the carrier permits it, with at most ten SIM lines. No fraud, bulk or nuisance calling, verification-code collection, line rental, third-party call forwarding, or telecommunications service for others. Follow local law and carrier terms.',
   'page.overview.subtitle': 'Live status of every modem, SIM and communication capability',
   'page.devices.subtitle': 'Manage 4G, VoWiFi, SIM and hardware by physical device',
   'page.calls.subtitle': 'Unified dialer, incoming call controls and call history',

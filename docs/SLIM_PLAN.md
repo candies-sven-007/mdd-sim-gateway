@@ -477,6 +477,7 @@ nft table inet mdd:
   - Bug 2 第 2 点关闭，不改匹配逻辑。设备侧时间线：18:05 eSIM（…6697）因线路上限被忽略 → 18:06:58 `POST /api/instances` 把线路 1 改绑到 6697（所以 18:08:31 拔出时 matched=1）→ 18:09 插入另一张卡（…5920），线路 1 被 6697 占着，被忽略 → 18:11:46 删除线路 1 → 18:12:28 重插后自动建立线路 1 并匹配。每次匹配变化都对应插卡事件或用户写操作。按 1.14.0-slim.10，18:11 删掉线路后卡片监控会自动补建，不用再重插卡。
   - 设备上的临时补丁（`index-BQK4vjq9.js` 首行插入的组件桩及其 .bak）随旧版本目录 /opt/mdd/1.14.0-slim.5 一起被 install.sh 清掉（安装新版本后删除 /opt/mdd 下其他版本目录）。
 - 2026-10-28 设备反馈：英国出口报 `'str' object has no attribute 'get'`。订阅（Sub Store 导出）返回的是 base64 编码的分享链接列表，不是 Clash YAML，YAML 把它读成字符串，`subscription()` 随后对字符串调用 `.get("proxies")`。修正：新增 `parse_subscription()`，接受 Clash YAML（只保留映射类型的节点）以及明文或 base64 的分享链接列表（每行用 `parse_share_link` 转换，名称取 `#` 后的备注、vmess 取 `ps`；本网关不支持的链接跳过）；没有可用节点时报出说明两种格式的错误。测试 `tests/test_subscription_formats.py`。另：局域网网页慢查明是棒子 Wi-Fi 链路丢包（ping 平均 186 ms、大包丢失 50–75%），与 mdd 无关。
+- 2026-10-29 用户确认：线路上限从"默认 1、可配置为 2"改为"默认 1、可配置 1–10"（恢复 slim 之前的上限）。`PRODUCT_MAX_LINES = 10`；合规提示改回"最多 10 条 SIM 线路 / at most ten SIM lines"；设置页的内存提示改为说明只有插着卡的线路才运行。引擎侧（mdd-enginectl、netns 10.88.N、地址段）本来就覆盖 1–10，不用改。测试 `test_product_boundaries`、`test_ui_slim` 同步更新。
 
 ---
 

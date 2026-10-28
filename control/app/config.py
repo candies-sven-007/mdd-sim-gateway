@@ -35,7 +35,7 @@ _loaded: tuple | None = None
 # variable: operators must not be able to turn the gateway into a bulk-SIM service by changing
 # deployment configuration. Within it, settings.max_lines (1 by default) is what the device's
 # memory allows; it can be raised to the ceiling once a second line has been measured to fit.
-PRODUCT_MAX_LINES = 2
+PRODUCT_MAX_LINES = 10
 DEFAULT_MAX_LINES = 1
 
 # Values added by the instances API for display only. They may ride back on a complete WebUI

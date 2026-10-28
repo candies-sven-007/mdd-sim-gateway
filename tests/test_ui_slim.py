@@ -36,9 +36,9 @@ class SlimUiTests(unittest.TestCase):
 
     def test_compliance_notice_names_the_ceiling(self):
         text = source("i18n.jsx")
-        self.assertIn("最多 2 条 SIM 线路", text)
-        self.assertIn("at most two SIM lines", text)
-        self.assertNotRegex(text, r"最多 ?10 ?条|ten SIM lines")
+        self.assertIn("最多 10 条 SIM 线路", text)
+        self.assertIn("at most ten SIM lines", text)
+        self.assertNotRegex(text, r"最多 ?2 ?条 SIM|two SIM lines")
 
 
 if __name__ == "__main__":

@@ -16,13 +16,15 @@ class ProductBoundaryTests(unittest.TestCase):
         )
         return temp, paths
 
-    def test_the_ceiling_is_two_and_the_default_one(self):
+    def test_the_ceiling_is_ten_and_the_default_one(self):
         # A source-level ceiling: no setting can turn the gateway into a bulk-SIM service.
-        self.assertEqual(config.PRODUCT_MAX_LINES, 2)
+        # Ten since 2026-10-28 (the pre-slim ceiling, at the operator's request); the engine
+        # side (mdd-enginectl, netns 10.88.N, address ranges) has always covered lines 1-10.
+        self.assertEqual(config.PRODUCT_MAX_LINES, 10)
         self.assertEqual(config.DEFAULT_MAX_LINES, 1)
         self.assertEqual(config.DEFAULTS["settings"]["max_lines"], 1)
-        for raw, expected in ((None, 1), (1, 1), (2, 2), (3, 2), (10, 2), (0, 1), (-1, 1),
-                              ("2", 2), ("x", 1)):
+        for raw, expected in ((None, 1), (1, 1), (2, 2), (3, 3), (10, 10), (11, 10), (99, 10),
+                              (0, 1), (-1, 1), ("2", 2), ("x", 1)):
             settings = {} if raw is None else {"max_lines": raw}
             with self.subTest(raw=raw):
                 self.assertEqual(config.max_lines(settings), expected)
@@ -38,10 +40,12 @@ class ProductBoundaryTests(unittest.TestCase):
             config.upsert_instance({"id": "2", "name": "SIM 2"})
             with self.assertRaises(config.LineLimitError):
                 config.upsert_instance({"id": "3", "name": "SIM 3"})
-            # Even a hand-edited setting above the ceiling allows no more than two.
-            config.update_settings({"max_lines": 10})
+            # Even a hand-edited setting above the ceiling allows no more than ten.
+            config.update_settings({"max_lines": 99})
+            for iid in range(3, 11):
+                config.upsert_instance({"id": str(iid), "name": f"SIM {iid}"})
             with self.assertRaises(config.LineLimitError):
-                config.upsert_instance({"id": "3", "name": "SIM 3"})
+                config.upsert_instance({"id": "11", "name": "SIM 11"})
 
     def test_stale_remote_controls_are_removed_on_load_and_save(self):
         temp, paths = self.temp_config()
