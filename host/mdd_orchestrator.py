@@ -44,6 +44,54 @@ def load_yaml_text(text: str) -> dict:
     loader = getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
     return yaml.load(text, Loader=loader) or {}
 
+def parse_subscription(text: str) -> dict:
+    """A subscription body as {"proxies": [clash-style node, ...]}.
+
+    Two formats are in use: Clash YAML with a `proxies` list, and the v2ray style list of
+    share links, one per line, usually base64-encoded as a whole (Sub Store's default
+    export). The second used to load as a plain YAML string and fail with
+    "'str' object has no attribute 'get'". Links this gateway cannot carry are skipped; a
+    body with no usable node at all is an error that names both formats.
+    """
+    try:
+        document = load_yaml_text(text)
+    except Exception:  # noqa: BLE001 - a share-link list need not be valid YAML
+        document = None
+    if isinstance(document, dict) and isinstance(document.get("proxies"), list):
+        return {**document, "proxies": [node for node in document["proxies"]
+                                        if isinstance(node, dict)]}
+    body = text.strip()
+    if "://" not in body:
+        try:
+            body = b64_padded("".join(body.split()))
+        except ValueError:
+            body = ""
+    from urllib.parse import unquote
+    nodes, skipped = [], 0
+    for line in body.splitlines():
+        line = line.strip()
+        if "://" not in line:
+            continue
+        try:
+            node = parse_share_link(line)
+        except (ValueError, KeyError, TypeError):
+            skipped += 1
+            continue
+        if line.split("://", 1)[0].lower() == "vmess":
+            try:
+                name = json.loads(b64_padded(line.split("://", 1)[1].split("#", 1)[0])).get("ps")
+            except (ValueError, AttributeError):
+                name = ""
+        else:
+            name = unquote(line.partition("#")[2])
+        node["name"] = str(name or f"{node.get('type')}-{node.get('server')}:{node.get('port')}")
+        nodes.append(node)
+    if not nodes:
+        raise ValueError("subscription is neither Clash YAML with proxies nor a list of "
+                         f"supported share links ({skipped} link(s) could not be used)")
+    return {"proxies": nodes}
+
+
 CLASH_API = os.environ.get("MDD_CLASH_API", "127.0.0.1:19090")
 
 
@@ -789,7 +837,7 @@ class Orchestrator:
             parsed = self._subscription_docs = {}
         entry = parsed.get(str(cache))
         if entry is None or entry[0] != key:
-            entry = parsed[str(cache)] = (key, load_yaml_text(cache.read_text(encoding="utf-8")))
+            entry = parsed[str(cache)] = (key, parse_subscription(cache.read_text(encoding="utf-8")))
         return deepcopy(entry[1])
 
     def xray_bridge_outbound(self, node: dict, sing_tag: str, runtime_id: str) -> dict:
