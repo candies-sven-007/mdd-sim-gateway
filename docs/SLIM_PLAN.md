@@ -402,10 +402,11 @@ nft table inet mdd:
   - TestClient 依赖 httpx，它不是运行依赖。新增 `tests/requirements.txt`（固定 httpx==0.28.1），ci.yml 的 python job 额外安装它；设备上的发布包不包含它。starlette 1.10 对 httpx 打印弃用警告，不影响结果。
   - 观察到但未改动：`/docs`、`/docs/oauth2-redirect`、`/openapi.json`、`/redoc` 在 9fcbe5c 和现在都不经登录即可访问（不在 /api/ 下，gate 视为静态资源）。会暴露完整接口清单，但不暴露数据。是否关闭（`FastAPI(docs_url=None, redoc_url=None, openapi_url=None)`）列为阶段 4 待定问题 P-1。
 - 2026-10-28 步骤 1：阶段 4 设计写入 §12（文件清单、两个 systemd 单元、netns/veth、每线路路由表、nft 0.9.8 规则、sudo + mdd-enginectl、阻断逻辑与测试方案、风险、12 个待定问题 P-1～P-12）。**未写代码，等待确认。** 下一步：按你对 P-1～P-12 的答复修订 §12，然后从 §12.11 第 1 项开始实现。
+- 2026-10-28 确认：P-1～P-12 全部采用 §12.10 括号里的推荐做法，§12 设计按原文生效，不再逐条讨论。用户要求尽快在棒子上跑起来：按 §12.11 第 1–6 步顺序实现（每步仍跑全量测试 + `npm run build`），第 6 步完成后先出 arm64 包装到设备上验证，第 7 步 CI（`netns-leak`、`nft-bullseye`）可以在首次上设备之后补。下一步：§12.11 第 1 项。
 
 ---
 
-## 12. 阶段 4 设计（2026-10-28 起草，**待确认，确认前不写代码**）
+## 12. 阶段 4 设计（2026-10-28 起草；2026-10-28 已确认：P-1～P-12 全部按推荐执行，可以开始写代码）
 
 本节只细化 §4 的落地方式，不改动 §10 的已确认决定。凡是与 §4 原文措辞不同的地方，都在 §12.10 列为待定问题，附推荐做法，由你决定。
 
@@ -736,7 +737,7 @@ mdd ALL=(root) NOPASSWD: /usr/local/sbin/mdd-enginectl
 | R-8 | systemd 247 对 `NRestarts` 在手动启动时是否清零、`TemporaryFileSystem` 挂载点是否自动创建，按文档理解，没在设备上验证。 | 阶段 7 验证；单元文件改动不影响其余设计。 |
 | R-9 | 能力集收窄后 Asterisk 或 swu_ike 可能缺少某个能力（例如 `CAP_NET_RAW` 是否需要）。 | 设备上按日志补，阶段 7 记录。 |
 
-### 12.10 待定问题（请逐条答复；括号里是推荐）
+### 12.10 待定问题（2026-10-28 已答复：全部按括号里的推荐执行）
 
 - **P-1** `/docs`、`/openapi.json`、`/redoc` 现在不登录即可访问（拆分前就如此）。是否在阶段 4 关闭？（推荐关闭：`FastAPI(docs_url=None, redoc_url=None, openapi_url=None)`，不影响 /api/ 基线。）
 - **P-2** 代理模式下是否对进入 TUN 的流量做 masquerade？§4.3 原写"不做"。（推荐做：与现在的 Docker 路径一致，sing-box 只看到本机地址；它不影响防泄漏，因为 masquerade 只作用于已被放行到 TUN 的包。）
