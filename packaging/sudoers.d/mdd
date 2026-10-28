@@ -1,0 +1,4 @@
+# The control plane (user mdd) may start and stop line engines, and nothing else.
+# mdd-enginectl validates its arguments itself: sudo 1.9.5 (Debian 11) has no argument regex.
+Defaults:mdd !requiretty, !lecture, env_reset, timestamp_timeout=0
+mdd ALL=(root) NOPASSWD: /usr/local/sbin/mdd-enginectl

@@ -1,0 +1,13 @@
+#!/bin/sh
+# The only command the control plane may run as root (see /etc/sudoers.d/mdd).
+# Reads no file the control plane can write: the line number is checked here and nowhere else.
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+usage() { echo "usage: mdd-enginectl {start|stop|restart|down|reset-failed} <line 1-10>" >&2; exit 64; }
+[ "$#" -eq 2 ] || usage
+case "$2" in [1-9]|10) line=$2 ;; *) usage ;; esac
+case "$1" in
+  start|stop|restart|reset-failed) exec systemctl "$1" "mdd-engine@$line.service" ;;
+  down) exec systemctl stop "mdd-engine@$line.service" "mdd-netns@$line.service" ;;
+  *) usage ;;
+esac

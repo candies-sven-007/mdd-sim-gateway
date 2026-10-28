@@ -1,0 +1,52 @@
+# VoWiFi engine of SIM line %i: PIN keeper, SWu IKEv2 tunnel, USIM bridge and Asterisk,
+# supervised by engine/entrypoint.sh inside the line's own network namespace.
+# Started and stopped only through /usr/local/sbin/mdd-enginectl (docs/SLIM_PLAN.md 12.3).
+[Unit]
+Description=MDD VoWiFi engine, line %i
+BindsTo=mdd-netns@%i.service
+After=mdd-netns@%i.service mdd-pcscd.service mdd-orchestrator.service
+Wants=mdd-pcscd.service
+ConditionPathExists=/var/lib/mdd/instances/%i/instance.json
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+Group=mdd
+UMask=0007
+ExecStart=/opt/mdd/current/engine/entrypoint.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillMode=control-group
+NetworkNamespacePath=/run/netns/mdd-%i
+RuntimeDirectory=mdd-engine-%i
+Environment=MDD_ID=%i
+Environment=MDD_CONFIG=/var/lib/mdd/instances/%i/instance.json
+Environment=MDD_RUNDIR=/var/lib/mdd/instances/%i/run
+Environment=MDD_LOGDIR=/var/lib/mdd/instances/%i/logs
+Environment=MDD_AST_LOGDIR=/var/lib/mdd/instances/%i/logs/asterisk
+Environment=MDD_ENGINE_DIR=/opt/mdd/current/engine
+Environment=MDD_TPL=/opt/mdd/current/engine/templates
+Environment=MDD_ENGINE_ETC=/run/mdd-engine-%i
+Environment=MDD_ASTERISK_CORE_DUMP=0
+Environment=PATH=/opt/mdd/current/venv/bin:/opt/mdd/current/asterisk/sbin:/opt/mdd/current/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=LD_LIBRARY_PATH=/opt/mdd/current/lib
+Environment=PYTHONDONTWRITEBYTECODE=1 MALLOC_ARENA_MAX=2 SWU_TUN_MTU=1400
+ReadWritePaths=/var/lib/mdd/instances/%i/run /var/lib/mdd/instances/%i/logs /run/pcscd
+TemporaryFileSystem=/etc/asterisk:mode=0750 /var/lib/asterisk:mode=0750 /var/spool/asterisk:mode=0750
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+LimitCORE=0
+MemoryMax=160M

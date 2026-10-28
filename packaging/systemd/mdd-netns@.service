@@ -1,0 +1,11 @@
+# Network namespace, veth and routing gate of SIM line %i (host/mdd_netns.py).
+# Pulled in by mdd-engine@%i.service; stopped by `mdd-enginectl down %i`.
+[Unit]
+Description=MDD line %i network namespace
+Before=mdd-engine@%i.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/mdd/current/venv/bin/python -I /opt/mdd/current/host/mdd_netns.py up %i
+ExecStop=/opt/mdd/current/venv/bin/python -I /opt/mdd/current/host/mdd_netns.py down %i
