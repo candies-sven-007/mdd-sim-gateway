@@ -445,6 +445,7 @@ nft table inet mdd:
   - 冒烟测试的脚本错误：`ldd | grep 'not found'` 在一切正常时返回 1，pipefail 让 `unresolved=$(...)` 直接终止脚本；`pcscd --version | head -n1` 和 `sing-box version | head -n1` 有 SIGPIPE 风险；`sh -n a b` 只检查第一个文件。已全部改掉；`find | head -n1` 改为 `find -print -quit`。
   - `test_install_script` 新增 `test_bullseye_build_fixes_stay`，固定以上修正，并检查构建命令不再用 `a && b` 的写法。
   - 本地 x86 结果：全流程通过（各组件冒烟测试、Python 导入、控制面导入、打包）。主包 75 MB（解压后约 225 MB，其中 Python 约 150 MB：解释器与 libpython 各约 30 MB、site-packages 49 MB），Xray 包 14 MB。apt-packages.txt 列出 66 个运行库及 nftables/iproute2/procps/sudo/ca-certificates/kmod，都来自 bullseye main。瘦身（tcl/tk、idlelib、ensurepip 等）留到首次上设备之后再看。
+- 2026-10-28 build-arm64 第五次运行（run 40647531386，3c65c2a）通过，CI 也通过。产物 `mdd-slim-arm64-1.14.0-slim.5`（artifact 12798113421，保留到 2026-11-27）：主包 68 MB，Xray 包 12 MB，各带 .sha256。arm64 冒烟测试：Asterisk 20.7.0、pcsc-lite 2.3.3、sing-box 1.13.15、Python 导入与控制面导入全部通过；apt-packages.txt 与本地 x86 结果相同。下一步：设备上先只读检查 apt 源（待定的第 2 项），再安装。
 
 ---
 
