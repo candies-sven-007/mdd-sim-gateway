@@ -135,7 +135,7 @@ export const api = {
   call: (id, to, from_endpoint = 'webrtc') => j('POST', `/api/instances/${id}/call`, { to, from_endpoint }),
   hangup: (id) => j('POST', `/api/instances/${id}/hangup`),
   softphone: (id) => j('GET', `/api/instances/${id}/softphone`),
-  // Call media mode and the relay's state; read-only, switched by the installer.
+  // Call media mode; only direct remains.
   media: () => j('GET', '/api/media'),
 
   // eSIM / LPA (lpac) — first arg is usually the PC/SC reader NAME (string).

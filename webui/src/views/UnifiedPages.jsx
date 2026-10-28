@@ -221,30 +221,6 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
   </div>
 }
 
-// How call media reaches the lines. Shown only: switching rebuilds every line, publishes or
-// withdraws host ports and starts or removes the relay, so it is the installer's job
-// (install.sh media relay | direct).
-function MediaModePanel() {
-  const { t } = useI18n()
-  const [media, setMedia] = useState(null)
-  useEffect(() => {
-    let alive = true
-    api.media().then((value) => { if (alive) setMedia(value) }).catch(() => {})
-    return () => { alive = false }
-  }, [])
-  if (!media) return null
-  const relay = media.mode === 'relay'
-  const ready = media.relay?.state === 'ready'
-  return <div className="u-form-grid"><div>
-    <label>{t('Call media')}</label>
-    <p>
-      {relay ? t('Media relay, port {port}', { port: media.public_port || media.port }) : t('Direct (each line publishes its RTP ports)')}
-      {relay && <> · <Badge state={ready ? 'on' : 'error'}>{ready ? t('Relay ready') : t('Relay unavailable')}</Badge></>}
-    </p>
-    <p className="u-note">{t('Switch with install.sh media relay or install.sh media direct on the gateway host.')}</p>
-  </div></div>
-}
-
 function deviceTitle(d, index) { return d.name || d.label || d.model || `Device ${index + 1}` }
 function simName(d, t) {
   if (d.present === false) return t('Device not connected')
@@ -792,7 +768,7 @@ export function EgressPage({ showToast }) {
 }
 
 export function SystemPage({ showToast }) {
-  const { t, language, setLanguage } = useI18n(); const [s, setS] = useState(null); const [loadError, setLoadError] = useState(false); const [tab, setTab] = useState('general'); const [status, setStatus] = useState(null); const [statusLoaded, setStatusLoaded] = useState(false); const [statusError, setStatusError] = useState(false); const [passwordForm,setPasswordForm]=useState({current:'',next:'',confirm:''}); const [restarting,setRestarting]=useState(null); const [maintenanceBusy,setMaintenanceBusy]=useState('');
+  const { t, language, setLanguage } = useI18n(); const [s, setS] = useState(null); const [loadError, setLoadError] = useState(false); const [tab, setTab] = useState('general'); const [status, setStatus] = useState(null); const [statusLoaded, setStatusLoaded] = useState(false); const [statusError, setStatusError] = useState(false); const [passwordForm,setPasswordForm]=useState({current:'',next:'',confirm:''}); const [restarting,setRestarting]=useState(null);
   const loadStatus = () => api.systemStatus().then(value => { setStatus(value); setStatusError(false) }).catch(() => setStatusError(true)).finally(() => setStatusLoaded(true))
   useEffect(() => { api.settings().then(value => { setS(value); setLoadError(false) }).catch(() => setLoadError(true)); loadStatus() }, [])
   useEffect(() => {
@@ -817,29 +793,9 @@ export function SystemPage({ showToast }) {
   }, [restarting, showToast, t])
   if (!s || !statusLoaded) return <p className={loadError || statusError ? 'u-error' : ''}>{t(loadError || statusError ? 'Loading failed' : 'Loading')}{!loadError && !statusError && '…'}</p>
   const tabs = [['general', t('General')], ['web', t('Web access')], ['voice', t('Calls & VoWiFi')], ['security', t('Security')], ['backup', t('Backups')], ['maintenance', t('Maintenance')]]
-  const buildCacheReclaimable = status?.host?.project_storage?.build_cache_reclaimable_bytes
-  const oldImagesReclaimable = status?.host?.project_storage?.mdd_old_images_reclaimable_bytes
   const hostRestartAvailable = status?.deployment?.host_restart_available !== false
   const save = async () => { try { const saved = await api.saveSettings(s); setS(saved); showToast(t('Saved')) } catch (e) { showToast(e.message) } }
   const action = async name => { try { const result = name === 'backup' ? await api.createBackup() : await api.maintenance(name); showToast(name === 'backup' && result.missing_attachments ? t('Backup created, but {count} attachment(s) were already missing', { count: result.missing_attachments }) : result.ok ? t('Operation completed') : t('Operation completed with errors')); loadStatus() } catch (e) { showToast(e.message) } }
-  const pruneBuildCache = async () => {
-    if (!window.confirm(t('Clear dangling Docker build cache? Images, containers and volumes are kept.'))) return
-    setMaintenanceBusy('prune_build_cache')
-    try {
-      const result = await api.maintenance('prune_build_cache')
-      showToast(t('Build cache cleaned · {size} reclaimed', { size: formatBytes(result.space_reclaimed_bytes) }))
-      loadStatus()
-    } catch (e) { showToast(e.message) } finally { setMaintenanceBusy('') }
-  }
-  const pruneOldImages = async () => {
-    if (!window.confirm(t('Delete unused old and rollback MDD images? Current images and the trusted Engine base are kept, but one-click rollback will no longer be available.'))) return
-    setMaintenanceBusy('prune_old_images')
-    try {
-      const result = await api.maintenance('prune_old_images')
-      showToast(t('Old images cleaned · {count} removed · {size} reclaimed', { count: result.removed_images, size: formatBytes(result.space_reclaimed_bytes) }))
-      loadStatus()
-    } catch (e) { showToast(e.message) } finally { setMaintenanceBusy('') }
-  }
   const deleteBackup = async name => { if (!window.confirm(t('Delete this local backup? This cannot be undone.'))) return; try { await api.deleteBackup(name); showToast(t('Backup deleted')); loadStatus() } catch (e) { showToast(e.message) } }
   const restart = async scope => {
     if (!window.confirm(t(`restart.confirm.${scope}`))) return
@@ -853,7 +809,8 @@ export function SystemPage({ showToast }) {
   return <div className="u-page"><div className="u-tabs">{tabs.map(([k, l]) => <button key={k} className={tab === k ? 'active' : ''} onClick={() => setTab(k)}>{l}</button>)}</div><div className={['backup', 'maintenance'].includes(tab) ? 'u-settings-shell' : 'card u-panel'}>
     {tab === 'general' && <><h2>{t('General')}</h2><div className="u-form-grid"><div><label>{t('Language')}</label><select value={language} onChange={e => setLanguage(e.target.value)}><option value="zh">中文</option><option value="en">English</option></select></div><div><label>{t('Timezone')}</label><input list="timezones" value={s.timezone || ''} onChange={e => setS({ ...s, timezone: e.target.value })} /><datalist id="timezones"><option>Asia/Shanghai</option><option>Europe/London</option><option>America/New_York</option><option>America/Los_Angeles</option><option>Asia/Tokyo</option><option>UTC</option></datalist></div></div></>}
     {tab === 'web' && <><h2>{t('Web access')}</h2><label><input type="checkbox" className="u-toggle" checked={!!s.tls?.self_signed} onChange={e => setS({ ...s, tls: { ...s.tls, self_signed: e.target.checked } })} />{t('Use self-signed certificate')}</label><div className="u-form-grid"><div><label>{t('Bind address')}</label><input value={s.bind || ''} onChange={e => setS({ ...s, bind: e.target.value })} /></div><div><label>{t('HTTPS port')}</label><input type="number" value={s.http_port || 8443} onChange={e => setS({ ...s, http_port: +e.target.value })} /></div><div><label>{t('Domain')}</label><input value={s.tls?.domain || ''} onChange={e => setS({ ...s, tls: { ...s.tls, domain: e.target.value } })} /></div><div><label>{t('Certificate path')}</label><input value={s.tls?.cert_path || ''} onChange={e => setS({ ...s, tls: { ...s.tls, cert_path: e.target.value } })} /></div><div><label>{t('Private key path')}</label><input value={s.tls?.key_path || ''} onChange={e => setS({ ...s, tls: { ...s.tls, key_path: e.target.value } })} /></div></div></>}
-    {tab === 'voice' && <><h2>{t('Calls & VoWiFi')}</h2><MediaModePanel /><div className="u-form-grid"><div><label>{t('Ring timeout (seconds)')}</label><input type="number" value={s.ring_timeout ?? 35} onChange={e => setS({ ...s, ring_timeout: +e.target.value })} /></div><div><label>{t('Max retries')}</label><input type="number" value={s.retry?.max ?? 3} onChange={e => setS({ ...s, retry: { ...s.retry, max: +e.target.value } })} /></div><div><label>{t('Seconds per attempt')}</label><input type="number" value={s.retry?.interval ?? 30} onChange={e => setS({ ...s, retry: { ...s.retry, interval: +e.target.value } })} /></div><div><label>{t('Data channel rekey interval (minutes, 0 = not initiated by the gateway)')}</label><input type="number" value={s.rekey?.minutes ?? 30} onChange={e => setS({ ...s, rekey: { ...s.rekey, minutes: +e.target.value } })} /></div><div><label>{t('Control channel rekey interval (minutes, 0 = off)')}</label><input type="number" value={s.rekey?.ike_minutes ?? 150} onChange={e => setS({ ...s, rekey: { ...s.rekey, ike_minutes: +e.target.value } })} /></div></div>
+    {tab === 'voice' && <><h2>{t('Calls & VoWiFi')}</h2><div className="u-form-grid"><div><label>{t('SIM lines')}</label><select value={s.max_lines ?? 1} onChange={e => setS({ ...s, max_lines: +e.target.value })}>{Array.from({ length: status?.line_limit?.product_max ?? 2 }, (_, i) => i + 1).map(n => <option key={n} value={n}>{t('At most {count} line(s)', { count: n })}</option>)}</select></div><div><label>{t('Ring timeout (seconds)')}</label><input type="number" value={s.ring_timeout ?? 35} onChange={e => setS({ ...s, ring_timeout: +e.target.value })} /></div><div><label>{t('Max retries')}</label><input type="number" value={s.retry?.max ?? 3} onChange={e => setS({ ...s, retry: { ...s.retry, max: +e.target.value } })} /></div><div><label>{t('Seconds per attempt')}</label><input type="number" value={s.retry?.interval ?? 30} onChange={e => setS({ ...s, retry: { ...s.retry, interval: +e.target.value } })} /></div><div><label>{t('Data channel rekey interval (minutes, 0 = not initiated by the gateway)')}</label><input type="number" value={s.rekey?.minutes ?? 30} onChange={e => setS({ ...s, rekey: { ...s.rekey, minutes: +e.target.value } })} /></div><div><label>{t('Control channel rekey interval (minutes, 0 = off)')}</label><input type="number" value={s.rekey?.ike_minutes ?? 150} onChange={e => setS({ ...s, rekey: { ...s.rekey, ike_minutes: +e.target.value } })} /></div></div>
+      <p className="u-hint" style={{ margin: '4px 0 0' }}>{t('Each line needs about 100 MB of memory. Raise the limit to 2 only after checking that a second line fits; lowering it stops the lines beyond it and keeps their settings.')}</p>
       <p className="u-hint" style={{ margin: '4px 0 0' }}>{t('Some carriers silently expire a VoWiFi session on a fixed clock (observed: ~2h50m). The control channel (IKE) rekey renews the session before that clock fires; keep it below the shortest carrier interval. 0 disables it.')}</p></>}
     {tab === 'security' && <><h2>{t('Security')}</h2><div className="u-detail"><span>{t('HTTPS')}</span><b>{status?.security?.https ? t('Enabled') : t('Disabled')}</b></div><div className="u-detail"><span>{t('Certificate mode')}</span><b>{status?.security?.certificate_mode ? t(status.security.certificate_mode) : '—'}</b></div><h3>{t('Change administrator password')}</h3><div className="u-form-grid"><div><label>{t('Current password')}</label><input type="password" autoComplete="current-password" value={passwordForm.current} onChange={e=>setPasswordForm({...passwordForm,current:e.target.value})}/></div><div><label>{t('New password (at least 10 characters)')}</label><input type="password" autoComplete="new-password" minLength="10" value={passwordForm.next} onChange={e=>setPasswordForm({...passwordForm,next:e.target.value})}/></div><div><label>{t('Confirm password')}</label><input type="password" autoComplete="new-password" minLength="10" value={passwordForm.confirm} onChange={e=>setPasswordForm({...passwordForm,confirm:e.target.value})}/></div></div><button className="btn btn-ghost" disabled={!passwordForm.current||passwordForm.next.length<10||!passwordForm.confirm} onClick={changePassword}>{t('Change password')}</button><p className="u-hint">{t('Changing the password also signs out every app.')}</p><label><input type="checkbox" className="u-toggle" checked={s.security?.audit_enabled !== false} onChange={e => setS({ ...s, security: { ...s.security, audit_enabled: e.target.checked } })} />{t('Record administrative operations')}</label><label>{t('Trusted reverse proxies (comma-separated)')}</label><input value={(s.security?.trusted_proxies || []).join(', ')} onChange={e => setS({ ...s, security: { ...s.security, trusted_proxies: e.target.value.split(',').map(x => x.trim()).filter(Boolean) } })} /></>}
     {tab === 'backup' && <div className="u-settings-stack">
@@ -865,12 +822,12 @@ export function SystemPage({ showToast }) {
       </div>
     </div>}
     {tab === 'maintenance' && <div className="u-settings-grid u-maintenance-grid">
-      <section className="card u-panel u-settings-card"><div className="u-settings-card-head"><div><h2>{t('Routine maintenance')}</h2><p>{t('Refresh runtime state without restarting the host.')}</p></div></div><div className="u-action-list"><button className="btn btn-ghost" onClick={() => action('restart_lines')}>{t('Restart all VoWiFi lines')}</button><button className="btn btn-ghost" onClick={() => action('refresh_egress')}>{t('Refresh country exits')}</button><button className="btn btn-ghost" disabled={!!maintenanceBusy} onClick={pruneOldImages}>{maintenanceBusy === 'prune_old_images' ? t('Cleaning old images…') : oldImagesReclaimable != null ? t('Clear old and rollback images · {size} reclaimable', { size: formatBytes(oldImagesReclaimable) }) : t('Clear old and rollback images')}</button><button className="btn btn-ghost" disabled={!!maintenanceBusy} onClick={pruneBuildCache}>{maintenanceBusy === 'prune_build_cache' ? t('Cleaning build cache…') : buildCacheReclaimable != null ? t('Clear build cache · {size} reclaimable', { size: formatBytes(buildCacheReclaimable) }) : t('Clear build cache')}</button></div><p className="u-hint">{t('Old-image cleanup keeps the current images, trusted Engine base and every image used by a container, but removes rollback images. Build-cache cleanup removes only dangling builder records; containers and volumes are always kept.')}</p></section>
+      <section className="card u-panel u-settings-card"><div className="u-settings-card-head"><div><h2>{t('Routine maintenance')}</h2><p>{t('Refresh runtime state without restarting the host.')}</p></div></div><div className="u-action-list"><button className="btn btn-ghost" onClick={() => action('restart_lines')}>{t('Restart all VoWiFi lines')}</button><button className="btn btn-ghost" onClick={() => action('refresh_egress')}>{t('Refresh country exits')}</button></div></section>
       <section className="card u-panel u-settings-card"><div className="u-settings-card-head"><div><h2>{t('Restart')}</h2><p>{t('Ordered by how much they interrupt: the control plane can be restarted without touching a call, the host cannot.')}</p></div></div><div className="u-action-list">
           <button className="btn btn-ghost" disabled={!!restarting} onClick={() => restart('control')}>{t('Restart the control plane')}</button>
           <button className="btn btn-ghost" disabled={!!restarting} onClick={() => restart('services')}>{t('Restart all gateway services')}</button>
           <button className="btn btn-ghost" disabled={!!restarting || !hostRestartAvailable} onClick={() => restart('host')}>{t('Restart the host')}</button>
-        </div>{!hostRestartAvailable && <p className="u-hint">{t('Host restart is unavailable in container mode. Restart the NAS from its own administration interface.')}</p>}{restarting && <p className="u-note u-restart-note">{t(`restart.waiting.${restarting}`)}</p>}</section>
+        </div>{restarting && <p className="u-note u-restart-note">{t(`restart.waiting.${restarting}`)}</p>}</section>
     </div>}
   </div>{!['backup', 'maintenance'].includes(tab) && <button className="btn btn-primary" onClick={save}>{t('Save')}</button>}</div>
 }
@@ -929,10 +886,6 @@ function HostPanel({ host, alerts, loading, clearing, onClear, t }) {
       <Row label={t('Disk')}>{disk.total_bytes ? t('{percent}% used · {used} / {total} · {free} available', { percent: disk.used_percent, used: formatBytes(disk.used_bytes), total: formatBytes(disk.total_bytes), free: formatBytes(disk.free_bytes) }) : '—'}</Row>
       <Row label={t(project.known_total_is_logical ? 'MDD reported usage (logical)' : 'MDD storage on disk')}>{project.known_total_bytes != null ? formatBytes(project.known_total_bytes) : '—'}</Row>
       <Row label={t('Project files')}>{project.files_bytes != null ? formatBytes(project.files_bytes) : '—'}</Row>
-      {project.docker_images_bytes != null && <Row label={t('MDD image virtual sizes (shared layers counted repeatedly)')}>{formatBytes(project.docker_images_bytes)}</Row>}
-      {project.docker_image_layers_bytes != null && <Row label={t(project.docker_images_all_managed ? 'MDD Docker image layers on disk' : 'All Docker image layers on disk')}>{t('{total} · {reclaimable} reclaimable', { total: formatBytes(project.docker_image_layers_bytes), reclaimable: formatBytes(project.docker_image_reclaimable_bytes) })}</Row>}
-      {!!project.container_writable_bytes && <Row label={t('Container writable layers')}>{formatBytes(project.container_writable_bytes)}</Row>}
-      {project.build_cache_bytes != null && <Row label={t('Shared Docker build cache')}>{t('{total} · {reclaimable} reclaimable', { total: formatBytes(project.build_cache_bytes), reclaimable: formatBytes(project.build_cache_reclaimable_bytes) })}</Row>}
     </div>
 
     <div className="card u-panel">

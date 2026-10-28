@@ -422,6 +422,7 @@ nft table inet mdd:
   - 模板：`asterisk.conf` 的 `astlogdir`/`astrundir` 指向线路目录，`astctlpermissions = 0660`（控制面经组 mdd 用 `asterisk -r -s`）；拨号计划里 `calls.txt` 与 `notify.py` 走线路路径，`notify.py` 用 Python 解释器显式调用（不依赖可执行位）；rtp/pjsip/http 模板去掉 relay 分支。
   - **修正一处违反硬约束的默认行为**：swu_ike 每次应用 P-CSCF 都会执行 `core set debug 3` 90 秒（`SWU_PCSCF_DEBUG_SECONDS` 默认 90），DEBUG 输出写进持久的 `reload_debug` 日志，期间收到的短信 RP-DATA 十六进制会落盘。改为：swu_ike 默认 0；render.py 只在该线路开启 Asterisk 调试时写 90；`logger.conf` 的 `reload_debug` 通道也只在调试时出现。
   - 测试：`tests/test_media_engine.py` 重写为 direct 渲染、线路路径、默认无 debug（含"任何地方都不打开 pjsip logger"）、engine.env 注入（`$(...)`、反引号、换行、引号等被 `set -a; .` 读入后原样保留且不执行）。全量 1004 个通过（relay 渲染与入口防火墙相关用例随功能删除）。
+- 2026-10-28 §12.11 第 6 项完成：WebUI。设置页"维护"删除两个 Docker 清理按钮与说明，"主机信息/存储"删除 Docker 镜像、构建缓存、容器可写层四行，删除"容器模式不能重启主机"的提示；"通话与 VoWiFi"删除媒体模式面板（只剩 direct），增加"SIM 线路数量：最多 1/2 条"选择与内存提示；软电话删除 relay 相关逻辑与提示（`iceServers` 恒为空）；i18n 删除 28 条 Docker/relay 词条，合规提示改为"最多 2 条 SIM 线路"/"at most two SIM lines"。新增 `tests/test_ui_slim.py`。全量 1008 个通过，WebUI 构建与 node 测试通过。后端的 Docker 字段已在第 4 项删除。
 
 ---
 
