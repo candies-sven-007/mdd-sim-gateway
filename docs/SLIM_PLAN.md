@@ -331,9 +331,9 @@ nft table inet mdd:
 - [x] 阶段 1：删除短信/彩信/USSD（保留 D2 的最小 RP-ACK）、余额保号、通知推送、语音留言、联系人、自动更新，连同测试、UI、i18n
 - [x] 阶段 2：删除蜂窝模块路径与全部容器部署文件（runtime/、Dockerfile、compose、drivers/、相关 tools 与 workflow）
 - [x] 阶段 3：拆分 main.py 为 routers（每拆一块跑一次测试）
-- [ ] 阶段 4：systemd 替换 Docker 编排——引擎、netns 隔离、出口防泄漏、RTP DNAT，补测试
-- [ ] 阶段 5：重写 install.sh（install/status/logs/uninstall）与 systemd 单元
-- [ ] 阶段 6：CI——ci.yml 在工作分支 push/PR 上跑；新增 build-arm64.yml；删除 release.yml
+- [x] 阶段 4：systemd 替换 Docker 编排——引擎、netns 隔离、出口防泄漏、RTP DNAT，补测试（CI 两个 job 待首次上设备后补）
+- [~] 阶段 5：重写 install.sh（install/status/logs/uninstall）与 systemd 单元（已提前完成，待设备验证）
+- [~] 阶段 6：CI——ci.yml 在工作分支 push/PR 上跑；新增 build-arm64.yml；删除 release.yml（build-arm64.yml 已提前加入；release.yml 未删）
 - [ ] 阶段 7（需要你在设备上执行）：实测内存与功能，调整 MemoryMax 与线路上限
 
 ### 进度日志
@@ -423,6 +423,14 @@ nft table inet mdd:
   - **修正一处违反硬约束的默认行为**：swu_ike 每次应用 P-CSCF 都会执行 `core set debug 3` 90 秒（`SWU_PCSCF_DEBUG_SECONDS` 默认 90），DEBUG 输出写进持久的 `reload_debug` 日志，期间收到的短信 RP-DATA 十六进制会落盘。改为：swu_ike 默认 0；render.py 只在该线路开启 Asterisk 调试时写 90；`logger.conf` 的 `reload_debug` 通道也只在调试时出现。
   - 测试：`tests/test_media_engine.py` 重写为 direct 渲染、线路路径、默认无 debug（含"任何地方都不打开 pjsip logger"）、engine.env 注入（`$(...)`、反引号、换行、引号等被 `set -a; .` 读入后原样保留且不执行）。全量 1004 个通过（relay 渲染与入口防火墙相关用例随功能删除）。
 - 2026-10-28 §12.11 第 6 项完成：WebUI。设置页"维护"删除两个 Docker 清理按钮与说明，"主机信息/存储"删除 Docker 镜像、构建缓存、容器可写层四行，删除"容器模式不能重启主机"的提示；"通话与 VoWiFi"删除媒体模式面板（只剩 direct），增加"SIM 线路数量：最多 1/2 条"选择与内存提示；软电话删除 relay 相关逻辑与提示（`iceServers` 恒为空）；i18n 删除 28 条 Docker/relay 词条，合规提示改为"最多 2 条 SIM 线路"/"at most two SIM lines"。新增 `tests/test_ui_slim.py`。全量 1008 个通过，WebUI 构建与 node 测试通过。后端的 Docker 字段已在第 4 项删除。
+- 2026-10-28 arm64 发布包（为尽快上设备，提前做了阶段 5 的 install.sh/单元和阶段 6 的 build-arm64.yml）。
+  - `build/build-arm64.sh`：在 debian:bullseye arm64 里构建，全部下载固定版本并校验 sha256/提交号。产物 `mdd-slim-arm64-<版本>.tar.gz`（`install.sh` + `payload/` + `SHA256SUMS`），Xray 单独打成 `mdd-slim-xray-arm64-<版本>.tar.gz`（只在 REALITY/XHTTP 节点需要）。payload 内含 python-build-standalone 3.12 与全部 Python 依赖、Asterisk（sysmocom 分支 + 本仓库补丁，关闭 BUILD_NATIVE、无声音包、按白名单裁剪模块）、pcsc-lite + ccid（带本仓库补丁）、lpac、sing-box、WebUI dist；`apt-packages.txt` 由 ldd + dpkg -S 生成，设备上只用 apt 装这些系统库。
+  - `.github/workflows/build-arm64.yml`：手动触发，或提交信息含 `[arm64]` 的 push 触发；ubuntu-24.04-arm 上跑 debian:bullseye 容器；结果只作为 workflow artifact（保留 30 天），不建 release、不打 tag。
+  - `install.sh` 重写：`install [--xray 包]`、`status`、`logs [control|orchestrator|pcscd|engine N] [行数]`、`reset-admin`、`uninstall [--purge]`。安装前先 `sha256sum -c`，再做环境检查（aarch64、systemd ≥ 247、tun/veth/nf_tables、netns、10.88/16 冲突、旧 Docker 版残留）。不改 apt 源；发行版的 pcscd/libccid 会被停用并卸载（记入 install-state，uninstall 时恢复）；没有 zram 交换时建 `mdd-zram.service`（内存一半，lzo-rle）。
+  - 新单元：`mdd-pcscd.service`、`mdd-orchestrator.service`（root）、`mdd-control.service`（用户 mdd，`systemd-journal` 组）。`requirements-runtime.txt` 固定发布包里的 Python 依赖版本。
+  - 代码改动：orchestrator 以 root 写入数据目录的文件改为属主与数据目录一致（`hand_to_data_owner`），否则控制面（mdd）读不到 proxy-status.json；asterisk.conf 增加 `astdatadir` 指向包内 `var/lib/asterisk`，因为单元把 `/var/lib/asterisk` 挂成空 tmpfs，Asterisk 缺 documentation/ 会退出；`SWU_LIVENESS_PERIOD`/`SWU_PCSCF_APPLY_MODE` 原来是 Docker 环境变量，现在写进 instance.json 再由 render.py 写入 engine.env；P-CSCF 调试窗口默认 0 秒，只有 `debug_asterisk` 时为 90 秒。
+  - 测试：删除依赖旧 install.sh/Docker 镜像的 `test_install_media`、`test_install_tun_mtu`、`test_install_requirements`、`test_engine_image_refresh`；新增 `tests/test_install_script.py`（15 个）。全量 993 个通过，WebUI 构建与 node 测试通过。
+  - 未在 arm64 上实测的点：sysmocom Asterisk 在 gcc 10 下能否编过（R3）、pcsc-lite 2.x 的 meson 选项、各组件在 Debian 11 glibc 2.31 上的运行，均由 build-arm64.yml 的冒烟测试先检查一遍。
 
 ---
 

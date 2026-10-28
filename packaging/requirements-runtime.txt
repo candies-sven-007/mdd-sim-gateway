@@ -1,0 +1,19 @@
+# Python packages of the device release (build/build-arm64.sh), for the control plane, the
+# orchestrator and the engines alike. control/requirements.txt stays what CI tests against.
+# uvicorn without [standard]: no uvloop/watchfiles/httptools on a 382 MB device (SLIM_PLAN 2.1);
+# h11 and websockets cover HTTP and the WebSocket endpoints.
+fastapi==0.141.1
+uvicorn==0.52.0
+websockets==17.1
+pyscard==2.3.1
+panoramisk==1.4
+PyYAML==6.0.3
+cryptography==50.0.0
+Jinja2==3.1.6
+python-multipart==0.0.32
+requests==2.34.2
+PySocks==1.7.1
+pyserial==3.5
+# Engine (swu_ike / ami_usim): IKE and ESP crypto, and the SIM card helpers.
+pycryptodome==3.23.0
+card @ git+https://github.com/mitshell/card.git@790a8fb0b8fbc0b06f568feba51aeef28352145e

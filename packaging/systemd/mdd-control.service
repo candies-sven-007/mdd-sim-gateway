@@ -1,0 +1,30 @@
+# Web UI and API (control/run.py), as the unprivileged user mdd. Starts and stops engines only
+# through `sudo -n /usr/local/sbin/mdd-enginectl`, so NoNewPrivileges and a narrowed capability
+# bounding set are not possible here (SLIM_PLAN R-4).
+[Unit]
+Description=MDD Sim Gateway control plane
+After=network-online.target mdd-pcscd.service mdd-orchestrator.service
+Wants=network-online.target mdd-pcscd.service mdd-orchestrator.service
+
+[Service]
+Type=simple
+User=mdd
+Group=mdd
+SupplementaryGroups=systemd-journal
+WorkingDirectory=/opt/mdd/current/control
+ExecStart=/opt/mdd/current/venv/bin/python /opt/mdd/current/control/run.py
+Environment=MDD_DATA=/var/lib/mdd
+Environment=MDD_WEBUI=/opt/mdd/current/webui/dist
+Environment=MDD_LPAC_BIN=/opt/mdd/current/lpac/lpac
+Environment=MDD_ASTERISK=/opt/mdd/current/asterisk/sbin/asterisk
+Environment=PATH=/opt/mdd/current/bin:/opt/mdd/current/venv/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=LD_LIBRARY_PATH=/opt/mdd/current/lib:/opt/mdd/current/asterisk/lib
+Environment=MALLOC_ARENA_MAX=2 PYTHONDONTWRITEBYTECODE=1
+Restart=always
+RestartSec=3
+MemoryMax=160M
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

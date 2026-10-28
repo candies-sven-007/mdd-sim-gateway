@@ -1,0 +1,19 @@
+# Country exits (sing-box, optional Xray), each line's route and the nftables rules that
+# confine it (host/mdd_orchestrator.py, host/mdd_netns.py). Runs as root.
+[Unit]
+Description=MDD country egress orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/mdd/current/venv/bin/python -I /opt/mdd/current/host/mdd_orchestrator.py --data /var/lib/mdd --repo /opt/mdd/current
+Environment=PATH=/opt/mdd/current/bin:/opt/mdd/current/venv/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=MALLOC_ARENA_MAX=2 PYTHONDONTWRITEBYTECODE=1
+Restart=always
+RestartSec=3
+KillMode=control-group
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

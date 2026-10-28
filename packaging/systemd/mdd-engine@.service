@@ -32,7 +32,8 @@ Environment=MDD_TPL=/opt/mdd/current/engine/templates
 Environment=MDD_ENGINE_ETC=/run/mdd-engine-%i
 Environment=MDD_ASTERISK_CORE_DUMP=0
 Environment=PATH=/opt/mdd/current/venv/bin:/opt/mdd/current/asterisk/sbin:/opt/mdd/current/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=LD_LIBRARY_PATH=/opt/mdd/current/lib
+Environment=LD_LIBRARY_PATH=/opt/mdd/current/lib:/opt/mdd/current/asterisk/lib
+Environment=MDD_AST_DATADIR=/opt/mdd/current/asterisk/var/lib/asterisk
 Environment=PYTHONDONTWRITEBYTECODE=1 MALLOC_ARENA_MAX=2 SWU_TUN_MTU=1400
 ReadWritePaths=/var/lib/mdd/instances/%i/run /var/lib/mdd/instances/%i/logs /run/pcscd
 TemporaryFileSystem=/etc/asterisk:mode=0750 /var/lib/asterisk:mode=0750 /var/spool/asterisk:mode=0750

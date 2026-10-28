@@ -142,7 +142,8 @@ async def run_lpac(
     if not os.path.isfile(binary):
         raise LpaError(
             f"lpac binary not found at {binary}. "
-            "Build it with: sudo ./install.sh build-lpac"
+            "The release ships it at /opt/mdd/current/lpac/lpac; reinstall the release "
+            "(sudo ./install.sh install)"
         )
     if not os.access(binary, os.X_OK):
         raise LpaError(f"lpac binary is not executable: {binary}")

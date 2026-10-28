@@ -1,0 +1,16 @@
+# PC/SC daemon built from the pinned pcsc-lite with the patched CCID driver (SLIM_PLAN D8).
+# The distribution's pcscd.service/pcscd.socket are masked by install.sh.
+[Unit]
+Description=MDD PC/SC smart card daemon
+Before=mdd-control.service
+
+[Service]
+Type=simple
+ExecStart=/opt/mdd/current/sbin/pcscd --foreground
+Environment=LD_LIBRARY_PATH=/opt/mdd/current/lib
+Restart=always
+RestartSec=2
+MemoryMax=32M
+
+[Install]
+WantedBy=multi-user.target

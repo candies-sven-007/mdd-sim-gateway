@@ -5,6 +5,10 @@
 ; default, which the engine unit gives each line privately.
 astlogdir = {{ ast_logdir }}
 astrundir = {{ rundir }}/asterisk
+{% if ast_datadir %}
+; Read-only data from the release (documentation/ must exist or Asterisk exits at startup).
+astdatadir = {{ ast_datadir }}
+{% endif %}
 
 [options]
 verbose = {{ 5 if debug_asterisk else 2 }}

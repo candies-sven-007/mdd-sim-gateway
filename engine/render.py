@@ -280,6 +280,7 @@ def build_context(cfg):
         "ast_logdir": AST_LOGDIR,
         "rundir": RUNDIR,
         "engine_dir": ENGINE_DIR,
+        "ast_datadir": os.environ.get("MDD_AST_DATADIR", ""),
         "python": sys.executable or "python3",
         "debug_asterisk": cfg.get("debug", {}).get("asterisk", False),
         "debug_charon": cfg.get("debug", {}).get("charon", False),

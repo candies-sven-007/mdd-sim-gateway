@@ -55,6 +55,24 @@ def read_json(path: Path) -> dict:
         return {}
 
 
+def hand_to_data_owner(path: Path) -> None:
+    """Give a file this root process wrote to whoever owns the data directory.
+
+    The control plane runs as the unprivileged user that owns /var/lib/mdd and reads what this
+    process publishes (proxy-status.json, the restart status). Root-owned 0600 files would lock
+    it out; the modes stay owner-only, only the owner changes.
+    """
+    if os.geteuid() != 0:
+        return
+    try:
+        owner = path.parent.parent.stat()
+        for item in (path.parent, path):
+            if item.exists():
+                os.chown(item, owner.st_uid, owner.st_gid)
+    except OSError:
+        pass
+
+
 def atomic_json(path: Path, value: dict):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
@@ -62,6 +80,7 @@ def atomic_json(path: Path, value: dict):
     tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+    hand_to_data_owner(path)
 
 
 def append_jsonl(path: Path, record: dict, limit: int = 500):
@@ -81,6 +100,7 @@ def append_jsonl(path: Path, record: dict, limit: int = 500):
         tmp.write_text("\n".join(lines[-limit:]) + "\n", encoding="utf-8")
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        hand_to_data_owner(path)
     except OSError:
         # Diagnostics must never take the orchestrator's reconcile loop down.
         pass
@@ -1354,7 +1374,8 @@ class Orchestrator:
         if not binary:
             raise RuntimeError(
                 "Xray-core executable not found; REALITY and XHTTP nodes are carried by it "
-                "(install it with: sudo ./install.sh reload)")
+                "(install the Xray archive: sudo ./install.sh install --xray "
+                "mdd-slim-xray-arm64-<version>.tar.gz)")
         candidate = self.xray_generated.with_name("xray.candidate.json")
         atomic_json(candidate, config)
         check = run([binary, "run", "-test", "-config", str(candidate)])
@@ -1474,7 +1495,8 @@ class Orchestrator:
                                        "lines": lines_status})
 
     def loop(self):
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        hand_to_data_owner(self.root / "desired.json")
         # Runs once, before the first pass: a restart that took this process with it can only
         # be completed by the process that comes back.
         self.settle_service_restart()

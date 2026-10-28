@@ -111,7 +111,8 @@ DEFAULTS = {
             "support_bundle_log_lines": 500,
         },
 
-        # Local lpac (eSIM LPA) integration. Binary is built by `./install.sh build-lpac` into
+        # Local lpac (eSIM LPA) integration. The release ships the binary (MDD_LPAC_BIN); a local
+        # build may live in
         # $MDD_DATA/lpac/ (STANDALONE layout). Empty lpac_bin → default path below.
         "esim": {
             "lpac_bin": "",
@@ -124,8 +125,9 @@ DEFAULTS = {
 
 
 def default_lpac_bin() -> str:
-    """Default path for the locally-built STANDALONE lpac binary."""
-    return os.path.join(DATA_DIR, "lpac", "lpac")
+    """Default path for the STANDALONE lpac binary: the packaged one (MDD_LPAC_BIN, set by the
+    control unit), else a locally built one under the data directory."""
+    return os.environ.get("MDD_LPAC_BIN") or os.path.join(DATA_DIR, "lpac", "lpac")
 
 
 def internal_event_token() -> str:
