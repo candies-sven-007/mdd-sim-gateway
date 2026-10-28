@@ -455,6 +455,10 @@ nft table inet mdd:
   - 修正：新增 `link_port()`（只接受 1–65535 的十进制数，否则报可读的 ValueError）和 `_split_link()`（`urlsplit` + `.hostname`/`.port`，并把 urlsplit 自己的端口异常换成可读信息）。ss 分支改为先确定 userinfo（最后一个 `@` 之前，标准 base64 里可能有 `/`，先百分号编码），再交给 `urlsplit`，SIP002 base64、2022 明文、整段 base64 三种写法都支持。vmess 校验 host 与端口；`clash_outbound` 也改用 `link_port()`（订阅节点同样受益）。
   - 400：`egress.EgressInputError`（EgressError 的子类）表示输入无法解析；`test_proxy_profile` 把所有读取链接的步骤（包括 Xray 出站的构建）放进同一个 try，路由对它返回 400 `{message, parsed}`，前端已经读取 `detail.message`。缺少 sing-box 等网关自身问题仍为 503。
   - 测试：`tests/test_share_link_ports.py`（11 个，含子用例）覆盖 vless、trojan、hysteria2/hy2、ss 三种写法、vmess 与 `host:port/?q`、`host:port?q`、`host:port/`、`#备注`、`[IPv6]:port`、无端口、非法端口等组合，以及路由的 400/503。确认过这些测试在修改前的代码上会失败（包括设备上那种链接格式）。
+- 2026-10-28 Bug 2：线路上限挡住了 SIM，页面却只提示"插入可读取的 SIM"。
+  - 匹配逻辑分析：插卡时按 ICCID 匹配（`state._match_instance_by_iccid`），不按读卡器槽位；读卡器槽位只在"已有运行中的引擎占着这张卡"时用来对应。拔卡或拔读卡器不占用、也不释放任何名额。"SIM line limit reached; ignoring…" 只会在 `_ensure_card_draft` 里打出，而走到这里的前提是读到的 ICCID 不属于任何已保存线路。因此设备上 6697 这次读到的 ICCID 与线路 1 保存的不同：要么是另一张卡，要么是 eUICC 切换了配置（ICCID 随配置变化），要么线路 1 保存的 ICCID 与读到的不一致。代码里没有找到"同一 ICCID 重插后匹配不上"的路径，需要设备上的数据确认（只看尾号，见交付说明）。
+  - 修改：上限挡住时在卡片状态里记下 `not_enabled = {reason: line_limit, max_lines, iccid_tail}`；`/api/devices` 对这种卡返回 `provisioning.state = "line_limit"` 和 `line_limit` 字段，VoWiFi 原因改为"这张 SIM 没有对应线路：已达到 SIM 线路上限"；设备页显示"尾号 xxxx 的 SIM 未启用：已达到上限（N 条）"和处理办法。卡片监控每轮检查被挡住的卡，一旦删掉线路或调大上限，就自动为它建线路并尝试启动，不需要重新插卡。
+  - 测试：`tests/test_line_limit_card.py`（7 个）：同一张卡拔读卡器再插、只拔卡再插都回到原线路，不尝试新建；重插时读卡失败不占名额；上限挡住时日志、卡片状态、`/api/devices`、`/api/cards` 都带原因；删线路、调大上限、卡片监控自动重试三种解除方式。
 
 ---
 

@@ -128,11 +128,46 @@ def _ensure_card_draft(info: dict) -> dict | None:
             "debug": {"asterisk": False, "charon": False},
         }, unique_name=True)
     except cfg.LineLimitError:
-        log.warning("SIM line limit reached; ignoring newly detected SIM %s",
-                    iccid[-4:])
+        limit = cfg.max_lines()
+        log.warning("SIM line limit reached (%s line(s)); ignoring newly detected SIM %s",
+                    limit, iccid[-4:])
+        # Kept on the live card so the devices page can say why this SIM has no line,
+        # instead of looking like a card that could not be read. The card monitor retries
+        # once a line is deleted or the limit is raised (retry_line_limited_cards).
+        info["not_enabled"] = {"reason": "line_limit", "max_lines": limit,
+                               "iccid_tail": iccid[-4:]}
         return None
+    info.pop("not_enabled", None)
     egress.publish()
     return inst
+
+
+def line_limited_cards() -> list[dict]:
+    """Present cards whose SIM was ignored because every line slot was taken."""
+    return [card for card in hub.cards.values()
+            if card.get("present") and not card.get("matched")
+            and (card.get("not_enabled") or {}).get("reason") == "line_limit"]
+
+
+def retry_line_limited_cards(waiting: list[dict]) -> list[str]:
+    """Create the lines that the limit blocked (cards from line_limited_cards()), if room.
+
+    Returns the ids of lines created. The card monitor takes the snapshot on the event loop
+    and runs this in a thread, and only when something is waiting; the config is read once
+    and written only when a slot is actually free.
+    """
+    if not waiting or len(cfg.list_instances()) >= cfg.max_lines():
+        return []
+    created = []
+    for card in waiting:
+        inst = _ensure_card_draft(card)
+        if not inst:
+            break                      # the limit was reached again
+        card["matched"] = inst["id"]
+        created.append(str(inst["id"]))
+        log.info("line limit no longer blocks SIM %s: created line %s",
+                 str(card.get("iccid") or "")[-4:], inst["id"])
+    return created
 
 
 def _exit_ledger_path() -> str:

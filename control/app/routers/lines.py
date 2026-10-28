@@ -654,8 +654,17 @@ async def _unified_devices() -> list[dict]:
         running = bool(inst) and (line_status or {}).get("state") != "STOPPED"
         vowifi = device_state.native_vowifi_capability(vowifi_desired, running, line_status)
         is_draft = bool(inst) and inst.get("provisioning_state") == "draft"
+        # A readable SIM the line limit kept out (state._ensure_card_draft). Without this
+        # the page could only say "insert a readable SIM", which is not what happened.
+        blocked = (native_card or {}).get("not_enabled") or {}
+        line_limited = bool(native_card and native_card.get("present") and not inst
+                            and native_card.get("iccid")
+                            and blocked.get("reason") == "line_limit")
         if not device_present:
             vowifi.update(actual="off", available=False, reason="Device not connected")
+        elif not inst and line_limited:
+            vowifi.update(available=False, reason=(
+                "This SIM has no line: the SIM line limit is reached"))
         elif not inst:
             vowifi.update(available=False, reason="Insert a readable SIM before enabling VoWiFi")
         elif is_draft:
@@ -736,7 +745,11 @@ async def _unified_devices() -> list[dict]:
                 "detected_country": egress.country_for_mcc((inst or card_info).get("mcc")),
                 "override": egress.normalize_country((inst or {}).get("proxy_country")),
                 "available_countries": available_countries},
-            "provisioning": {"state": "draft" if is_draft else "ready" if inst else "detecting",
+            "provisioning": {"state": ("draft" if is_draft else "ready" if inst
+                                       else "line_limit" if line_limited else "detecting"),
+                **({"line_limit": {"max_lines": cfg.max_lines(),
+                                   "iccid_tail": blocked.get("iccid_tail") or ""}}
+                   if line_limited else {}),
                 # IMEI is set on the Hardware tab; everything else on the SIM tab.
                 "missing": ([_DRAFT_FIELD_KEYS[name] for name in draft_missing]
                             if draft_missing is not None else

@@ -313,6 +313,13 @@ async def card_monitor():
                     else:
                         await _on_card_remove(entry)
                     changed = True
+            # A SIM ignored for the line limit gets its line as soon as a line is deleted or
+            # the limit is raised, without having to be re-inserted.
+            waiting = app_state.line_limited_cards()
+            for iid in (await asyncio.to_thread(app_state.retry_line_limited_cards, waiting)
+                        if waiting else []):
+                asyncio.create_task(app_state._auto_start_hotplugged_line(iid))
+                changed = True
             # The first completed scan is always announced, even when it found nothing:
             # it is what turns the UI's "detecting devices" state into a real answer.
             if changed or first:

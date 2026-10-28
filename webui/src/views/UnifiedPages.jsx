@@ -189,6 +189,9 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
   // (Hardware tab); every other field belongs to the SIM (SIM tab).
   const setupMissing = kind === 'vowifi' && device.provisioning?.state === 'draft'
     ? (device.provisioning?.missing || []) : []
+  // A readable SIM that the line limit kept out: say so, and what to do about it.
+  const lineLimit = kind === 'vowifi' && device.provisioning?.state === 'line_limit'
+    ? (device.provisioning?.line_limit || {}) : null
   const needsImei = setupMissing.includes('imei')
   const needsSim = setupMissing.some(key => key !== 'imei')
   // IMSI and MCC/MNC come from the card itself. A reader can miss them on the read at
@@ -209,6 +212,10 @@ export function CapabilitySwitch({ device, kind, onChanged, showToast, compact =
   }
   return <div className={`u-capability ${compact ? 'compact' : ''}`}>
     <div><b>{title}</b><div className="u-cap-detail">{detail}</div>
+      {lineLimit && <div className="u-cap-setup">
+        <span>{t('SIM ending {tail} was not enabled: the limit of {count} SIM line(s) is reached.', { tail: lineLimit.iccid_tail || '????', count: lineLimit.max_lines })}</span>
+        <span>{t('Delete a line you no longer use, or raise "SIM lines" in Settings → Calls & VoWiFi. The SIM is then set up automatically.')}</span>
+      </div>}
       {!!setupMissing.length && <div className="u-cap-setup">
         <span>{t('Missing information')}: {setupMissing.map(key => t(`setup.field.${key}`)).join(t('list separator'))}</span>
         {needsCardRead && <button className="btn btn-ghost" disabled={rereading} onClick={rereadSim}>{t(rereading ? 'Reading…' : 'Read SIM again')}</button>}
