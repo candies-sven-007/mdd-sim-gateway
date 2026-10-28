@@ -21,6 +21,7 @@ UNIT_DIR=/etc/systemd/system
 UNITS="mdd-pcscd.service mdd-orchestrator.service mdd-control.service mdd-netns@.service mdd-engine@.service"
 SERVICES="mdd-pcscd.service mdd-orchestrator.service mdd-control.service"
 ENGINECTL=/usr/local/sbin/mdd-enginectl
+BTCTL=/usr/local/sbin/mdd-btctl
 SUDOERS=/etc/sudoers.d/mdd
 MODULES_FILE=/etc/modules-load.d/mdd.conf
 SYSCTL_FILE=/etc/sysctl.d/90-mdd.conf
@@ -189,6 +190,7 @@ install_units() {
     install -m 0644 "$CURRENT/packaging/systemd/$unit" "$UNIT_DIR/$unit"
   done
   install -m 0755 -o root -g root "$CURRENT/packaging/sbin/mdd-enginectl" "$ENGINECTL"
+  install -m 0755 -o root -g root "$CURRENT/packaging/sbin/mdd-btctl" "$BTCTL"
   temporary=$(mktemp)
   cp "$CURRENT/packaging/sudoers.d/mdd" "$temporary"
   visudo -cf "$temporary" >/dev/null || { rm -f "$temporary"; die "sudoers fragment failed visudo -cf"; }
@@ -345,7 +347,7 @@ cmd_uninstall() {
     nft delete table inet mdd 2>/dev/null || true
     nft delete table ip mdd_nat 2>/dev/null || true
   fi
-  rm -f "${SUDOERS:?}" "${ENGINECTL:?}" "${MODULES_FILE:?}" "${SYSCTL_FILE:?}"
+  rm -f "${SUDOERS:?}" "${ENGINECTL:?}" "${BTCTL:?}" "${MODULES_FILE:?}" "${SYSCTL_FILE:?}"
   for point in $MOUNT_POINTS; do
     if [ "$(state_get "created:$point")" = 1 ]; then rmdir "$point" 2>/dev/null || true; fi
   done

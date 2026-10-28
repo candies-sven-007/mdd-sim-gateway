@@ -510,3 +510,13 @@ label:has(>.u-toggle) { display:flex; align-items:center; gap:10px; min-height:3
     border-radius: 10px;
   }
 }
+/* Bluetooth speaker page (views/Bluetooth.jsx). Flex with wrapping rather than a media query:
+   the buttons drop under the device name whenever the name column would fall below 220px. */
+.u-bt-row { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px; margin-top:14px; padding-top:14px; border-top:1px solid var(--border); }
+.u-bt-row > :first-child { flex:1 1 220px; min-width:0; }
+.u-bt-row > .u-proxy-actions { flex:0 1 auto; justify-content:flex-start; }
+.u-bt-row h4 { margin:0 0 4px; font-size:14px; overflow-wrap:anywhere; }
+.u-bt-row p { margin:0; color:var(--text-dim); font-size:12px; }
+.u-bt-row .u-proxy-actions .u-note { margin:0; font-size:12px; }
+.u-inline-check { display:inline-flex; align-items:center; gap:6px; margin-top:6px; font-size:13px; cursor:pointer; }
+.u-bt-volume input[type=range] { width:100%; }

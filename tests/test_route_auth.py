@@ -25,7 +25,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from control.app import auth, gate, main
 from control.app import config as cfg
-from tests.test_route_set import BASELINE_HTTP, BASELINE_WEBSOCKET
+from tests.test_route_set import BASELINE_WEBSOCKET, SERVED_HTTP as BASELINE_HTTP
 
 # Reachable without a session, and why. Read from gate.py and routers/auth.py:
 PUBLIC = {

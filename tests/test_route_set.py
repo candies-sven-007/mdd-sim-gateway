@@ -80,6 +80,18 @@ BASELINE_HTTP = frozenset({
     ("PUT", "/api/settings"),
 })
 
+# Deliberate additions after the baseline, each with the change that made it. Every one of
+# them is requested signed out by tests/test_route_auth.py like the baseline.
+ADDED_HTTP = frozenset({
+    # Bluetooth speaker page (docs/SLIM_PLAN.md progress log, 2026-10-28).
+    ("GET", "/api/bluetooth/status"),
+    ("POST", "/api/bluetooth/scan"),
+    ("POST", "/api/bluetooth/devices/{mac}/{action}"),
+    ("PUT", "/api/bluetooth/volume"),
+    ("PUT", "/api/bluetooth/autoconnect"),
+})
+SERVED_HTTP = BASELINE_HTTP | ADDED_HTTP
+
 BASELINE_WEBSOCKET = frozenset({
     "/api/instances/{iid}/softphone/ws",
     "/ws",
@@ -115,8 +127,8 @@ def current_routes(app=main.app):
 class RouteSetTests(unittest.TestCase):
     def test_http_routes_match_the_baseline(self):
         http, _, _ = current_routes()
-        self.assertEqual(sorted(http - BASELINE_HTTP), [], "routes not in the baseline")
-        self.assertEqual(sorted(BASELINE_HTTP - http), [], "baseline routes that are gone")
+        self.assertEqual(sorted(http - SERVED_HTTP), [], "routes not in the baseline")
+        self.assertEqual(sorted(SERVED_HTTP - http), [], "baseline routes that are gone")
 
     def test_websocket_paths_match_the_baseline(self):
         _, websocket, _ = current_routes()
@@ -135,7 +147,7 @@ class RouteSetTests(unittest.TestCase):
         self.assertIsNone(main.app.redoc_url)
 
     def test_every_http_route_is_under_api(self):
-        self.assertTrue(all(path.startswith("/api/") for _, path in BASELINE_HTTP))
+        self.assertTrue(all(path.startswith("/api/") for _, path in SERVED_HTTP))
 
     def test_each_route_is_registered_once(self):
         seen = []

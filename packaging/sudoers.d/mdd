@@ -1,4 +1,7 @@
-# The control plane (user mdd) may start and stop line engines, and nothing else.
-# mdd-enginectl validates its arguments itself: sudo 1.9.5 (Debian 11) has no argument regex.
+# The control plane (user mdd) may start and stop line engines and drive the Bluetooth speaker,
+# and nothing else. Both helpers validate their arguments themselves: sudo 1.9.5 (Debian 11) has
+# no argument regex.
 Defaults:mdd !requiretty, !lecture, env_reset, timestamp_timeout=0
 mdd ALL=(root) NOPASSWD: /usr/local/sbin/mdd-enginectl
+# Bluetooth speaker control for the web UI (mdd-btctl validates its own arguments too).
+mdd ALL=(root) NOPASSWD: /usr/local/sbin/mdd-btctl

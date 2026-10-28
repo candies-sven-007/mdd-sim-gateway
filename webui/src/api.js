@@ -135,6 +135,12 @@ export const api = {
   call: (id, to, from_endpoint = 'webrtc') => j('POST', `/api/instances/${id}/call`, { to, from_endpoint }),
   hangup: (id) => j('POST', `/api/instances/${id}/hangup`),
   softphone: (id) => j('GET', `/api/instances/${id}/softphone`),
+  // Bluetooth speaker (control/app/routers/bluetooth.py). The MAC is validated server-side too.
+  bluetoothStatus: () => j('GET', '/api/bluetooth/status'),
+  bluetoothScan: () => j('POST', '/api/bluetooth/scan'),
+  bluetoothDevice: (mac, action) => j('POST', `/api/bluetooth/devices/${encodeURIComponent(mac)}/${encodeURIComponent(action)}`),
+  bluetoothVolume: (body) => j('PUT', '/api/bluetooth/volume', body),
+  bluetoothAutoconnect: (mac) => j('PUT', '/api/bluetooth/autoconnect', { mac }),
   // Call media mode; only direct remains.
   media: () => j('GET', '/api/media'),
 

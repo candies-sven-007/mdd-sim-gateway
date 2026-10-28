@@ -214,7 +214,8 @@ rm -rf "${PREFIX:?}/engine/patches"
 echo "$VERSION" > "$PREFIX/VERSION"
 mkdir -p "$PREFIX/webui"; cp -a "$WEBUI_DIST" "$PREFIX/webui/dist"
 find "${PREFIX:?}" -name __pycache__ -prune -exec rm -rf {} +
-chmod 0755 "$PREFIX/engine/entrypoint.sh" "$PREFIX/packaging/sbin/mdd-enginectl"
+chmod 0755 "$PREFIX/engine/entrypoint.sh" "$PREFIX/packaging/sbin/mdd-enginectl" \
+  "$PREFIX/packaging/sbin/mdd-btctl"
 # ProtectSystem=strict keeps /opt read-only at runtime, so compile the bytecode now.
 "$PY" -m compileall -q "$PREFIX/control" "$PREFIX/engine" "$PREFIX/host" >/dev/null
 rm -rf "${PREFIX:?}/include" "${PREFIX:?}/lib/pkgconfig" "${PREFIX:?}/share/man" "${PREFIX:?}/share/doc"
@@ -253,6 +254,9 @@ netns_status=0; "$PY" -I "$PREFIX/host/mdd_netns.py" up 0 2>/dev/null || netns_s
 [ "$netns_status" -eq 64 ]
 sh -n "$PREFIX/engine/entrypoint.sh"          # sh -n checks only its first file
 sh -n "$PREFIX/packaging/sbin/mdd-enginectl"
+# mdd-btctl runs on the bundled interpreter (its shebang); an unknown action is refused (64).
+btctl_status=0; "$PY" -I "$PREFIX/packaging/sbin/mdd-btctl" no-such-action >/dev/null || btctl_status=$?
+[ "$btctl_status" -eq 64 ]
 
 cat > "$PREFIX/BUILDINFO" <<EOF
 version=$VERSION

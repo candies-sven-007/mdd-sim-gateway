@@ -3,13 +3,14 @@ import { api, connectWs, setCsrf } from './api.js'
 import Softphone from './views/Softphone.jsx'
 import GlobalSoftphone from './GlobalSoftphone.jsx'
 import Esim from './views/Esim.jsx'
+import BluetoothPage from './views/Bluetooth.jsx'
 import { UnifiedOverview, DevicesPage, EgressPage, SystemPage, DiagnosticsPage } from './views/UnifiedPages.jsx'
 import { useI18n } from './i18n.jsx'
 
 const NAV = [
   ['overview', 'Overview', '⌂'], ['devices', 'Devices', '▣'], ['calls', 'Calls', '☎'],
   ['esim', 'eSIM', '◎'],
-  ['egress', 'Network exits', '⇄'],
+  ['egress', 'Network exits', '⇄'], ['bluetooth', 'Bluetooth audio', '♫'],
   ['settings', 'System settings', '⚙'], ['diagnostics', 'Diagnostics', '≣'],
 ]
 
@@ -199,6 +200,7 @@ export default function App() {
   const content={
     overview:<UnifiedOverview {...common}/>, devices:<DevicesPage {...common}/>, calls:<Softphone {...common}/>,
     esim:<Esim {...common}/>,
+    bluetooth:<BluetoothPage showToast={showToast}/>,
     egress:<EgressPage {...common}/>,
     settings:<SystemPage {...common}/>, diagnostics:<DiagnosticsPage {...common}/>,
   }[view]

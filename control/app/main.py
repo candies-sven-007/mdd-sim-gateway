@@ -25,6 +25,7 @@ from . import store, engine, egress, gate
 from . import state as app_state
 from . import tasks as app_tasks
 from .routers import auth as auth_routes
+from .routers import bluetooth as bluetooth_routes
 from .routers import egress as egress_routes
 from .routers import engine as engine_routes
 from .routers import esim as esim_routes
@@ -109,6 +110,7 @@ app.include_router(esim_routes.router)
 app.include_router(egress_routes.router)
 app.include_router(logs_routes.router)
 app.include_router(system_routes.router)
+app.include_router(bluetooth_routes.router)
 
 
 def _audit_client(request: Request, settings: dict) -> str:

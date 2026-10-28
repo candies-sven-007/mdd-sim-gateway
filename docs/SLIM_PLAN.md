@@ -463,6 +463,15 @@ nft table inet mdd:
   - 依据：同一时间 `/ws?auth_close=1` 用同一 cookie 和 Origin 能连上，说明会话和 Origin 校验都通过；Origin 被拒时 gate 会打 "refused WebSocket … from origin" 日志。403 来自 `ws_softphone` 自己：线路不存在或关了软电话（1008）、读不到引擎状态或引擎没运行（1013）、引擎连不上（1011），都是在 accept 之前 close，uvicorn 把这种情况记为 HTTP 403，浏览器只看到 1006。`GlobalSoftphone` 会给每条开着软电话的线路建 UA，不看线路是否在运行，JsSIP 按 2–30 秒的退避一直重连，所以线路 1 没运行时就每隔几秒一个 403（与 Bug 2 的线路状态吻合）。
   - 修改（按"预期行为"处理）：relay 对这些情况先以 sip 子协议 accept，再用明确的关闭码和原因关闭：4404 线路不存在、4410 软电话已关、4409 线路未运行、4503 读不到状态、4502 引擎无响应；不支持 sip 子协议的客户端仍在握手阶段拒绝（1008）。JsSIP 每次连上都会把退避计数清零，所以前端不能依赖它：`Softphone` 收到这些码时停掉 JsSIP 的重连，自己按 30 秒起翻倍、最长 10 分钟重试，注册成功后清零；软电话页显示原因和下次重试时间，其他页面不提示。
   - 测试：`test_softphone_ws` 按新行为改写（accept 后带码和原因关闭，原因不超过 123 字节，前后端的码集合一致）；`webui/tests/softphone-refusal.test.mjs` 检查退避序列、拒绝后停掉 UA 并按时重启、`stop()` 取消待重试。
+- 2026-10-28 新功能：蓝牙音频页面。权限模型按 2026-10-28 的确认：控制面仍以 mdd 运行，不加入 bluetooth/pulse-access 组、不改 PulseAudio 认证，所有蓝牙与音量操作都是一次 `sudo -n /usr/local/sbin/mdd-btctl <动作> [参数]`。
+  - `packaging/sbin/mdd-btctl`（root，0755，由 install.sh 安装、uninstall 删除）：用发布包自带的解释器（`#!/opt/mdd/current/venv/bin/python3 -I`；/opt/mdd 归 root，mdd 不可写），不读 mdd 可写的任何文件。动作白名单 status/scan/pair/connect/disconnect/remove/volume/mute/autoconnect，其余一律退出码 64；MAC、0–100 音量、0/1 静音、MAC 或 none 在脚本里再校验一遍；固定 PATH 与环境（`LC_ALL=C`、`PULSE_SERVER=unix:/run/pulse/native`），参数列表调用，不经过 shell；输出 JSON；修改类动作用 flock `/run/mdd-btctl.lock` 串行；autoconnect 先写临时文件再 rename。
+  - 与确认内容的一处差异：`status` 不取锁。配对会持锁约 40 秒，而页面扫描时每秒轮询状态；status 只读，修改类动作仍全部串行。
+  - 配对在同一个 bluetoothctl 会话里完成（stdin 依次写 agent、scan on、等设备出现、pair、trust、connect），即设备上实测成功的做法；扫描用后台进程，30 秒，状态写在 `/run/mdd-btctl.scan`。名字里的零宽字符会清掉；未命名设备（名字就是地址）标为 named=false；音量取 `pactl list sinks` 里第一条 `Volume:`（不是 `Base Volume:`），多声道取平均。
+  - sudoers 增加一行 `mdd ALL=(root) NOPASSWD: /usr/local/sbin/mdd-btctl`，`visudo -cf` 通过。mdd-control 单元没有 ProtectSystem/NoNewPrivileges，sudo 起的 root 进程能写 /var/lib/bt-speaker、访问系统 D-Bus 和 /run/pulse，单元不用改。
+  - 控制面 `routers/bluetooth.py`：GET status、POST scan、POST devices/{mac}/{action}、PUT volume、PUT autoconnect；只解析脚本的 JSON；pair 超时 45 秒，其余 20 秒；sudo 或脚本缺失、sudoers 未装时 status 返回 available=false 和原因；修改类操作另有 asyncio.Lock。鉴权沿用 gate + authz（只有管理员会话）。`test_route_set` 增加 `ADDED_HTTP`（基线之后有意新增的路由），`test_route_auth` 对它们同样做未登录拒绝检查。
+  - 前端 `views/Bluetooth.jsx`，导航"蓝牙音频"：当前音箱、音量滑块（停止拖动 200 ms 后提交）、静音；扫描按钮带 30 秒倒计时，扫描时每秒轮询，其他时间页面可见时每 3 秒；列表按已配对、音频设备、其他排序，未命名设备默认隐藏；每行有配对/连接/断开、开机自动连接、删除配对（二次确认）；设了自动连接的音箱点断开时提示约 30 秒会重连，可选"断开并取消自动连接"；配对时提示最长 40 秒，失败显示后端信息和"进入配对模式并断开手机连接"。用无头浏览器加模拟 API 在 390 px 宽度下渲染过：无运行时错误、无横向滚动。
+  - 测试：`tests/test_bluetooth.py`（26 个 + 1 个需要特权的集成测试）：用设备上的真实输出测解析；29 种非法参数（含 shell 元字符）都退出 64 且不执行命令；用假的 bluetoothctl/pactl 测各动作的参数列表、文件和 JSON；路由的 400/502/503/504。集成测试 `MDD_SUDO_IT=1`：以 mdd 身份 `sudo -n mdd-btctl status` 成功，非法参数 64，`id`、`sh -c`、`python3` 都被 sudo 拒绝，已在沙箱里用临时用户跑过并清理。`webui/tests/bluetooth-page.test.mjs` 测排序和隐藏。
+  - 尚未在设备上实测：扫描、配对、连接、音量、静音、断开、删除配对、重启后自动连接。
 
 ---
 

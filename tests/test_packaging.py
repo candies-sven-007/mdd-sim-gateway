@@ -191,7 +191,9 @@ class SudoersTests(unittest.TestCase):
     def test_only_enginectl(self):
         rules = [line for line in SUDOERS.read_text().splitlines()
                  if line.strip() and not line.startswith("#") and not line.startswith("Defaults")]
-        self.assertEqual(rules, ["mdd ALL=(root) NOPASSWD: /usr/local/sbin/mdd-enginectl"])
+        self.assertEqual(rules, ["mdd ALL=(root) NOPASSWD: /usr/local/sbin/mdd-enginectl",
+                                 # Bluetooth speaker page; see tests/test_bluetooth.py.
+                                 "mdd ALL=(root) NOPASSWD: /usr/local/sbin/mdd-btctl"])
         self.assertIn("env_reset", SUDOERS.read_text())
 
     @unittest.skipUnless(shutil.which("visudo"), "visudo not installed")
