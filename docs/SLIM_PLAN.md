@@ -401,3 +401,362 @@ nft table inet mdd:
   - 变异验证：把 /api/settings 加进 PUBLIC_PATHS、把 WebSocket 来源改成不要求会话，测试都会失败（WebSocket 等待第一条消息有 5 秒上限，被错误放行的 socket 不会让测试挂住）。
   - TestClient 依赖 httpx，它不是运行依赖。新增 `tests/requirements.txt`（固定 httpx==0.28.1），ci.yml 的 python job 额外安装它；设备上的发布包不包含它。starlette 1.10 对 httpx 打印弃用警告，不影响结果。
   - 观察到但未改动：`/docs`、`/docs/oauth2-redirect`、`/openapi.json`、`/redoc` 在 9fcbe5c 和现在都不经登录即可访问（不在 /api/ 下，gate 视为静态资源）。会暴露完整接口清单，但不暴露数据。是否关闭（`FastAPI(docs_url=None, redoc_url=None, openapi_url=None)`）列为阶段 4 待定问题 P-1。
+- 2026-10-28 步骤 1：阶段 4 设计写入 §12（文件清单、两个 systemd 单元、netns/veth、每线路路由表、nft 0.9.8 规则、sudo + mdd-enginectl、阻断逻辑与测试方案、风险、12 个待定问题 P-1～P-12）。**未写代码，等待确认。** 下一步：按你对 P-1～P-12 的答复修订 §12，然后从 §12.11 第 1 项开始实现。
+
+---
+
+## 12. 阶段 4 设计（2026-10-28 起草，**待确认，确认前不写代码**）
+
+本节只细化 §4 的落地方式，不改动 §10 的已确认决定。凡是与 §4 原文措辞不同的地方，都在 §12.10 列为待定问题，附推荐做法，由你决定。
+
+### 12.0 范围
+
+- 阶段 4 做：引擎从 Docker 容器改为 `mdd-engine@N.service`；线路 netns、veth、每线路路由表；nft（出口防泄漏、RTP DNAT）；控制面经 `sudo` 调 `mdd-enginectl`；运行状态改读 systemd；删除 relay/coturn 与 RTP 转发容器；设置页"维护/存储"的 Docker 部分；i18n "最多十条线路"；线路上限可配置（默认 1，最大 2）。
+- 留给阶段 5：`install.sh` 重写，`mdd-control`/`mdd-orchestrator`/`mdd-pcscd` 三个常驻单元，安装时创建用户、目录、sudoers、模块加载与 sysctl。阶段 4 只把单元文件、sudoers 片段、enginectl 放进 `packaging/` 并用测试固定内容。
+- 结果：阶段 4 结束到阶段 5 结束之间，仓库里的 `install.sh` 仍是旧的 Docker 版，**不能在设备上安装**。
+
+### 12.1 总体结构与信任边界
+
+```
+浏览器 ──HTTPS──> mdd-control（用户 mdd）
+                    │ 写 desired.json / instances/N/instance.json（0640, 组 mdd）
+                    │ sudo -n /usr/local/sbin/mdd-enginectl {start|stop|restart|down|reset-failed} N
+                    │ systemctl show（只读，不需要 sudo）
+                    │ AMI 10.88.N.2:5038、WS 10.88.N.2:8088（宿主主动发起）
+                    ▼
+mdd-orchestrator（root）── sing-box/Xray（子进程）── TUN mdd-<cc>
+   │ 读 desired.json，校验后：每线路默认路由（TUN / 直连 / 不放行）、nft 两张表
+   ▼
+mdd-netns@N（root, oneshot）：netns mdd-N、veth mddvN<->eth0、地址、sysctl、
+                              ip rule 与路由表 1000+N 里的 unreachable 兜底
+mdd-engine@N（root, Group=mdd, 能力受限）：entrypoint → pin_keeper → swu_ike → ami_usim → asterisk
+```
+
+- 信任边界与现在相同：控制面写的文件由 root 进程读取并校验（orchestrator 读 desired.json；引擎读 instance.json）。新增一处：引擎原来是容器内 root，现在是宿主上的受限 root，所以 instance.json → engine.env 的转义必须可靠（render.py 已用 `shlex.quote`，阶段 4 加注入测试，见 §12.8）。
+- 两道闸（§4.3）的归属：**路由闸**由 `mdd-netns@N` 建立，orchestrator 不运行也存在；**过滤闸**（nft forward）由 orchestrator 整表原子写入。
+
+### 12.2 文件改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `host/mdd_netns.py`（新） | 纯函数：线路编号 → 名称/地址/表号/标记；`line_route_state()` 判定 TUN/直连/不放行；生成 `ip` 命令列表与完整 nft 规则文本；带一个可替换的执行器。命令行入口 `up N`/`down N` 供 `mdd-netns@.service` 调用。 |
+| `host/mdd_orchestrator.py` | 删除 /32 ePDG 路由管理（`resolve`、`retained_epdg_addresses`、`current_managed_routes`、`apply_routes`、`MANAGED_ROUTE_PROTO`），因为每线路路由表已把 netns 的全部出站流量导向本国 TUN；新增 `reconcile_lines()`：按 `line_route_state()` 设置表 1000+N 的默认路由、直连规则、TUN 与 veth 的 `rp_filter=2`，并用 `nft -f -` 原子替换两张表；顺序固定为"先收紧后放开"（先删旧路由，再换 nft，再加新路由）。`COUNTRY_PROXY_LISTEN` 默认值 172.17.0.1 → 127.0.0.1。`_sleep_for_work` 在 sing-box/Xray 进程退出时立即醒来。服务重启请求里的单元名改为 `mdd-control`/`mdd-orchestrator`。proxy-status.json 的 `lines[iid]` 去掉 `addresses`/`routed_addresses`，增加 `route`（`tun`/`direct`/`blocked`）与 `netns`。 |
+| `control/app/engine.py` | 删除 Docker SDK。`start()`：取线路出口状态（`egress.ensure_line`，仍是启动前 fail-closed）→ 解析 ePDG（代理模式经本国 SOCKS 用现有 `resolve_ipv4_via_socks`，直连模式用宿主 DNS）→ 写 instance.json（含解析后的 IP）→ 若在运行先 `capture_diagnostics` → `enginectl restart N`。`stop()`/`capture_and_stop()`：`enginectl stop N`，以 systemd `InvocationID` 代替容器 ID 做"同一代"判断。`container_runtime()` → `unit_runtime()`：一次 `systemctl show` 读 `ActiveState,SubState,MainPID,NRestarts,InvocationID,ActiveEnterTimestamp,ExecMainCode,ExecMainStatus`，地址固定为 `10.88.N.2`。`logs()`：`journalctl -u mdd-engine@N -o short-iso`。`exec_cli()`/`registration_state()`：`asterisk -r -s <instances/N/run/asterisk/asterisk.ctl> -x <命令>`，5 秒超时。删除 `ensure_image`、`reconcile_rtp_forward`、`media_mode_of`、`_format_docker_logs`。`delete_instance_data` 前先 `enginectl down N`。 |
+| `control/app/runtime.py` | Docker 事件流 → 每 3 秒一次 `systemctl show mdd-engine@1..max`（一个子进程），对比 `ActiveState`/`InvocationID` 变化后调用原来的 `on_change(iid, runtime, action)`；`get/invalidate/start/close` 接口不变。 |
+| `control/app/media.py` | 只留 direct：`DIRECT`、`mode()` 恒为 direct、`provisioning()` 返回空 ICE 服务器。删除 relay、coturn、镜像、探测、`main()`。`GET /api/media` 仍在，返回 `{"mode": "direct"}`（路由基线不变）。 |
+| `control/app/rtp_forward.py` | 删除。DNAT 规则改由 `host/mdd_netns.py` 生成、orchestrator 应用（见 P-5）。 |
+| `control/app/egress.py` | `desired_document()` 每条线路增加 `rtp: [start, end]`；文档增加 `control_port`。新增 `resolve_epdg(inst, line_state)`。容器栈 SOCKS 状态契约代码按 D5 保留，不再被引擎调用。 |
+| `control/app/config.py` | `MAX_SIM_LINES` → `max_lines()`：读 `settings.max_lines`，默认 1，只接受 1 或 2。`_engine_manager_url()` 默认值改为 `https://10.88.<id>.1:<http_port>`（显式设置仍优先）。 |
+| `control/app/operations.py`、`sysinfo.py`、`routers/system.py` | 删除镜像清理、构建缓存清理、容器重启执行器、Docker 存储统计；`/api/system/maintenance` 遇到 `prune_*` 返回 400；`/api/system/status` 去掉 `container_stack`，`host_restart_available` 恒为 true。 |
+| `control/app/tasks.py`、`main.py` | 删除 `media_supervisor`（只服务 relay 与按媒体模式重建）；lifespan 去掉容器重启收尾与 `engine.close_client`。 |
+| `control/app/routers/softphone.py` | 去掉 `docker.errors`；软电话 WS 中继地址来自 `unit_runtime()`。 |
+| `control/requirements.txt` | 删除 `docker`。 |
+| `engine/entrypoint.sh` | 删除 1b 节 relay 防火墙；脚本路径改用 `${MDD_ENGINE_DIR:-/usr/local/bin}`；Asterisk 用 `-C` 指向渲染出的 asterisk.conf。文件名保持不变，由单元直接执行（§2.2 原写改名为 `mdd-engine-run`，为减少改动保留原名，测试与 CI 的 `sh -n` 不变）。 |
+| `engine/render.py`、`templates/asterisk.conf.j2`、`logger.conf.j2` | 删除 relay 与 `engine_subnet` 分支；路径从环境变量取（见 P-4）；asterisk.conf 增加 `astrundir=<run>/asterisk`、`astctlpermissions=0660`；`logger.conf` 的 `reload_debug => debug` 改为只在 `debug_asterisk` 为真时写出；默认 `debug=0`、不开 pjsip logger（加测试固定）。 |
+| `packaging/systemd/mdd-netns@.service`、`mdd-engine@.service`（新） | 见 §12.3。 |
+| `packaging/sbin/mdd-enginectl`、`packaging/sudoers.d/mdd`（新） | 见 §12.7。 |
+| `webui/src/views/UnifiedPages.jsx`、`i18n.jsx`、`softphone.js`、`Softphone.jsx`、`GlobalSoftphone.jsx`、`api.js` | 删除存储页的 Docker 行与两个清理按钮、MediaModePanel 的 relay 显示、relay 相关提示；"Responsible use notice" 改为"最多两条线路"；系统设置加"线路上限 1/2"（见 P-6）。 |
+| `.github/workflows/ci.yml` | 新增 `netns-leak` 与 `nft-bullseye` 两个 job（§12.8）。 |
+| 测试 | 删除：`test_media_relay`、`test_rtp_forward`、`test_engine_image_refresh`。重写：`test_runtime_registry`、`test_media_engine`、`test_media_control`、`test_engine_paths`、`test_engine_manager_url`、`test_country_egress` 中 /32 路由部分、`test_operations`/`test_sysinfo` 中 Docker 部分、`test_product_boundaries`（上限）、`test_ui_softphone_media_preflight`。新增：§12.8 列出的测试。`test_install_media`、`test_install_tun_mtu`、`test_run_paths` 依赖旧 install.sh，留到阶段 5。 |
+
+### 12.3 systemd 单元
+
+`packaging/systemd/mdd-netns@.service`：
+
+```ini
+[Unit]
+Description=MDD line %i network namespace
+Before=mdd-engine@%i.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/mdd/current/venv/bin/python -I /opt/mdd/current/host/mdd_netns.py up %i
+ExecStop=/opt/mdd/current/venv/bin/python -I /opt/mdd/current/host/mdd_netns.py down %i
+```
+
+`packaging/systemd/mdd-engine@.service`（按 P-4 推荐写法）：
+
+```ini
+[Unit]
+Description=MDD VoWiFi engine, line %i
+BindsTo=mdd-netns@%i.service
+After=mdd-netns@%i.service mdd-pcscd.service mdd-orchestrator.service
+Wants=mdd-pcscd.service
+ConditionPathExists=/var/lib/mdd/instances/%i/instance.json
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=root
+Group=mdd
+UMask=0007
+ExecStart=/opt/mdd/current/engine/entrypoint.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillMode=control-group
+NetworkNamespacePath=/run/netns/mdd-%i
+RuntimeDirectory=mdd-engine-%i
+Environment=MDD_ID=%i
+Environment=MDD_CONFIG=/var/lib/mdd/instances/%i/instance.json
+Environment=MDD_RUNDIR=/var/lib/mdd/instances/%i/run
+Environment=MDD_LOGDIR=/var/lib/mdd/instances/%i/logs
+Environment=MDD_ENGINE_DIR=/opt/mdd/current/engine
+Environment=MDD_TPL=/opt/mdd/current/engine/templates
+Environment=MDD_ENGINE_ETC=/run/mdd-engine-%i
+Environment=MDD_ASTERISK_CORE_DUMP=0
+Environment=PATH=/opt/mdd/current/venv/bin:/opt/mdd/current/asterisk/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=LD_LIBRARY_PATH=/opt/mdd/current/lib
+Environment=PYTHONDONTWRITEBYTECODE=1 MALLOC_ARENA_MAX=2 SWU_TUN_MTU=1400
+ReadWritePaths=/var/lib/mdd/instances/%i/run /var/lib/mdd/instances/%i/logs /run/pcscd
+TemporaryFileSystem=/etc/asterisk:mode=0750 /var/lib/asterisk:mode=0750 /var/spool/asterisk:mode=0750 /var/log/asterisk:mode=0750 /var/run/asterisk:mode=0750
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+LimitCORE=0
+MemoryMax=160M
+```
+
+说明：
+
+- 不设 `ProtectKernelTunables`：swu_ike 在 netns 内对 `ipsec0` 执行 `sysctl -w net.ipv6.conf.ipsec0.*`（`engine/swu_ike.py` 的 `set_routes`），需要可写的 `/proc/sys/net`（该路径按 netns 隔离，不影响宿主）。
+- 能力集比 §4.3 少了 `CAP_SYS_NICE CAP_SETUID CAP_SETGID`：Asterisk 以 root 运行、不带 `-U/-p`，按代码阅读用不到。设备实测若缺能力再补，阶段 7 记录。不给 `CAP_DAC_OVERRIDE`，所以 instance 目录与文件必须是组 `mdd` 可读写（控制面写 0640/0770；引擎 `Group=mdd`、`UMask=0007`，它创建的文件控制面也能读和删）。
+- `TemporaryFileSystem=` 让每条线路的 Asterisk 有自己的 `/etc/asterisk` 等目录（与容器一样每次启动都是空的）。挂载点需要宿主上存在空目录，阶段 5 由 install.sh 创建、uninstall 删除。
+- `Restart=always` 对应原来的 `unless-stopped`；`NRestarts` 对应 `RestartCount`。
+- `LimitCORE=0` 与 `MDD_ASTERISK_CORE_DUMP=0` 见 P-7。
+- `MemoryMax=160M` 是 §4.1 的初值，阶段 7 实测后调整。
+
+### 12.4 netns 与 veth（`mdd_netns.py up N`，N 为线路 ID，1–10）
+
+| 项 | 值 |
+|---|---|
+| netns | `mdd-N`（`/run/netns/mdd-N`） |
+| veth | 宿主侧 `mddvN`（不用 §4.3 的 `mdd-hN`：`mdd-h1` 会被匹配 TUN 的 `mdd-*` 通配到）；netns 侧 `eth0` |
+| 地址 | 宿主 `10.88.N.1/30`，netns `10.88.N.2/30`，netns 默认路由 via `10.88.N.1` |
+| 路由表 / 规则优先级 | 表 `1000+N`；`pref 1000+N iif mddvN lookup 1000+N`；`pref 900+N iif mddvN fwmark M lookup main`；直连时另加 `pref 950+N iif mddvN lookup main` |
+| 标记 M | `0x6d640000 + N` |
+
+`up` 的步骤（幂等：已存在且一致就跳过，不一致就先 `down` 再建）：
+
+```sh
+ip netns add mdd-N
+ip link add mddvN type veth peer name eth0 netns mdd-N
+ip addr add 10.88.N.1/30 dev mddvN
+sysctl -qw net.ipv6.conf.mddvN.disable_ipv6=1 net.ipv4.conf.mddvN.rp_filter=2
+ip link set mddvN up
+ip -n mdd-N link set lo up
+ip -n mdd-N addr add 10.88.N.2/30 dev eth0
+ip -n mdd-N link set eth0 up
+ip -n mdd-N route add default via 10.88.N.1
+ip netns exec mdd-N sysctl -qw \
+    net.ipv6.conf.all.accept_ra=0 net.ipv6.conf.default.accept_ra=0 \
+    net.ipv6.conf.all.autoconf=0 net.ipv6.conf.default.autoconf=0 \
+    net.ipv6.conf.all.use_tempaddr=0 net.ipv6.conf.default.use_tempaddr=0 \
+    net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.eth0.disable_ipv6=1
+# 路由闸：从这一刻起，netns 发往外部的流量默认不可达
+ip route replace unreachable default metric 4000 table 1000+N
+ip rule add pref 1000+N iif mddvN lookup 1000+N
+ip rule add pref 900+N  iif mddvN fwmark M lookup main
+```
+
+`down`：删除上述 3 条规则、`ip route flush table 1000+N`、`ip link del mddvN`、`ip netns del mdd-N`。
+
+- netns 内不放 resolv.conf：引擎不做外部 DNS，ePDG 由控制面解析成 IP 写进 instance.json（§4.3）；代理模式经本国出口解析（D6）。
+- 前 6 个 IPv6 sysctl 与容器相同；`ipsec0` 需要 IPv6，所以 `all.disable_ipv6=0`，只关掉 `eth0` 的 IPv6。
+- 宿主全局需要 `net.ipv4.ip_forward=1`（原来由 Docker 打开）。阶段 4 由 orchestrator 启动时检查并打开，阶段 5 由 install.sh 写入 `/etc/sysctl.d/`。
+
+### 12.5 每线路路由表
+
+表 `1000+N` 里永远有 `unreachable default metric 4000`。orchestrator 只增删一条更优先的默认路由，或者加一条直连规则：
+
+| `line_route_state()` 结果 | 条件 | 表 1000+N | pref 950+N 直连规则 |
+|---|---|---|---|
+| `tun` | 国家出口已启用，`proxy-status` 中该国 `ready=true`，且 TUN 网卡存在 | `default dev mdd-<cc> metric 100` + unreachable | 无 |
+| `direct` | 全局未开代理（`proxy.enabled=false`），或该国出口显式 `mode=direct` | 只有 unreachable | `iif mddvN lookup main` |
+| `blocked` | 其余情况：出口未就绪、出口出错、没有为该国配置出口、国家无法判断、线路停用 | 只有 unreachable | 无 |
+
+- sing-box 退出时 TUN 网卡消失，内核立即删掉 `dev mdd-<cc>` 路由，落到 unreachable；orchestrator 在下一轮（sing-box 退出会立即唤醒）重启 sing-box 并在 TUN 出现后加回路由。
+- 线路换国家：先删旧默认路由（落到 unreachable），再原子替换 nft，最后加新路由，中间不会经过另一国家的 TUN。
+- `fwmark` 规则只服务两类包（标记由 nft 打，见 §12.6）：被 DNAT 进来的 RTP 连接的回包；引擎从自己的 RTP 端口发往宿主直连私网的 UDP（ICE 连通性检查，见 P-3）。
+
+### 12.6 nft 规则（nftables 0.9.8 兼容）
+
+约束：不用 `fib`；不用 `inet` 族 NAT（NAT 放在 `ip` 族表里）；链优先级写数字（-150/-100/0/100）不写名字；不用 `typeof`、flowtable 等新语法。整表替换用 `table X` + `delete table X` + 定义，放在同一个 `nft -f` 事务里（表不存在时也不会失败）。"本机地址"不能用 `fib daddr type local`，改为 orchestrator 每轮从 `ip -4 -o addr` 生成 `local4` 集合（排除 10.88.0.0/16 与 TUN 地址）；"宿主直连私网"`lan4` 来自 `ip -4 route show table main scope link`，只取 RFC 1918 网段并排除 10.88.0.0/16。
+
+示例：线路 1 走美国出口（`mdd-us`，RTP 10000–10011），线路 2 直连（RTP 10100–10111），控制面端口 8443，本机 LAN 地址 192.168.1.50/24：
+
+```nft
+table inet mdd
+delete table inet mdd
+table inet mdd {
+  set lan4 { type ipv4_addr; flags interval; elements = { 192.168.1.0/24 } }
+
+  chain mangle_pre {
+    type filter hook prerouting priority -150; policy accept;
+    iifname "mddv1" ct mark 0x6d640001 meta mark set 0x6d640001
+    iifname "mddv1" ip daddr @lan4 udp sport 10000-10011 meta mark set 0x6d640001
+    iifname "mddv2" ct mark 0x6d640002 meta mark set 0x6d640002
+    iifname "mddv2" ip daddr @lan4 udp sport 10100-10111 meta mark set 0x6d640002
+  }
+
+  chain forward {
+    type filter hook forward priority 0; policy accept;
+    iifname "mddv1" meta mark 0x6d640001 accept
+    iifname "mddv1" oifname "mdd-us" accept        # 仅当线路 1 的状态是 tun
+    oifname "mddv1" ct mark 0x6d640001 accept
+    oifname "mddv1" ct state established,related accept
+    iifname "mddv2" meta mark 0x6d640002 accept
+    iifname "mddv2" accept                          # 仅当线路 2 的状态是 direct
+    oifname "mddv2" ct mark 0x6d640002 accept
+    oifname "mddv2" ct state established,related accept
+    iifname "mddv*" counter drop
+    oifname "mddv*" counter drop
+  }
+
+  chain input {
+    type filter hook input priority 0; policy accept;
+    iifname "mddv*" ct state established,related accept
+    iifname "mddv*" tcp dport 8443 accept           # 引擎回调 /api/engine/event
+    iifname "mddv*" counter drop
+  }
+}
+
+table ip mdd_nat
+delete table ip mdd_nat
+table ip mdd_nat {
+  set local4 { type ipv4_addr; elements = { 192.168.1.50 } }
+  set lan4 { type ipv4_addr; flags interval; elements = { 192.168.1.0/24 } }
+
+  chain pre {
+    type nat hook prerouting priority -100; policy accept;
+    iifname != "mddv*" iifname != "mdd-*" ip daddr @local4 udp dport 10000-10011 ct mark set 0x6d640001 dnat to 10.88.1.2
+    iifname != "mddv*" iifname != "mdd-*" ip daddr @local4 udp dport 10100-10111 ct mark set 0x6d640002 dnat to 10.88.2.2
+  }
+
+  chain post {
+    type nat hook postrouting priority 100; policy accept;
+    ip saddr 10.88.1.2 ip daddr @lan4 udp sport 10000-10011 masquerade
+    ip saddr 10.88.1.2 oifname "mdd-us" masquerade  # P-2，推荐保留
+    ip saddr 10.88.2.2 ip daddr @lan4 udp sport 10100-10111 masquerade
+    ip saddr 10.88.2.2 oifname != "mddv2" masquerade # 仅直连
+  }
+}
+```
+
+- 线路状态是 `blocked` 时，生成器不输出该线路的 `oifname "mdd-<cc>" accept` / `iifname "mddvN" accept`，也不输出 TUN 的 masquerade，包会落到 `iifname "mddv*" drop`。
+- IPv6：`inet` 族 forward 链里的两条 `drop` 同样作用于 IPv6；veth 两端都关了 IPv6。
+- `input` 链让 netns 只能访问控制面端口；控制面主动连 AMI/WS 的回包靠 `established` 放行。
+- 端口段由 orchestrator 校验：整数、1024–65535、宽度 ≤ 60、线路之间不重叠、不含控制面端口；不合格的线路按 `blocked` 处理并在 `proxy-status` 里写明原因。
+
+### 12.7 控制面调用
+
+- `/usr/local/sbin/mdd-enginectl`（root 所有，0755，POSIX sh，不读取任何 `mdd` 可写的文件）：
+
+```sh
+#!/bin/sh
+# The only command the control plane may run as root (see /etc/sudoers.d/mdd).
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+usage() { echo "usage: mdd-enginectl {start|stop|restart|down|reset-failed} <line 1-10>" >&2; exit 64; }
+[ "$#" -eq 2 ] || usage
+case "$2" in [1-9]|10) line=$2 ;; *) usage ;; esac
+case "$1" in
+  start|stop|restart|reset-failed) exec systemctl "$1" "mdd-engine@$line.service" ;;
+  down) exec systemctl stop "mdd-engine@$line.service" "mdd-netns@$line.service" ;;
+  *) usage ;;
+esac
+```
+
+- `/etc/sudoers.d/mdd`（安装时用 `visudo -cf` 校验）：
+
+```
+Defaults:mdd !requiretty, !lecture, env_reset, timestamp_timeout=0
+mdd ALL=(root) NOPASSWD: /usr/local/sbin/mdd-enginectl
+```
+
+  bullseye 的 sudo 是 1.9.5，不支持参数正则，所以参数校验放在脚本里，测试覆盖。
+- 控制面：`subprocess.run(["sudo", "-n", ENGINECTL, action, iid], timeout=60)`；`ENGINECTL` 可由环境变量覆盖，测试里换成假的脚本。
+- 只读操作都不经 sudo：`systemctl show`、`journalctl -u mdd-engine@N`（`mdd` 加入 `systemd-journal` 组，阶段 5 安装时做，见 P-12）、`asterisk -r -s` 控制套接字（套接字在 `instances/N/run/asterisk/`，组 `mdd`，0660）。
+- 控制面单元（阶段 5）不能设 `NoNewPrivileges=yes` 或收窄 `CapabilityBoundingSet`，否则 sudo 无法提权；这是"用 sudo 不用 polkit"（D4）的代价，见 R-4。
+
+### 12.8 出口断开时的阻断与测试方案
+
+阻断分三层，任何一层单独都不会让 IKE 走默认路由：
+
+1. **启动前**（沿用）：`egress.ensure_line()` 等到 `proxy-status.lines[N].ready`，否则 `EgressError`、不启动；代理模式下 ePDG 经本国 SOCKS 解析，失败也不启动。
+2. **路由闸**（新增）：表 1000+N 只有在 `tun` 状态才有可用默认路由；TUN 消失时内核自动删路由。
+3. **过滤闸**（新增）：forward 链只放行到本国 TUN（或显式直连），其余 `drop`。
+
+线路已在运行时出口断开：不主动停止引擎，swu_ike 的重传在宿主上被 unreachable 拒绝（不出网卡），控制面现有健康策略照常判定（冻结 → 重选节点 / 退避）。出口恢复后 orchestrator 加回路由，swu_ike 下一次重连即恢复。
+
+测试：
+
+1. 单元测试（`tests/test_netns_rules.py`，普通 CI job 里跑）
+   - `line_route_state()` 真值表：出口 ready → tun；未就绪 / 出错 / 未配置 / 国家未知 / 线路停用 → blocked；全局关代理或显式 direct → direct；TUN 网卡不存在 → blocked。
+   - 生成的规则：任何状态下 `up` 命令都含 unreachable 兜底与 `iif` 规则；blocked 线路没有任何 accept 到 TUN 或上游的规则、没有 TUN 的 masquerade；每条线路都被 `mddv*` drop 覆盖；线路 1 的规则不出现 `mddv2`/`10.88.2.`；DNAT 只匹配 `@local4` 和本线路端口段。
+   - 0.9.8 兼容的词法检查：生成文本里不出现 `fib`、`typeof`、`flowtable`、`priority dstnat|srcnat|filter|mangle` 等；NAT 只在 `ip` 族表。
+   - orchestrator 状态迁移（假执行器记录命令）：ready → 未就绪时，同一轮里先删默认路由再替换 nft；换国家时顺序为"删旧路由 → nft → 加新路由"；sing-box 进程退出时 `_sleep_for_work` 立即返回。
+   - `mdd-enginectl`：用假的 `systemctl` 放在 PATH 前面，验证合法参数被原样转发，`0`、`11`、`01`、`1;id`、`../1`、多余参数等全部以 64 退出且不调用 systemctl。
+   - 单元文件：固定 `NetworkNamespacePath`、`BindsTo`、`NoNewPrivileges=yes`、`ProtectSystem=strict`、能力集、`DeviceAllow`、`LimitCORE=0`；不存在来自 `/var/lib/mdd` 的 `EnvironmentFile`。
+   - engine.env 注入：instance.json 的 PIN/IMEI/APN 等字段含 `$(touch x)`、反引号、换行、单双引号时，`set -a; . engine.env` 后值原样保留，且没有命令被执行。
+   - 日志：默认渲染的 logger.conf/asterisk.conf 不含 `debug` 通道、`debug=0`；模板里没有 `pjsip set logger on`。
+2. 特权集成测试（新 job `netns-leak`，`ubuntu-latest` + `sudo`；`tests/integration/test_netns_leak.py`，非 root 或未设 `MDD_NETNS_IT=1` 时跳过）。为了不碰 runner 自己的默认路由，整个拓扑放在一个模拟宿主的 netns 里：模拟宿主 `it-host`、模拟上游 `it-wan`（nft 计数器统计到达的包）、模拟 LAN 浏览器 `it-lan`、线路 netns `mdd-1`、模拟国家 TUN（`ip tuntap` + 一个读包计数的小进程，代替 sing-box）。规则用 `mdd_netns.py` 生成并在 `it-host` 里执行。场景：
+   - a. 出口就绪：`mdd-1` 发 UDP 500/4500 到 198.51.100.10 → TUN 计数增加，`it-wan` 为 0。
+   - b. 停掉读包进程并删除 TUN（模拟 sing-box 退出）：`ip route get 198.51.100.10 from 10.88.1.2 iif mddv1` 返回 unreachable，发包后 `it-wan` 为 0。
+   - c. TUN 仍在、状态改为未就绪：路由被删，同上。
+   - d. 只删 nft 表（模拟过滤闸丢失），TUN 不在：路由闸仍挡住，`it-wan` 为 0。
+   - e. 只删 ip 规则（模拟路由闸丢失），nft 在、TUN 不在：包按主表走向 `it-wan`，被 forward drop，`it-wan` 为 0，drop 计数增加。
+   - f. 直连：包到达 `it-wan`，源地址是 masquerade 后的上游地址。
+   - g. RTP：`it-lan` 发 UDP 到宿主 LAN 地址的 10000 端口 → 到达 `mdd-1` 的 10.88.1.2；回包回到 `it-lan`，TUN 计数不变；`mdd-1` 主动从 10000 发往 `it-lan` → 到达且源地址是宿主 LAN 地址。
+   - h. IPv6：`mdd-1` 发 IPv6 包 → 不出 `it-host`。
+3. 0.9.8 语法检查（新 job `nft-bullseye`）：在 GitHub runner 上 `docker run --privileged debian:bullseye`，apt 安装 nftables 0.9.8，对生成器输出的若干组配置执行 `nft -c -f`（只检查不加载）。Docker 只用于 CI，不进发布包，见 P-9。
+
+### 12.9 风险
+
+| # | 风险 | 应对 |
+|---|---|---|
+| R-1 | 不做 masquerade 时 sing-box 收到源地址为 10.88.N.2 的包；现在的 Docker 路径里，容器流量进 TUN 前被 Docker 的 `MASQUERADE ! -o docker0` 改成了 TUN 地址，这种情况从没跑过。 | P-2 推荐保留 TUN masquerade，与现状一致；集成测试 a 覆盖转发路径；阶段 7 设备实测。 |
+| R-2 | 去掉 /32 ePDG 路由后，从 TUN 回来的包的源地址（ePDG）在主表里指向上游网卡，严格 `rp_filter` 会丢包。 | orchestrator 对 TUN 与 `mddvN` 设 `rp_filter=2`（内核取 `all` 与接口值的较大者，2 即宽松）；集成测试在 `it-host` 里把 `all.rp_filter` 设为 1 来跑。 |
+| R-3 | ePDG 改为启动时解析一次的 IP；运营商轮换 DNS 记录后，旧 IP 停用前线路不受影响，停用后要等健康策略重启引擎（重启时重新解析）。原生 Docker 版是引擎每次重连自己解析。 | 记录到阶段 7 观察；需要时再让 swu_ike 重连前请求控制面重新解析。 |
+| R-4 | 控制面要能用 sudo，单元里不能用 `NoNewPrivileges` 和能力集收窄；`ProtectSystem=strict` 下 sudo 能否正常写时间戳/日志需实测。 | sudoers 已设 `timestamp_timeout=0`；阶段 5 在设备上验证，不行就给 `/run/sudo` 加 `ReadWritePaths`。 |
+| R-5 | `settings.bind` 若被设成某个 LAN 地址，引擎回调 `10.88.N.1` 连不上。 | 控制面启动时检查，bind 不是 `0.0.0.0` 时在系统状态里告警；阶段 4 加测试。 |
+| R-6 | 10.88.0.0/16 与用户 LAN 冲突。 | 阶段 5 install.sh 检查并拒绝安装；orchestrator 发现冲突时所有线路 `blocked` 并报原因（P-11）。 |
+| R-7 | `ip_forward=1` 是全局设置，宿主的其他网卡之间也会转发。forward 链对非 `mddv*` 流量保持 `accept`，不改变用户已有行为。 | 在 INSTALL 文档写明。 |
+| R-8 | systemd 247 对 `NRestarts` 在手动启动时是否清零、`TemporaryFileSystem` 挂载点是否自动创建，按文档理解，没在设备上验证。 | 阶段 7 验证；单元文件改动不影响其余设计。 |
+| R-9 | 能力集收窄后 Asterisk 或 swu_ike 可能缺少某个能力（例如 `CAP_NET_RAW` 是否需要）。 | 设备上按日志补，阶段 7 记录。 |
+
+### 12.10 待定问题（请逐条答复；括号里是推荐）
+
+- **P-1** `/docs`、`/openapi.json`、`/redoc` 现在不登录即可访问（拆分前就如此）。是否在阶段 4 关闭？（推荐关闭：`FastAPI(docs_url=None, redoc_url=None, openapi_url=None)`，不影响 /api/ 基线。）
+- **P-2** 代理模式下是否对进入 TUN 的流量做 masquerade？§4.3 原写"不做"。（推荐做：与现在的 Docker 路径一致，sing-box 只看到本机地址；它不影响防泄漏，因为 masquerade 只作用于已被放行到 TUN 的包。）
+- **P-3** 是否允许引擎从自己的 RTP 端口主动发往宿主直连私网（浏览器）的 UDP 走主表并 masquerade？§4.3 只放行了 DNAT 回包。（推荐允许：Asterisk 做完整 ICE，会先向浏览器发连通性检查；只放行回包时，这些包会被导向 TUN 或不可达；按 conntrack 的规则推断，它们还会占住同一个 5 元组，使浏览器随后的入站包 DNAT 冲突，可能造成通话无声（推断，未实测，集成测试 g 会覆盖）。Docker 版允许这种流量。限制为：源端口在本线路 RTP 段、目的在 RFC 1918 直连网段、仅 UDP。）
+- **P-4** 引擎路径：§4.3 写"沿用容器内路径（`/config`、`/logs`、`/run/mdd-sim-gateway`）用 BindPaths 映射"。这需要在宿主根目录建 `/config`、`/logs` 挂载点。（推荐改为环境变量 `MDD_CONFIG`、`MDD_LOGDIR`、`MDD_RUNDIR` 直接指向 `/var/lib/mdd/instances/N/...`，默认值保持容器路径，约 15 处代码改动；Asterisk 自己的目录仍用 `TemporaryFileSystem`。）
+- **P-5** D4 写"`rtp_forward.py` 改写为 nft DNAT 规则生成"。规则要由 root 的 orchestrator 应用，所以生成器放在 `host/mdd_netns.py`，`control/app/rtp_forward.py` 删除。可以吗？（推荐可以；只是位置变化。）
+- **P-6** 线路上限 2 的开关放在哪里？（推荐：WebUI 系统设置里 1/2 二选一，改小时自动停止超出的线路，沿用现有 `line_allowed` 逻辑；也可以只允许改 config.yaml。）
+- **P-7** Asterisk core dump 是否默认关闭？现在容器里是开启的（`-g` + `ulimit core unlimited`），设备根分区只有 1.6 GB。（推荐关闭，排障时再在单元 drop-in 里打开。）
+- **P-8** 出口 UDP 健康检查：现在是手动测试（`/api/egress/{country}/test`、节点测试）加线路健康策略触发的节点重选，没有周期性 UDP 探测。阶段 4 是否保持不变？（推荐保持，只把 SOCKS 测试入口从 172.17.0.1 改到 127.0.0.1；新增周期探测会引入误判导致的线路闪断。）
+- **P-9** CI 的 nft 0.9.8 语法检查用 `docker run --privileged debian:bullseye`。Docker 只在 CI 出现。可以吗？（推荐可以；GitHub runner 自带 nftables 1.x，无法检查 0.9.8 语法。）
+- **P-10** `mdd-enginectl` 的线路号上限：固定 1–10（与可能存在的旧配置 ID 兼容），还是读取 `max_lines`？（推荐固定 1–10：root 脚本不解析 `mdd` 可写的配置；超过 `max_lines` 的线路由控制面拒绝启动。）
+- **P-11** 10.88.0.0/16 固定还是可配置？（推荐固定，冲突时安装拒绝并提示。）
+- **P-12** 引擎日志用 journald（`mdd` 进 `systemd-journal` 组，可读全部系统日志），还是让 entrypoint 把输出写进 `instances/N/logs/engine.log`（复用 `log_capture.py` 轮转）？（推荐 journald：改动最小、日志有时间戳和大小上限；如果你介意 `mdd` 能读整个系统日志，就选文件方案。）
+
+### 12.11 实施顺序（确认后按此提交，每步全量测试 + `npm run build`）
+
+1. `host/mdd_netns.py` + `tests/test_netns_rules.py`（纯函数，不接入任何调用方）
+2. `packaging/`：两个单元文件、`mdd-enginectl`、sudoers 片段 + 测试
+3. orchestrator 接入 `reconcile_lines()`，删除 /32 路由，SOCKS 改监听 127.0.0.1
+4. 控制面 `engine.py`/`runtime.py` 改为 systemd 后端，ePDG 解析，`max_lines`，manager_url，删除 `rtp_forward.py`、media relay、`media_supervisor`、requirements 里的 docker
+5. 引擎：entrypoint 去 relay、路径环境变量、asterisk.conf 控制套接字、logger 默认无 debug
+6. operations/sysinfo/system 路由的 Docker 部分 + WebUI 存储页、媒体面板、i18n、线路上限设置
+7. CI：`netns-leak`、`nft-bullseye`
