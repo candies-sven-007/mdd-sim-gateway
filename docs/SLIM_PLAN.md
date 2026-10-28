@@ -403,6 +403,9 @@ nft table inet mdd:
   - 观察到但未改动：`/docs`、`/docs/oauth2-redirect`、`/openapi.json`、`/redoc` 在 9fcbe5c 和现在都不经登录即可访问（不在 /api/ 下，gate 视为静态资源）。会暴露完整接口清单，但不暴露数据。是否关闭（`FastAPI(docs_url=None, redoc_url=None, openapi_url=None)`）列为阶段 4 待定问题 P-1。
 - 2026-10-28 步骤 1：阶段 4 设计写入 §12（文件清单、两个 systemd 单元、netns/veth、每线路路由表、nft 0.9.8 规则、sudo + mdd-enginectl、阻断逻辑与测试方案、风险、12 个待定问题 P-1～P-12）。**未写代码，等待确认。** 下一步：按你对 P-1～P-12 的答复修订 §12，然后从 §12.11 第 1 项开始实现。
 - 2026-10-28 确认：P-1～P-12 全部采用 §12.10 括号里的推荐做法，§12 设计按原文生效，不再逐条讨论。用户要求尽快在棒子上跑起来：按 §12.11 第 1–6 步顺序实现（每步仍跑全量测试 + `npm run build`），第 6 步完成后先出 arm64 包装到设备上验证，第 7 步 CI（`netns-leak`、`nft-bullseye`）可以在首次上设备之后补。下一步：§12.11 第 1 项。
+- 2026-10-28 §12.11 第 1 项完成（0528af7 之后的提交）：`host/mdd_netns.py` + `tests/test_netns_rules.py`（46 个）+ `tests/test_netns_leak.py`（特权集成，9 个场景，root 且 `MDD_NETNS_IT=1` 才运行）。集成测试在沙箱里用 nftables 1.0.9 和 Debian 11 的 nftables 0.9.8 用户态各跑一遍，全部通过。
+  - 对 §12 的一处补充：每条线路的路由表里加宿主直连私网的 `throw` 路由。原因：内核对转发包做反向路径检查时，把出接口 `mddvN` 当作入接口查策略路由，命中线路自己的表、查到 TUN，严格 `rp_filter` 下会丢掉浏览器回给 Asterisk ICE 检查的包（集成测试 g 复现过，`IPReversePathFilter` 计数加 1）。forward 链仍只放行带标记的 RTP，其余到局域网的包照样丢弃。
+  - 沙箱内核没有 IPv6，`up` 改为：IPv6 的 sysctl 失败只告警，rp_filter 等其余步骤失败就退出。
 
 ---
 
