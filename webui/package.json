@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "lint": "eslint .",
+    "build": "eslint . && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -17,6 +18,10 @@
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
     "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "9.39.5",
+    "eslint-plugin-react": "7.37.5",
+    "eslint-plugin-react-hooks": "5.2.0",
+    "globals": "17.13.0",
     "tailwindcss": "^4.3.3",
     "vite": "6.4.4"
   }

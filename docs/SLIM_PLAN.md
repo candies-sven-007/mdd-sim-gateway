@@ -446,6 +446,10 @@ nft table inet mdd:
   - `test_install_script` 新增 `test_bullseye_build_fixes_stay`，固定以上修正，并检查构建命令不再用 `a && b` 的写法。
   - 本地 x86 结果：全流程通过（各组件冒烟测试、Python 导入、控制面导入、打包）。主包 75 MB（解压后约 225 MB，其中 Python 约 150 MB：解释器与 libpython 各约 30 MB、site-packages 49 MB），Xray 包 14 MB。apt-packages.txt 列出 66 个运行库及 nftables/iproute2/procps/sudo/ca-certificates/kmod，都来自 bullseye main。瘦身（tcl/tk、idlelib、ensurepip 等）留到首次上设备之后再看。
 - 2026-10-28 build-arm64 第五次运行（run 40647531386，3c65c2a）通过，CI 也通过。产物 `mdd-slim-arm64-1.14.0-slim.5`（artifact 12798113421，保留到 2026-11-27）：主包 68 MB，Xray 包 12 MB，各带 .sha256。arm64 冒烟测试：Asterisk 20.7.0、pcsc-lite 2.3.3、sing-box 1.13.15、Python 导入与控制面导入全部通过；apt-packages.txt 与本地 x86 结果相同。下一步：设备上先只读检查 apt 源（待定的第 2 项），再安装。
+- 2026-10-28 设备首装反馈（1.14.0-slim.5，openstick）。Bug 1：设备页白屏，`UnrecognizedUsbDevices is not defined`。
+  - 原因：这个组件是蜂窝模块的"未识别 USB 设备"探测（`api.usbCandidates`/`probeUsbCandidate`），阶段 2（b18256e）删除模块路径时删掉了组件与接口，但设备页里两处引用没删。vite 只转译不检查，所以构建能通过。slim 只支持 USB 读卡器，这个组件不该存在，修正为删除引用（349c:0418 不是读卡器，显示出来也没有可用的操作）。
+  - 防再犯：前端是纯 JS（无 TypeScript），所以用 ESLint 而不是 tsc：`no-undef` 和 `react/jsx-no-undef`，不开风格规则。`npm run build` 改为 `eslint . && vite build`，CI 的 webui job 随之检查；CI 另加 `node --test tests/*.test.mjs`。`webui/tests/lint-guard.test.mjs` 确认引用未定义组件或标识符会报错、build 脚本先跑 lint。手动验证过：故意插入 `<NoSuchPanel />` 时 `npm run build` 退出码为 1。新增的 devDependencies 都固定版本（eslint 9.39.5、eslint-plugin-react 7.37.5、eslint-plugin-react-hooks 5.2.0（只注册，让已有的 disable 注释能解析）、globals 17.13.0），原有包版本不变，只用于构建。
+  - 全仓排查：ESLint 在前端只报出这两处；pyflakes 在 control/engine/host 里没有未定义名称；control/app 的所有模块都能导入；`api.js` 调用的 63 个路径后端全部存在，前端没有绕过 api.js 的 `/api/` 调用。
 
 ---
 

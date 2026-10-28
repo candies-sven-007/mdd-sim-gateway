@@ -62,7 +62,9 @@ jobs:
           cache: npm
           cache-dependency-path: webui/package-lock.json
       - run: npm ci
+      # Lints first (undefined names/components fail the build), then vite build.
       - run: npm run build
+      - run: node --test tests/*.test.mjs
       # npm audit calls the public registry, which intermittently returns 503 from its audit
       # endpoint. A transient registry outage must not fail CI, but a real high-severity
       # advisory still must. Retry a few times; only tolerate a failure whose output shows the
