@@ -84,7 +84,7 @@ apt-get install -y -q --no-install-recommends \
   swig libssl-dev libedit-dev uuid-dev libjansson-dev libxml2-dev libsqlite3-dev libsrtp2-dev \
   libcurl4-openssl-dev libunbound-dev libopencore-amrnb-dev libopencore-amrwb-dev \
   libvo-amrwbenc-dev libspeex-dev libspeexdsp-dev libogg-dev libvorbis-dev libgsm1-dev \
-  libudev-dev libusb-1.0-0-dev zlib1g-dev subversion
+  libudev-dev libusb-1.0-0-dev zlib1g-dev subversion libmnl-dev
 python3 -m pip install -q "meson==${MESON_VERSION}"
 export PATH="/usr/local/bin:$PATH"
 
@@ -166,14 +166,15 @@ rm -rf cmake; mkdir cmake; tar xzf cmake.tgz -C cmake --strip-components=1
 checkout https://github.com/estkme-group/lpac.git lpac "$LPAC_COMMIT"
 cd lpac
 for patch_file in "$REPO"/patches/lpac/*.patch; do echo "applying $(basename "$patch_file")"; patch -p1 < "$patch_file"; done
-"$WORK/cmake/bin/cmake" -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTANDALONE_MODE=ON \
+# lpac includes <PCSC/winscard.h>; the pinned pcsc-lite's headers are in $PREFIX/include/PCSC.
+"$WORK/cmake/bin/cmake" -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DLPAC_WITH_APDU_PCSC=ON -DLPAC_WITH_HTTP_CURL=ON -DLPAC_WITH_APDU_AT=OFF \
-  -DLPAC_WITH_APDU_QMI=OFF -DLPAC_WITH_APDU_QMI_QRTR=OFF -DLPAC_WITH_APDU_UQMI=OFF \
+  -DLPAC_WITH_APDU_QMI=OFF -DLPAC_WITH_APDU_QMI_QRTR=OFF \
   -DLPAC_WITH_APDU_MBIM=OFF -DLPAC_WITH_APDU_GBINDER=OFF \
-  -DCMAKE_PREFIX_PATH="$PREFIX"
+  -DCMAKE_PREFIX_PATH="$PREFIX" -DCMAKE_C_FLAGS="-I$PREFIX/include"
 "$WORK/cmake/bin/cmake" --build build --parallel "$JOBS"
 rm -rf "${WORK:?}/lpac-install"; DESTDIR="$WORK/lpac-install" "$WORK/cmake/bin/cmake" --install build
-lpac_bin=$(find "$WORK/lpac-install" -type f -name lpac -perm -u+x | head -n1)
+lpac_bin=$(find "$WORK/lpac-install" -type f -name lpac -perm -u+x -print -quit)
 [ -n "$lpac_bin" ] || { echo "lpac binary not found" >&2; exit 1; }
 mkdir -p "$PREFIX/lpac"
 cp -a "$(dirname "$lpac_bin")"/. "$PREFIX/lpac/"
@@ -186,8 +187,9 @@ fetch "https://github.com/astral-sh/python-build-standalone/releases/download/${
 tar xzf python.tgz -C "$PREFIX"            # -> $PREFIX/python
 ln -sfn python "$PREFIX/venv"              # the units name venv/bin/python
 PY="$PREFIX/python/bin/python3"
-# pyscard, if it has to be compiled, finds the pinned pcsc-lite here.
-CFLAGS="-I$PREFIX/include/PCSC" LDFLAGS="-L$PREFIX/lib" \
+# pyscard is compiled here: it finds the pinned pcsc-lite through these flags, and gcc replaces
+# the clang that python-build-standalone's sysconfig names (the container has no clang).
+CC=gcc LDSHARED="gcc -shared" CFLAGS="-I$PREFIX/include/PCSC" LDFLAGS="-L$PREFIX/lib" \
   "$PY" -m pip install --no-cache-dir --no-warn-script-location -r "$REPO/packaging/requirements-runtime.txt"
 "$PY" -m pip uninstall -y pip setuptools wheel >/dev/null 2>&1 || true
 
@@ -236,17 +238,21 @@ cat "$PREFIX/apt-packages.txt"
 log "smoke tests"
 unresolved=$(find "$PREFIX" -type f \( -name '*.so' -o -name '*.so.*' -o -perm -u+x \) -print0 |
   xargs -0 file | awk -F: '/ELF/ {print $1}' |
-  while IFS= read -r binary; do ldd "$binary" 2>/dev/null | grep 'not found' | sed "s|^|$binary: |"; done)
+  while IFS= read -r binary; do
+    # grep finds nothing in a healthy binary; that status must not end the script (pipefail).
+    ldd "$binary" 2>/dev/null | grep 'not found' | sed "s|^|$binary: |" || true
+  done)
 [ -z "$unresolved" ] || { echo "$unresolved" >&2; exit 1; }
 "$PREFIX/asterisk/sbin/asterisk" -V
-"$PREFIX/sbin/pcscd" --version | head -n1
+pcscd_version=$("$PREFIX/sbin/pcscd" --version); echo "${pcscd_version%%$'\n'*}"
 "$PREFIX/lpac/lpac" version || true
-"$PREFIX/bin/sing-box" version | head -n1
+singbox_version=$("$PREFIX/bin/sing-box" version); echo "${singbox_version%%$'\n'*}"
 "$PY" -c 'import Crypto, cryptography, jinja2, panoramisk, requests, serial, smartcard, socks, card, yaml, fastapi, uvicorn, websockets, multipart; print("python imports ok")'
 (cd "$PREFIX/control" && MDD_DATA="$WORK/smoke-data" "$PY" -c 'import app.main; print("control imports ok")')
 netns_status=0; "$PY" -I "$PREFIX/host/mdd_netns.py" up 0 2>/dev/null || netns_status=$?
 [ "$netns_status" -eq 64 ]
-sh -n "$PREFIX/engine/entrypoint.sh" "$PREFIX/packaging/sbin/mdd-enginectl"
+sh -n "$PREFIX/engine/entrypoint.sh"          # sh -n checks only its first file
+sh -n "$PREFIX/packaging/sbin/mdd-enginectl"
 
 cat > "$PREFIX/BUILDINFO" <<EOF
 version=$VERSION

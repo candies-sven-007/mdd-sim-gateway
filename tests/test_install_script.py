@@ -110,6 +110,17 @@ class BuildScriptTests(unittest.TestCase):
         for name in ("PJPROJECT_COMMIT", "ASTERISK_COMMIT", "LPAC_COMMIT"):
             self.assertRegex(self.TEXT, rf"{name}=[0-9a-f]{{40}}\n")
 
+    def test_bullseye_build_fixes_stay(self):
+        """Each of these broke a real build-arm64 run on debian:bullseye (SLIM_PLAN log)."""
+        self.assertIn("archive.debian.org/debian-security", self.TEXT)   # suite archived
+        self.assertIn("-Dc_link_args=-pthread", self.TEXT)               # glibc 2.31
+        self.assertRegex(self.TEXT, r"\blibmnl-dev\b")                     # res_pjsip_outbound_registration
+        self.assertIn('-DCMAKE_C_FLAGS="-I$PREFIX/include"', self.TEXT)  # lpac <PCSC/winscard.h>
+        self.assertIn('CC=gcc LDSHARED="gcc -shared"', self.TEXT)        # pyscard, no clang
+        # A failing left side of `a && b` does not stop a set -e script.
+        self.assertNotRegex(self.TEXT, r"(?m)^\s*(ninja|make|meson|cmake)\b[^#\n]*&&")
+        self.assertNotRegex(self.TEXT, r'(?m)^\s*"\$WORK/cmake/bin/cmake"[^#\n]*&&')
+
     def test_every_asterisk_patch_follows_ast_src(self):
         """The patchers default to the old image's /home/asterisk-build; the build sets AST_SRC."""
         self.assertIn('export AST_SRC="$WORK/asterisk"', self.TEXT)

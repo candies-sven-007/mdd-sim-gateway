@@ -438,6 +438,13 @@ nft table inet mdd:
   - 脚本问题：`ninja -C build && ninja -C build install` 在 `set -e` 下，左边失败不会退出，所以 pcsc-lite 的错误被跳过，报错位置变成了后面 ccid 找不到 libpcsclite。修正：pcsc-lite 与 ccid 两处都拆成两行。其余 `&&` 已检查：重试循环里的条件判断、子 shell 内的 `cd && 命令`（子 shell 的退出码仍受 `set -e` 约束），不需要改。
 - 2026-10-28 build-arm64 第三次运行（run 40644627821，bef589b）：pcsc-lite 与 ccid 已编过；失败在 Asterisk 补丁。`ims_public_identity_log.py` 找不到 `/home/asterisk-build/asterisk/...`：补丁脚本的默认路径是原 Docker 镜像里的目录。4 个脚本读环境变量 `AST_SRC`，`mt_rpack_routing.py`、`resolve_config_docs.py` 写死路径。修正：build-arm64.sh 在应用补丁前 `export AST_SRC="$WORK/asterisk"`；那两个脚本也改为读 `AST_SRC`（默认值不变）；`test_mt_sms_discard` 改为通过 `AST_SRC` 运行补丁；`test_install_script` 新增检查：每个补丁脚本都读 `AST_SRC`，并且在空目录上只因缺源文件退出，不出现 Python 错误。
   - 本地复现手段：沙箱里起 dockerd，用 amd64 `debian:bullseye`（gcc 10.2.1、glibc 2.31，与 CI 容器同版本）跑 build-arm64.sh 中 Python 之前的步骤。沙箱代理对 GitHub 源码归档返回 403，所以本地用 git 取 pcsc-lite/ccid 同一标签代替（CI 仍用固定 sha256 的归档）。本地已复现第三次的失败，修正后 6 个补丁都能打上，configure 通过；Asterisk 编译结果见下一条。
+- 2026-10-28 build-arm64 第四次运行（run 40645261213，563357b）：6 个补丁都打上了，Asterisk 在 arm64 上编译成功（R3 消除）；失败在模块白名单：`res_pjsip_outbound_registration.so` 没有生成，本地 x86 复现结果相同。之后用本地 x86 环境把整个脚本跑通（只为本地替换了 x86 的 Python/sing-box/Xray 下载与校验值），途中又修了四处：
+  - `res_pjsip_outbound_registration` 的 MODULEINFO 要求 `libmnl`（sysmocom 的 netlink/xfrm 代码），menuselect 因此跳过了它。原 Fedora Dockerfile 装了 `libmnl-devel`，构建依赖里补上 `libmnl-dev`。其余白名单模块的外部依赖（speex、ogg、vorbis、unbound、srtp、openssl、gsm）都已在列表里。
+  - lpac 源码写的是 `#include <PCSC/winscard.h>`，固定版本的 pcsc-lite 头文件装在 `$PREFIX/include/PCSC`。cmake 加 `-DCMAKE_C_FLAGS="-I$PREFIX/include"`；同时去掉这个 lpac 版本不认识的 `STANDALONE_MODE`、`LPAC_WITH_APDU_UQMI`。
+  - pyscard 没有可用的预编译 wheel，需要现场编译。python-build-standalone 的 sysconfig 指定编译器为 clang，容器里没有，所以 pip 这一步设 `CC=gcc LDSHARED="gcc -shared"`。
+  - 冒烟测试的脚本错误：`ldd | grep 'not found'` 在一切正常时返回 1，pipefail 让 `unresolved=$(...)` 直接终止脚本；`pcscd --version | head -n1` 和 `sing-box version | head -n1` 有 SIGPIPE 风险；`sh -n a b` 只检查第一个文件。已全部改掉；`find | head -n1` 改为 `find -print -quit`。
+  - `test_install_script` 新增 `test_bullseye_build_fixes_stay`，固定以上修正，并检查构建命令不再用 `a && b` 的写法。
+  - 本地 x86 结果：全流程通过（各组件冒烟测试、Python 导入、控制面导入、打包）。主包 75 MB（解压后约 225 MB，其中 Python 约 150 MB：解释器与 libpython 各约 30 MB、site-packages 49 MB），Xray 包 14 MB。apt-packages.txt 列出 66 个运行库及 nftables/iproute2/procps/sudo/ca-certificates/kmod，都来自 bullseye main。瘦身（tcl/tk、idlelib、ensurepip 等）留到首次上设备之后再看。
 
 ---
 
