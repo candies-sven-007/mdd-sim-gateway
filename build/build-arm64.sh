@@ -99,8 +99,10 @@ fetch "https://github.com/LudovicRousseau/PCSC/archive/refs/tags/${PCSC_VERSION}
 rm -rf "PCSC-$PCSC_VERSION"; tar xzf pcsc.tgz; cd "PCSC-$PCSC_VERSION"
 meson setup build --prefix="$PREFIX" --libdir=lib --sbindir=sbin \
   -Dpolkit=false -Dlibsystemd=false -Dusbdropdir="$PREFIX/lib/pcsc/drivers" \
-  -Dipcdir=/run/pcscd
-ninja -C build && ninja -C build install
+  -Dipcdir=/run/pcscd -Dc_link_args=-pthread
+# -pthread: libpcsclite.so.1 calls pthread_once, which glibc 2.31 still keeps in libpthread.
+ninja -C build
+ninja -C build install
 
 # --------------------------------------------------------------------------------------- ccid
 log "ccid $CCID_VERSION + patches/ccid"
@@ -111,7 +113,8 @@ for patch_file in "$REPO"/patches/ccid/*.patch; do echo "applying $(basename "$p
 # The Alcor AK9563 (2ce3:9563) on the target device must be in the supported-reader table.
 grep -qi '0x2ce3:0x9563' readers/supported_readers.txt || { echo "ccid lacks 2ce3:9563" >&2; exit 1; }
 meson setup build --prefix="$PREFIX" --libdir=lib
-ninja -C build && ninja -C build install
+ninja -C build
+ninja -C build install
 ls "$PREFIX/lib/pcsc/drivers/ifd-ccid.bundle/Contents/Linux/"
 
 # ----------------------------------------------------------------------------------- asterisk

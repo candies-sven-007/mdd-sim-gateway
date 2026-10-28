@@ -433,6 +433,9 @@ nft table inet mdd:
   - 未在 arm64 上实测的点：sysmocom Asterisk 在 gcc 10 下能否编过（R3）、pcsc-lite 2.x 的 meson 选项、各组件在 Debian 11 glibc 2.31 上的运行，均由 build-arm64.yml 的冒烟测试先检查一遍。
 - 2026-10-28 build-arm64 首次运行（run 40640355602，1225304）失败在容器的第一次 apt：bullseye-security 的包在 deb.debian.org/debian-security 上 404（LTS 结束后已挪到 archive.debian.org；那里的 Release 日期 2026-09-12，没有 Valid-Until，openssl 等包可下载）。修正：workflow 在 apt 之前把容器里的 `deb.debian.org/debian-security` 改写为 `archive.debian.org/debian-security`（.list 与 .sources 都改），build-arm64.sh 开头重复一次（幂等）。只改构建容器。
   - 待定：设备上 install.sh 的 apt 会遇到同样问题。是自动改写安全源，还是只检测并提示手动修改，等设备上 `grep -rn security /etc/apt/sources.list /etc/apt/sources.list.d/` 的输出再决定；在此之前 install.sh 不改 apt 源。
+- 2026-10-28 build-arm64 第二次运行（run 40641838007，3ace8e0）：换源已生效，apt 通过；失败在编译。
+  - pcsc-lite 2.3.3 链接 `libpcsclite.so.1` 时报 `undefined reference to pthread_once`（src/libredirect.c:182）：glibc 2.31 的 pthread 函数还在 libpthread 里，pcsc-lite 的 meson 没给这个库链接 threads，又带 `-Wl,--no-undefined`。修正：meson setup 加 `-Dc_link_args=-pthread`。
+  - 脚本问题：`ninja -C build && ninja -C build install` 在 `set -e` 下，左边失败不会退出，所以 pcsc-lite 的错误被跳过，报错位置变成了后面 ccid 找不到 libpcsclite。修正：pcsc-lite 与 ccid 两处都拆成两行。其余 `&&` 已检查：重试循环里的条件判断、子 shell 内的 `cd && 命令`（子 shell 的退出码仍受 `set -e` 约束），不需要改。
 
 ---
 
