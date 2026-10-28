@@ -365,60 +365,6 @@ class ReselectAttributionTests(unittest.TestCase):
         self.assertEqual(written, {})
 
 
-class EpdgAddressRetentionTests(unittest.TestCase):
-    """A carrier rotates its ePDG A record every few seconds while an IKE SA lives for hours.
-
-    Routing only the newest answer revoked the route under a live tunnel, dropping that
-    traffic onto the host default route — the wrong country, and the carrier then killed the
-    SA. That is the fail-closed guarantee being broken by a DNS refresh.
-    """
-
-    def _app(self, temp):
-        return Orchestrator(Path(temp), Path.cwd(), dry_run=True)
-
-    def test_previous_answers_stay_routed(self):
-        with tempfile.TemporaryDirectory() as temp:
-            app = self._app(temp)
-            app.retained_epdg_addresses("us:epdg.test", ["208.54.2.163"])
-            app.retained_epdg_addresses("us:epdg.test", ["208.54.34.3"])
-            kept = app.retained_epdg_addresses("us:epdg.test", ["208.54.39.163"])
-            self.assertEqual(kept, ["208.54.2.163", "208.54.34.3", "208.54.39.163"])
-
-    def test_addresses_age_out(self):
-        with tempfile.TemporaryDirectory() as temp:
-            app = self._app(temp)
-            app.retained_epdg_addresses("us:epdg.test", ["208.54.2.163"])
-            # Expire the first answer without touching the clock the code reads.
-            app.epdg_seen["us:epdg.test"]["208.54.2.163"] = time.time() - 1
-            self.assertEqual(app.retained_epdg_addresses("us:epdg.test", ["208.54.34.3"]),
-                             ["208.54.34.3"])
-
-    def test_a_repeated_answer_refreshes_its_lifetime(self):
-        with tempfile.TemporaryDirectory() as temp:
-            app = self._app(temp)
-            app.retained_epdg_addresses("us:epdg.test", ["208.54.2.163"])
-            first = app.epdg_seen["us:epdg.test"]["208.54.2.163"]
-            app.retained_epdg_addresses("us:epdg.test", ["208.54.2.163"])
-            self.assertGreaterEqual(app.epdg_seen["us:epdg.test"]["208.54.2.163"], first)
-
-    def test_retention_is_capped(self):
-        with tempfile.TemporaryDirectory() as temp:
-            app = self._app(temp)
-            from host import mdd_orchestrator as orch
-            with patch.object(orch, "EPDG_ADDRESS_MAX", 3):
-                for index in range(8):
-                    kept = app.retained_epdg_addresses("us:epdg.test", [f"208.54.0.{index}"])
-            # Bounded, and it is the oldest entries that go.
-            self.assertEqual(kept, ["208.54.0.5", "208.54.0.6", "208.54.0.7"])
-
-    def test_countries_do_not_share_retention(self):
-        with tempfile.TemporaryDirectory() as temp:
-            app = self._app(temp)
-            app.retained_epdg_addresses("us:epdg.us", ["208.54.2.163"])
-            self.assertEqual(app.retained_epdg_addresses("gb:epdg.gb", ["31.94.76.1"]),
-                             ["31.94.76.1"])
-
-
 class ManagedReselectTests(unittest.TestCase):
     """Node changes must follow line failures, never a latency timer."""
 
@@ -1286,7 +1232,7 @@ class XrayFailureBlastRadiusTests(unittest.TestCase):
                        "lines": []}
             with patch.object(Orchestrator, "apply_xray",
                               side_effect=RuntimeError("Xray-core executable not found")), \
-                    patch.object(Orchestrator, "apply_routes"):
+                    patch.object(Orchestrator, "reconcile_lines", return_value={}):
                 app.reconcile_proxy(desired)
             return json.loads((app.root / "proxy-status.json").read_text())
 

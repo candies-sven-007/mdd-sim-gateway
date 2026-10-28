@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Host-side country egress orchestrator.
 
-The manager writes ``data/orchestrator/desired.json``.  This process owns the host network
-namespace, the sing-box (and optional Xray) process and the ePDG host routes. SIM readers are
-plain PC/SC devices served by pcscd; this process does not touch them.
+The manager writes ``data/orchestrator/desired.json``.  This process owns the sing-box (and
+optional Xray) process, and each line's default route and the nftables rules that confine
+it (host/mdd_netns.py). SIM readers are plain PC/SC devices served by pcscd; this process
+does not touch them.
 """
 from __future__ import annotations
 
@@ -17,8 +18,8 @@ import os
 import re
 import shutil
 import signal
-import socket
 import subprocess
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -29,6 +30,13 @@ try:
 except ImportError:  # pragma: no cover - installer provides PyYAML
     yaml = None
 
+# Run as `python -I host/mdd_orchestrator.py`, which leaves the script's directory off sys.path;
+# the package root is root-owned (/opt/mdd/current), so adding it is safe.
+_PACKAGE_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PACKAGE_ROOT not in sys.path:
+    sys.path.insert(0, _PACKAGE_ROOT)
+from host import mdd_netns  # noqa: E402
+
 
 def load_yaml_text(text: str) -> dict:
     """Parse with libyaml when PyYAML has it: the same safe schema, far less CPU. The country
@@ -36,7 +44,6 @@ def load_yaml_text(text: str) -> dict:
     loader = getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
     return yaml.load(text, Loader=loader) or {}
 
-MANAGED_ROUTE_PROTO = "186"
 CLASH_API = os.environ.get("MDD_CLASH_API", "127.0.0.1:19090")
 
 
@@ -265,12 +272,6 @@ def parse_manual_outbound(value, tag: str) -> dict:
 
 
 UDP_PROXY_TYPES = {"ss", "shadowsocks", "trojan", "vless", "vmess", "hysteria2", "hy2"}
-# Carrier ePDG names rotate their A record every ~30 seconds. Routing only the newest answer
-# pulls the route out from under a tunnel that is still talking to the previous address, which
-# drops that traffic onto the host default route — the wrong country, and the carrier drops the
-# IKE SA. Addresses are therefore retained well beyond one DNS answer.
-EPDG_ADDRESS_TTL = float(os.environ.get("MDD_EPDG_ADDRESS_TTL", "21600"))
-EPDG_ADDRESS_MAX = int(os.environ.get("MDD_EPDG_ADDRESS_MAX", "64"))
 # How long a node that just failed a line is kept out of the candidate pool.
 EXIT_RESELECT_COOLDOWN = float(os.environ.get("MDD_EXIT_RESELECT_COOLDOWN", "900"))
 EXIT_RESELECT_MAX_AGE = float(os.environ.get("MDD_EXIT_RESELECT_MAX_AGE", "600"))
@@ -295,7 +296,9 @@ EXIT_RANK_WARMUP_SECONDS = float(os.environ.get("MDD_EXIT_RANK_WARMUP", "25"))
 TUN_DNS_WATCH_SECONDS = float(os.environ.get("MDD_TUN_DNS_WATCH", "60"))
 IDLE_INTERVAL_SECONDS = float(os.environ.get("MDD_IDLE_INTERVAL", "15"))
 
-COUNTRY_PROXY_LISTEN = os.environ.get("MDD_COUNTRY_PROXY_LISTEN", "172.17.0.1")
+# Loopback only: the control plane (same host) tests exits and resolves ePDGs through it.
+COUNTRY_PROXY_LISTEN = os.environ.get("MDD_COUNTRY_PROXY_LISTEN", "127.0.0.1")
+DEFAULT_CONTROL_PORT = 8443
 COUNTRY_PROXY_PORT_BASE = int(os.environ.get("MDD_COUNTRY_PROXY_PORT_BASE", "22000"))
 
 
@@ -496,8 +499,6 @@ class Orchestrator:
         prior_exits = (read_json(self.status_path).get("exits") or {})
         if not isinstance(prior_exits, dict):
             prior_exits = {}
-        # "<country>:<epdg host>" -> {address: time it may stop being routed}
-        self.epdg_seen: dict[str, dict[str, float]] = {}
         # Last node change per country, so the UI can say why the exit is not the pinned one.
         self.exit_last_change: dict[str, dict] = {
             str(country): dict(state["last_change"])
@@ -566,6 +567,8 @@ class Orchestrator:
         self.last_proxy_fingerprint = ""
         self.last_proxy_config: dict | None = None
         self.applied_timezone = ""
+        # Runs the ip/nft/sysctl commands of the line network; a dry run executes nothing.
+        self.netns_runner = _DryRunner() if dry_run else mdd_netns.Runner()
         self.stop = False
         # What the previous cycle concluded, for deciding whether this one changed anything.
         self._last_conclusion = ""
@@ -609,7 +612,7 @@ class Orchestrator:
         publish("running")
         self.log(f"restarting on request: scope={scope}")
         if scope == "control":
-            result = run(["systemctl", "restart", "mdd-sim-gateway-control"])
+            result = run(["systemctl", "restart", "mdd-control.service"])
             if result.returncode:
                 publish("failed", error_code="restart.error.failed",
                         error=(result.stderr or result.stdout or "").strip()[:400])
@@ -624,10 +627,13 @@ class Orchestrator:
                 publish("failed", error_code="restart.error.failed",
                         error=(result.stderr or result.stdout or "").strip()[:400])
             return
-        run(["systemctl", "reset-failed", "mdd-sim-gateway-restart.service"])
-        result = run(["systemd-run", "--unit", "mdd-sim-gateway-restart", "--collect",
+        # This restarts the orchestrator itself, so it runs from a transient unit that
+        # outlives this process. The engines keep running; their lines are blocked while the
+        # TUNs come back.
+        run(["systemctl", "reset-failed", "mdd-restart.service"])
+        result = run(["systemd-run", "--unit", "mdd-restart", "--collect",
                       "--description", "MDD Sim Gateway service restart",
-                      "sh", str(self.repo / "install.sh"), "restart"])
+                      "systemctl", "restart", "mdd-orchestrator.service", "mdd-control.service"])
         if result.returncode:
             publish("failed", error_code="restart.error.launch",
                     error=(result.stderr or result.stdout or "").strip()[:400])
@@ -648,8 +654,8 @@ class Orchestrator:
 
     def log(self, message):
         line = f"{time.strftime('%F %T')} {message}"
-        # Retained as well as printed: journalctl is out of reach from the control-plane
-        # container, so the support bundle would otherwise show no reason for a stall.
+        # Retained as well as printed, so the support bundle shows the reason for a stall
+        # without journal access.
         self._log_ring.append(line)
         print(line, flush=True)
 
@@ -1371,138 +1377,101 @@ class Orchestrator:
             raise RuntimeError("Xray exited during startup")
         self.last_xray_fingerprint = fingerprint
 
+    def reconcile_lines(self, desired: dict, proxy_enabled: bool, exits: dict) -> dict:
+        """Each line's route and the nftables rules (host/mdd_netns.py); per-line status."""
+        mdd_netns.ensure_forwarding(runner=self.netns_runner)
+        try:
+            control_port = int(desired.get("control_port") or DEFAULT_CONTROL_PORT)
+        except (TypeError, ValueError):
+            control_port = DEFAULT_CONTROL_PORT
+        lines = [line for line in desired.get("lines") or [] if isinstance(line, dict)]
+        return mdd_netns.reconcile(self.netns_runner, lines, proxy_enabled=proxy_enabled,
+                                   exits=exits, control_port=control_port, log=self.log)
+
     @staticmethod
-    def resolve(host: str) -> list[str]:
-        result = set()
-        for family, _, _, _, address in socket.getaddrinfo(host, 0, type=socket.SOCK_DGRAM):
-            ip = address[0]
-            if family == socket.AF_INET:
-                result.add(ip)
-        return sorted(result)
-
-    def retained_epdg_addresses(self, key: str, resolved: list[str]) -> list[str]:
-        """Every ePDG address that must stay routed, not just the one DNS just returned.
-
-        A carrier rotates this record every few seconds while an IKE SA lives for hours, so the
-        set of addresses in use is always wider than the current answer. Entries age out on a
-        timer and are capped, which keeps the route table bounded without ever revoking the
-        address an established tunnel is still using.
-        """
-        now = time.time()
-        seen = self.epdg_seen.setdefault(key, {})
-        for address in resolved:
-            seen[address] = now + EPDG_ADDRESS_TTL
-        for address, expiry in list(seen.items()):
-            if expiry <= now:
-                del seen[address]
-        if len(seen) > EPDG_ADDRESS_MAX:
-            for address, _ in sorted(seen.items(), key=lambda item: item[1])[:len(seen) - EPDG_ADDRESS_MAX]:
-                del seen[address]
-        return sorted(seen)
-
-    def current_managed_routes(self) -> set[tuple[str, str]]:
-        result = run(["ip", "-4", "route", "show", "proto", MANAGED_ROUTE_PROTO])
-        found = set()
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                parts = line.split()
-                if parts and "dev" in parts:
-                    found.add((parts[0].split("/")[0], parts[parts.index("dev") + 1]))
-        return found
-
-    def apply_routes(self, wanted: set[tuple[str, str]]):
-        if self.dry_run:
-            return
-        current = self.current_managed_routes()
-        for ip, iface in current - wanted:
-            run(["ip", "-4", "route", "del", f"{ip}/32", "dev", iface, "proto", MANAGED_ROUTE_PROTO])
-        for ip, iface in wanted:
-            run(["ip", "-4", "route", "replace", f"{ip}/32", "dev", iface, "proto", MANAGED_ROUTE_PROTO])
+    def line_status(line: dict, exit_state: dict, route: dict) -> dict:
+        """What proxy-status.json says about one line: its exit, plus where it may go."""
+        state = dict(exit_state)
+        state.pop("_member_names", None)
+        if not line.get("enabled", True):
+            state = {"mode": "disabled"}
+        blocked = route.get("route", mdd_netns.BLOCKED) == mdd_netns.BLOCKED
+        state.update({"ready": not blocked and line.get("enabled", True),
+                      "route": route.get("route", mdd_netns.BLOCKED),
+                      "netns": route.get("netns", ""),
+                      "netns_present": bool(route.get("netns_present"))})
+        if blocked and route.get("reason") and line.get("enabled", True):
+            state["error"] = route["reason"]
+        return state
 
     def reconcile_proxy(self, desired: dict):
         proxy = desired.get("proxy") or {}
-        lines_status, wanted, owners = {}, set(), {}
+        lines = [line for line in desired.get("lines") or [] if isinstance(line, dict)]
+        enabled = bool(proxy.get("enabled"))
         exits_state = {}
         try:
-            if not proxy.get("enabled"):
-                self.apply_routes(set())
+            if not enabled:
                 if self.singbox and self.singbox.poll() is None: self.singbox.terminate()
                 self.singbox = None; self.last_proxy_fingerprint = ""
                 self.apply_xray(None)
-                for line in desired.get("lines") or []:
-                    lines_status[str(line.get("id"))] = {"ready": True, "mode": "direct"}
-                atomic_json(self.status_path, {"updated_at": int(time.time()), "enabled": False,
-                                               "exits": {}, "lines": lines_status})
-                return
-            config, exits_state = self.build_proxy_config(proxy)
-            configured = [x for x in exits_state.values() if x.get("mode") != "direct" and x.get("ready")]
-            if configured:
-                # REALITY made Xray load-bearing for ordinary exits, where it used to matter
-                # only to the rare XHTTP node. Letting its failure escape here took every
-                # country down with it — including exits that never touch Xray. Only the
-                # countries it actually carries are failed; the rest still get their routes.
-                try:
-                    self.apply_xray(self.next_xray_config)
-                except Exception as exc:
-                    for country in self._xray_countries:
-                        if country in exits_state:
-                            exits_state[country] = {**exits_state[country], "ready": False,
-                                                    "error": f"Xray is unavailable: {exc}"}
-                    self.log(f"Xray failed; {len(self._xray_countries)} exit(s) affected: {exc}")
-                try:
-                    self.apply_singbox(config)
-                finally:
-                    self.release_tun_dns()
             else:
-                self.apply_xray(None)
-            # Ranking must come first: update_selected_nodes then reports the node this cycle
-            # actually settled on, so proxy-status.json never shows the pre-selection default.
-            self.process_reselect_requests(exits_state)
-            # After the reselect pass: a country that just moved node has fresh sessions, and
-            # nothing stale left worth closing.
-            self.process_stalled_reports(exits_state)
-            self.update_selected_nodes(exits_state)
-            for line in desired.get("lines") or []:
-                iid, country, host = str(line.get("id")), str(line.get("country") or "").lower(), str(line.get("epdg") or "")
-                exit_state = exits_state.get(country) or {"ready": False, "terminal": True,
-                                                           "error": f"no enabled {country.upper()} exit"}
-                state = dict(exit_state)
-                if not line.get("enabled", True):
-                    state = {"ready": True, "mode": "disabled"}
-                elif exit_state.get("ready") and exit_state.get("mode") != "direct":
+                config, exits_state = self.build_proxy_config(proxy)
+                configured = [x for x in exits_state.values()
+                              if x.get("mode") != "direct" and x.get("ready")]
+                if configured:
+                    # REALITY made Xray load-bearing for ordinary exits, where it used to
+                    # matter only to the rare XHTTP node. Only the countries it actually
+                    # carries are failed when it does; the rest keep their routes.
                     try:
-                        resolved = self.resolve(host)
-                        if not resolved: raise RuntimeError("ePDG DNS returned no IPv4 address")
-                        addresses = self.retained_epdg_addresses(f"{country}:{host}", resolved)
-                        iface = exit_state["interface"]
-                        for ip in addresses:
-                            if ip in owners and owners[ip] != iface:
-                                if ip not in resolved:
-                                    # A retained address the carrier has since handed to another
-                                    # country. The fresh answer wins; stop routing the old one.
-                                    self.epdg_seen.get(f"{country}:{host}", {}).pop(ip, None)
-                                    continue
-                                raise RuntimeError(f"ePDG {ip} is already assigned to another country exit")
-                            owners[ip] = iface; wanted.add((ip, iface))
-                        state["epdg"] = host
-                        # What DNS says right now vs everything kept routed for live tunnels.
-                        state["addresses"] = resolved
-                        state["routed_addresses"] = addresses
+                        self.apply_xray(self.next_xray_config)
                     except Exception as exc:
-                        state = {**state, "ready": False, "error": str(exc)}
-                lines_status[iid] = state
-            self.apply_routes(wanted)
+                        for country in self._xray_countries:
+                            if country in exits_state:
+                                exits_state[country] = {**exits_state[country], "ready": False,
+                                                        "error": f"Xray is unavailable: {exc}"}
+                        self.log(f"Xray failed; {len(self._xray_countries)} exit(s) affected: {exc}")
+                    try:
+                        self.apply_singbox(config)
+                    finally:
+                        self.release_tun_dns()
+                else:
+                    self.apply_xray(None)
+                # Ranking must come first: update_selected_nodes then reports the node this
+                # cycle actually settled on, so proxy-status.json never shows the pre-selection
+                # default.
+                self.process_reselect_requests(exits_state)
+                # After the reselect pass: a country that just moved node has fresh sessions,
+                # and nothing stale left worth closing.
+                self.process_stalled_reports(exits_state)
+                self.update_selected_nodes(exits_state)
         except Exception as exc:
-            for line in desired.get("lines") or []:
-                lines_status[str(line.get("id"))] = {"ready": False, "error": str(exc)}
             # build_proxy_config marks an exit ready once its config renders; a sing-box that
             # then refused to start leaves no listener behind it. Publishing those exits as
             # ready sent the UDP test at a socket nobody was serving and blamed the node.
+            self.log(f"exit reconcile failed: {exc}")
             for country, state in exits_state.items():
                 if state.get("mode") != "direct" and state.get("ready"):
                     exits_state[country] = {**state, "ready": False, "error": str(exc)}
-        atomic_json(self.status_path, {"updated_at": int(time.time()), "enabled": True,
-                                       "exits": exits_state, "lines": lines_status})
+        try:
+            routes = self.reconcile_lines(desired, enabled, exits_state)
+        except Exception as exc:  # noqa: BLE001 - the routing gate stays; report every line
+            self.log(f"line network reconcile failed: {exc}")
+            routes = {str(line.get("id")): {"route": mdd_netns.BLOCKED, "reason": str(exc)}
+                      for line in lines}
+        lines_status = {}
+        for line in lines:
+            iid = str(line.get("id"))
+            country = str(line.get("country") or "").lower()
+            if enabled:
+                exit_state = exits_state.get(country) or {
+                    "ready": False, "terminal": True,
+                    "error": f"no enabled {country.upper()} exit"}
+            else:
+                exit_state = {"mode": "direct"}
+            lines_status[iid] = self.line_status(line, exit_state, routes.get(iid) or {})
+        atomic_json(self.status_path, {"updated_at": int(time.time()), "enabled": enabled,
+                                       "exits": exits_state if enabled else {},
+                                       "lines": lines_status})
 
     def loop(self):
         self.root.mkdir(parents=True, exist_ok=True)
@@ -1532,8 +1501,13 @@ class Orchestrator:
                 stamps.append(0.0)
         return tuple(stamps)
 
+    def _engine_died(self) -> bool:
+        """sing-box or Xray exited on its own: its exits are gone and must be rebuilt now."""
+        return any(process is not None and process.poll() is not None
+                   for process in (self.singbox, self.xray))
+
     def _sleep_for_work(self, seconds: float) -> None:
-        """Wait, but wake immediately when an input document changes.
+        """Wait, but wake immediately when an input document changes or an engine dies.
 
         Backing off must not make the gateway feel unresponsive: a settings save or a line
         start writes one of these files, and noticing that costs a stat rather than the
@@ -1546,7 +1520,7 @@ class Orchestrator:
             if remaining <= 0:
                 return
             time.sleep(min(self.interval, max(0.1, remaining)))
-            if self._input_mtimes() != watched:
+            if self._input_mtimes() != watched or self._engine_died():
                 return
 
     def request_stop(self):
@@ -1556,6 +1530,13 @@ class Orchestrator:
         self.request_stop()
         if self.singbox and self.singbox.poll() is None: self.singbox.terminate()
         if self.xray and self.xray.poll() is None: self.xray.terminate()
+
+
+class _DryRunner:
+    """Answers every query empty and executes nothing (Orchestrator dry runs)."""
+
+    def run(self, command, input=None):
+        return subprocess.CompletedProcess(command, 0, "", "")
 
 
 def main():

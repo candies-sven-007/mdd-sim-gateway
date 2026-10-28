@@ -407,6 +407,7 @@ nft table inet mdd:
   - 对 §12 的一处补充：每条线路的路由表里加宿主直连私网的 `throw` 路由。原因：内核对转发包做反向路径检查时，把出接口 `mddvN` 当作入接口查策略路由，命中线路自己的表、查到 TUN，严格 `rp_filter` 下会丢掉浏览器回给 Asterisk ICE 检查的包（集成测试 g 复现过，`IPReversePathFilter` 计数加 1）。forward 链仍只放行带标记的 RTP，其余到局域网的包照样丢弃。
   - 沙箱内核没有 IPv6，`up` 改为：IPv6 的 sysctl 失败只告警，rp_filter 等其余步骤失败就退出。
 - 2026-10-28 §12.11 第 2 项完成：`packaging/systemd/mdd-netns@.service`、`mdd-engine@.service`、`packaging/sbin/mdd-enginectl`、`packaging/sudoers.d/mdd` + `tests/test_packaging.py`（15 个；含 `visudo -cf` 与 `systemd-analyze verify`，工具不存在时跳过）。与 §12.3 的差异：引擎单元去掉了 `/var/run/asterisk`、`/var/log/asterisk` 两个临时挂载（Asterisk 的控制套接字和日志按 P-4 放在线路自己的 run/logs 目录），增加 `MDD_AST_LOGDIR`。
+- 2026-10-28 §12.11 第 3 项完成：orchestrator 每轮调用 `mdd_netns.reconcile()`（代理关闭时也调用，线路按直连处理），删除 /32 ePDG 路由、ePDG 解析与地址保留（`EpdgAddressRetentionTests` 5 个测试随功能删除）；国家 SOCKS 默认监听 127.0.0.1；sing-box/Xray 自行退出时立即醒来重建；服务重启改用 `mdd-control.service`/`mdd-orchestrator.service`（`services` 范围用 `systemd-run` 临时单元执行 `systemctl restart`，不再调用 install.sh）。`proxy-status.json` 的 `lines[N]` 增加 `route`/`netns`/`netns_present`，去掉 `addresses`/`routed_addresses`。新增 `tests/test_orchestrator_lines.py`（12 个）。
 
 ---
 
