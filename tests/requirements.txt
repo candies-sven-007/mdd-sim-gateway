@@ -1,0 +1,3 @@
+# Test-only dependencies, on top of control/requirements.txt. Never installed on the gateway.
+# httpx: starlette.testclient (tests/test_route_auth.py).
+httpx==0.28.1

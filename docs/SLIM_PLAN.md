@@ -394,3 +394,10 @@ nft table inet mdd:
   - 遗留项 1（下一步先做）：路由防漏测试。以拆分前 9fcbe5c 的 /api/ 路由 (method, path) 集合和 WebSocket 路径集合为固定基线，断言 tests/route_listing.api_routes(app) 与基线一致；再用 TestClient 在未登录状态下请求每个基线接口，除白名单（登录、首次设置等）外都必须返回 401 或 403。
   - 遗留项 2：设置页的维护/存储里仍有 Docker 镜像与构建缓存相关的 UI 和后端字段，留给阶段 4。
   - 遗留项 3：i18n 里仍写最多十条线路，阶段 4 改线路上限时一并修改。
+- 2026-10-28 遗留项 1 完成：路由防漏测试（本提交）。全量测试 998 个通过，WebUI 构建通过。
+  - `tests/test_route_set.py`：基线改为从 9fcbe5c 实际导出（在该提交的工作树里遍历 app.routes 并展开 include 的 router），66 个 /api/ 的 (method, path) 加 2 个 WebSocket 路径；与原 EXPECTED 逐项相同。非 APIRoute/APIWebSocketRoute 的路由（普通 Starlette Route、Mount）也会被检出，避免绕过比较。
+  - `tests/test_route_auth.py`：用 TestClient 走完整应用（gate、审计中间件、routers），未登录请求每个基线接口，分"未设置管理员"和"已设置管理员"两种状态各跑一遍；也测了带无效 cookie 的情况。除白名单外都必须是 401/403；WebSocket 必须以 4401/4403 关闭（gate 对 WebSocket 的对应码）。
+  - 白名单（来自 gate.PUBLIC_PATHS 与 routers/auth.py）：`GET /api/auth/status`（登录页判断显示"设置"还是"登录"，未登录时 csrf 为空）、`POST /api/auth/setup`（auth.configured() 后返回 409）、`POST /api/auth/login`（按来源限速，错误密码 401）。`POST /api/engine/event` 不在白名单：它要求引擎令牌，未带或带错都返回 401，单独有测试。
+  - 变异验证：把 /api/settings 加进 PUBLIC_PATHS、把 WebSocket 来源改成不要求会话，测试都会失败（WebSocket 等待第一条消息有 5 秒上限，被错误放行的 socket 不会让测试挂住）。
+  - TestClient 依赖 httpx，它不是运行依赖。新增 `tests/requirements.txt`（固定 httpx==0.28.1），ci.yml 的 python job 额外安装它；设备上的发布包不包含它。starlette 1.10 对 httpx 打印弃用警告，不影响结果。
+  - 观察到但未改动：`/docs`、`/docs/oauth2-redirect`、`/openapi.json`、`/redoc` 在 9fcbe5c 和现在都不经登录即可访问（不在 /api/ 下，gate 视为静态资源）。会暴露完整接口清单，但不暴露数据。是否关闭（`FastAPI(docs_url=None, redoc_url=None, openapi_url=None)`）列为阶段 4 待定问题 P-1。

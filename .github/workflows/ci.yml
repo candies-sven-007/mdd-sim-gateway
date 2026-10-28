@@ -29,9 +29,11 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-          cache-dependency-path: control/requirements.txt
+          cache-dependency-path: |
+            control/requirements.txt
+            tests/requirements.txt
       - run: sudo apt-get update && sudo apt-get install -y swig libpcsclite-dev
-      - run: pip install -r control/requirements.txt
+      - run: pip install -r control/requirements.txt -r tests/requirements.txt
       - run: python -m py_compile control/app/*.py engine/*.py host/*.py
       - run: python -m unittest discover -s tests -v
       - run: sh -n install.sh engine/entrypoint.sh
