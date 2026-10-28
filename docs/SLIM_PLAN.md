@@ -459,6 +459,10 @@ nft table inet mdd:
   - 匹配逻辑分析：插卡时按 ICCID 匹配（`state._match_instance_by_iccid`），不按读卡器槽位；读卡器槽位只在"已有运行中的引擎占着这张卡"时用来对应。拔卡或拔读卡器不占用、也不释放任何名额。"SIM line limit reached; ignoring…" 只会在 `_ensure_card_draft` 里打出，而走到这里的前提是读到的 ICCID 不属于任何已保存线路。因此设备上 6697 这次读到的 ICCID 与线路 1 保存的不同：要么是另一张卡，要么是 eUICC 切换了配置（ICCID 随配置变化），要么线路 1 保存的 ICCID 与读到的不一致。代码里没有找到"同一 ICCID 重插后匹配不上"的路径，需要设备上的数据确认（只看尾号，见交付说明）。
   - 修改：上限挡住时在卡片状态里记下 `not_enabled = {reason: line_limit, max_lines, iccid_tail}`；`/api/devices` 对这种卡返回 `provisioning.state = "line_limit"` 和 `line_limit` 字段，VoWiFi 原因改为"这张 SIM 没有对应线路：已达到 SIM 线路上限"；设备页显示"尾号 xxxx 的 SIM 未启用：已达到上限（N 条）"和处理办法。卡片监控每轮检查被挡住的卡，一旦删掉线路或调大上限，就自动为它建线路并尝试启动，不需要重新插卡。
   - 测试：`tests/test_line_limit_card.py`（7 个）：同一张卡拔读卡器再插、只拔卡再插都回到原线路，不尝试新建；重插时读卡失败不占名额；上限挡住时日志、卡片状态、`/api/devices`、`/api/cards` 都带原因；删线路、调大上限、卡片监控自动重试三种解除方式。
+- 2026-10-28 softphone WebSocket 反复 403：判断为预期行为，不是鉴权 bug。
+  - 依据：同一时间 `/ws?auth_close=1` 用同一 cookie 和 Origin 能连上，说明会话和 Origin 校验都通过；Origin 被拒时 gate 会打 "refused WebSocket … from origin" 日志。403 来自 `ws_softphone` 自己：线路不存在或关了软电话（1008）、读不到引擎状态或引擎没运行（1013）、引擎连不上（1011），都是在 accept 之前 close，uvicorn 把这种情况记为 HTTP 403，浏览器只看到 1006。`GlobalSoftphone` 会给每条开着软电话的线路建 UA，不看线路是否在运行，JsSIP 按 2–30 秒的退避一直重连，所以线路 1 没运行时就每隔几秒一个 403（与 Bug 2 的线路状态吻合）。
+  - 修改（按"预期行为"处理）：relay 对这些情况先以 sip 子协议 accept，再用明确的关闭码和原因关闭：4404 线路不存在、4410 软电话已关、4409 线路未运行、4503 读不到状态、4502 引擎无响应；不支持 sip 子协议的客户端仍在握手阶段拒绝（1008）。JsSIP 每次连上都会把退避计数清零，所以前端不能依赖它：`Softphone` 收到这些码时停掉 JsSIP 的重连，自己按 30 秒起翻倍、最长 10 分钟重试，注册成功后清零；软电话页显示原因和下次重试时间，其他页面不提示。
+  - 测试：`test_softphone_ws` 按新行为改写（accept 后带码和原因关闭，原因不超过 123 字节，前后端的码集合一致）；`webui/tests/softphone-refusal.test.mjs` 检查退避序列、拒绝后停掉 UA 并按时重启、`stop()` 取消待重试。
 
 ---
 

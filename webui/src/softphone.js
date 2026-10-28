@@ -72,6 +72,22 @@ function silentAudioStream() {
   } catch { return null }
 }
 
+// Close codes the gateway's softphone relay refuses a line with (control/app/softphone_ws.py).
+// JsSIP would reconnect every few seconds for ever (its counter resets on every accepted
+// socket), so the Softphone stops it and retries on its own, backing off from 30 s to 10 min.
+export const SOFTPHONE_REFUSALS = {
+  4404: 'This SIM line no longer exists.',
+  4409: 'This line is not running. Start it on the device page; the softphone connects by itself.',
+  4410: 'The browser softphone is turned off for this line.',
+  4502: 'This line is not answering yet. Retrying.',
+  4503: 'The line state could not be read. Retrying.',
+}
+export const REFUSAL_RETRY_MIN_MS = 30_000
+export const REFUSAL_RETRY_MAX_MS = 600_000
+export function refusalRetryDelay(attempt) {
+  return Math.min(REFUSAL_RETRY_MAX_MS, REFUSAL_RETRY_MIN_MS * 2 ** Math.max(0, attempt))
+}
+
 export class Softphone {
   // audioEl: a persistent <audio> element rendered by React and handed in via ref. Using one
   // stable, DOM-attached element (instead of a per-call `new Audio()`) is what makes remote
@@ -91,6 +107,9 @@ export class Softphone {
     this._recCtx = null
     this._recChunks = []
     this._local = null                // local audio handed to JsSIP; ours to release
+    this._host = null
+    this._refusals = 0                // consecutive refusals, for the back-off
+    this._retryTimer = null
   }
 
   emit(type, data) { try { this.onEvent(type, data) } catch {} }
@@ -154,7 +173,10 @@ export class Softphone {
   // control/engine pair is being upgraded from the old directly-published WSS transport.
   start(prov, host) {
     if (this.ua) this.stop()
+    clearTimeout(this._retryTimer)
+    this._retryTimer = null
     this.prov = prov
+    this._host = host
     // Prefer the same-origin relay. The fallback keeps the page usable during a rolling update
     // in which an older control plane still returns ws_port. Invalid/mixed provisioning must
     // report a failed registration rather than throw from a React effect and blank the page.
@@ -188,8 +210,13 @@ export class Softphone {
     // from the torn-down UA would flip the already-registered NEW line's status to red. All other
     // events (incoming, registered, …) must always pass — gating them broke the incoming-call
     // Answer/Decline overlay.
-    this.ua.on('disconnected', () => { if (!this._dead) this.emit('ws', 'disconnected') })
-    this.ua.on('registered', () => this.emit('registered', true))
+    const ua = this.ua
+    this.ua.on('disconnected', (event) => {
+      if (this._dead || this.ua !== ua) return
+      if (SOFTPHONE_REFUSALS[event?.code]) { this._holdOff(event.code, event.reason); return }
+      this.emit('ws', 'disconnected')
+    })
+    this.ua.on('registered', () => { this._refusals = 0; this.emit('registered', true) })
     this.ua.on('unregistered', () => this.emit('registered', false))
     this.ua.on('registrationFailed', (e) => this.emit('regfail', (e && e.cause) || 'failed'))
     this.ua.on('newRTCSession', (e) => this.handleSession(e))
@@ -442,7 +469,25 @@ export class Softphone {
 
   get recording() { return !!this._rec }
 
+  // The relay refused this line (not running, softphone off, …). Stop JsSIP's own reconnect
+  // loop and try again later, waiting twice as long each time.
+  _holdOff(code, reason) {
+    const ua = this.ua
+    this.ua = null
+    try { ua?.stop() } catch {}
+    const retryInMs = refusalRetryDelay(this._refusals)
+    this._refusals += 1
+    this.emit('refused', { code, reason: reason || '', message: SOFTPHONE_REFUSALS[code], retryInMs })
+    clearTimeout(this._retryTimer)
+    this._retryTimer = setTimeout(() => {
+      this._retryTimer = null
+      if (!this._dead && !this.ua && this.prov) this.start(this.prov, this._host)
+    }, retryInMs)
+  }
+
   stop() {
+    clearTimeout(this._retryTimer)
+    this._retryTimer = null
     // Mark dead FIRST so any late JsSIP event from ua.stop() (async 'disconnected'/'unregistered')
     // is swallowed by emit() and cannot clobber a newly-started line's state.
     this._dead = true

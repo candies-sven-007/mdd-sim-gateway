@@ -21,15 +21,16 @@ class _Browser:
         self.headers = {"sec-websocket-protocol": ", ".join(subprotocols)} if subprotocols else {}
         self.accepted = None
         self.close_code = None
+        self.close_reason = None
         self.inbox = asyncio.Queue()    # what the browser sends
         self.outbox = asyncio.Queue()   # what the relay delivers to the browser
 
     async def accept(self, subprotocol=None):
         self.accepted = subprotocol
 
-    async def close(self, code=1000):
+    async def close(self, code=1000, reason=None):
         if self.close_code is None:
-            self.close_code = code
+            self.close_code, self.close_reason = code, reason
 
     async def receive(self):
         return await self.inbox.get()
@@ -92,31 +93,36 @@ class SoftphoneRelayTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.engine_closed.wait(), 5)
 
     async def refused(self, browser=None, **patches):
+        """A refusal is accepted on the sip subprotocol, then closed with a code and reason."""
         self.patched(**patches)
         browser = browser or _Browser()
         await asyncio.wait_for(softphone_routes.ws_softphone(browser, "sim1"), 10)
-        self.assertIsNone(browser.accepted)
+        self.assertEqual(browser.accepted, "sip")
+        self.assertEqual(browser.close_reason,
+                         softphone_ws.REFUSAL_REASONS[browser.close_code])
         return browser.close_code
 
-    async def test_unknown_line_disabled_softphone_or_missing_subprotocol_is_refused(self):
-        cases = [
-            ({}, ("sip",)),
-            ({"id": "sim1", "sip": {"webrtc": {"enable": False}}}, ("sip",)),
-            (None, ()),
-        ]
-        for instance, subprotocols in cases:
-            with self.subTest(instance=instance, subprotocols=subprotocols):
-                code = await self.refused(_Browser(subprotocols), instance=instance)
-                self.assertEqual(code, 1008)
+    async def test_unknown_line_and_disabled_softphone_are_refused_with_a_reason(self):
+        self.assertEqual(await self.refused(instance={}), softphone_ws.REFUSED_NO_LINE)
+        self.assertEqual(
+            await self.refused(instance={"id": "sim1", "sip": {"webrtc": {"enable": False}}}),
+            softphone_ws.REFUSED_DISABLED)
+
+    async def test_a_client_that_does_not_offer_sip_fails_the_handshake(self):
+        self.patched()
+        browser = _Browser(())
+        await asyncio.wait_for(softphone_routes.ws_softphone(browser, "sim1"), 10)
+        self.assertIsNone(browser.accepted)
+        self.assertEqual(browser.close_code, 1008)
 
     async def test_stopped_engine_is_refused(self):
         code = await self.refused(runtime={"running": False, "ip": None, "generation": None})
-        self.assertEqual(code, 1013)
+        self.assertEqual(code, softphone_ws.REFUSED_NOT_RUNNING)
 
-    async def test_unreachable_engine_fails_the_handshake(self):
+    async def test_unreachable_engine_is_refused(self):
         self.server.close()
         await self.server.wait_closed()
-        self.assertEqual(await self.refused(), 1011)
+        self.assertEqual(await self.refused(), softphone_ws.REFUSED_UNREACHABLE)
 
     async def test_browser_accept_failure_closes_the_engine_connection(self):
         self.patched()
@@ -136,8 +142,23 @@ class SoftphoneRelayTests(unittest.IsolatedAsyncioTestCase):
                 main.engine, "unit_runtime",
                 side_effect=OSError("systemctl unavailable")):
             await asyncio.wait_for(softphone_routes.ws_softphone(browser, "sim1"), 5)
-        self.assertIsNone(browser.accepted)
-        self.assertEqual(browser.close_code, 1013)
+        self.assertEqual(browser.accepted, "sip")
+        self.assertEqual(browser.close_code, softphone_ws.REFUSED_UNAVAILABLE)
+
+    def test_the_page_knows_every_refusal_code(self):
+        """webui/src/softphone.js backs off only on the codes it knows; the sets must agree."""
+        import re
+        source = (Path(__file__).resolve().parents[1] / "webui" / "src" / "softphone.js").read_text()
+        block = source[source.index("export const SOFTPHONE_REFUSALS"):]
+        block = block[:block.index("}")]
+        self.assertEqual({int(code) for code in re.findall(r"^\s*(\d{4}):", block, re.M)},
+                         set(softphone_ws.REFUSAL_REASONS))
+
+    def test_refusal_codes_are_application_codes_with_short_reasons(self):
+        for code, reason in softphone_ws.REFUSAL_REASONS.items():
+            with self.subTest(code=code):
+                self.assertTrue(4000 <= code <= 4999)
+                self.assertLessEqual(len(reason.encode()), 123)   # RFC 6455 close reason
 
     def test_path_is_per_line_and_escaped(self):
         self.assertEqual(softphone_ws.path("sim1"), "/api/instances/sim1/softphone/ws")

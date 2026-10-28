@@ -53,6 +53,7 @@ const WEBRTC_AVAILABLE = typeof RTCPeerConnection === 'function'
 const REG_LABEL = {
   loading: 'Loading…', idle: 'Idle', connecting: 'Connecting', registered: 'Registered',
   unregistered: 'Unregistered', disconnected: 'Disconnected', failed: 'Registration failed',
+  refused: 'Line unavailable',
 }
 
 // MMI codes a handset answers by itself: they are never sent to the network. Here the
@@ -113,6 +114,8 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   const id = selected?.id
   const [prov, setProv] = useState(null)
   const [reg, setReg] = useState('loading')
+  // Why the gateway refused this line's softphone, while it waits to retry (softphone.js).
+  const [refusal, setRefusal] = useState(null)
   const [call, setCall] = useState(null)     // {dir, number, state, startedAt, endCause}
   const [num, setNum] = useState('')
   const [dur, setDur] = useState(0)
@@ -290,8 +293,10 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
   const connect = useCallback(() => {
     if (!prov || !prov.enabled || phone.current) return
     const ph = new Phone((type, data) => {
-      if (type === 'registered' && data) {
+      if (type === 'refused') { setRefusal(data); setReg('refused') }
+      else if (type === 'registered' && data) {
         registeredOnce.current = true
+        setRefusal(null)
         setReg('registered')
       } else if (type === 'registered') {
         setReg(registeredOnce.current ? 'unregistered' : 'connecting')
@@ -403,6 +408,10 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
     // INVITE went into a websocket that is not there and the screen reported an ordinary
     // failed call. 'connecting' is deliberately allowed through — the transport may come up
     // within the call setup — while these three states cannot carry a call at all.
+    if (reg === 'refused') {
+      toast(t(refusal?.message || 'Line unavailable'))
+      return
+    }
     if (['disconnected', 'failed', 'unregistered'].includes(reg)) {
       toast(t(reg === 'disconnected'
         ? 'This browser is not connected to the line’s engine, so the call cannot be placed. Check that the engine for this SIM is running.'
@@ -520,6 +529,13 @@ export default function Softphone({ selected, subscribe, instances, cards, devic
             {t(REG_LABEL[reg] || reg)}
           </div>
         </div>
+
+        {reg === 'refused' && refusal && (
+          <div className="u-note" style={{ margin: '8px 0', fontSize: 13, lineHeight: 1.5 }}>
+            {t(refusal.message)}{' '}
+            {t('Trying again in {seconds} s.', { seconds: Math.round(refusal.retryInMs / 1000) })}
+          </div>
+        )}
 
         {/* Say it before a call is attempted, not after one silently fails: the failure mode
             is a screen that runs its full course and then blames the carrier. */}

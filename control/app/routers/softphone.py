@@ -102,20 +102,23 @@ async def ws_softphone(ws: WebSocket, iid: str):
     """The browser softphone's SIP-over-WebSocket, relayed to the line's engine.
 
     The session and the page's origin are checked by the gateway middleware before this runs
-    (gate.py). Rejections close before accepting (the browser sees a failed handshake)."""
-    inst = cfg.get_instance(iid)
-    webrtc = ((inst or {}).get("sip") or {}).get("webrtc") or {}
-    if not inst or not webrtc.get("enable", True) or \
-            not softphone_ws.offers_sip(ws.headers.get("sec-websocket-protocol")):
+    (gate.py). A line that cannot take the call is refused after accepting, with an explicit
+    close code and reason (softphone_ws.REFUSAL_REASONS), so the page can say why and stop
+    retrying; only a client that does not speak SIP at all fails the handshake."""
+    if not softphone_ws.offers_sip(ws.headers.get("sec-websocket-protocol")):
         await ws.close(code=1008)
         return
+    inst = cfg.get_instance(iid)
+    webrtc = ((inst or {}).get("sip") or {}).get("webrtc") or {}
+    if not inst:
+        return await softphone_ws.refuse(ws, softphone_ws.REFUSED_NO_LINE)
+    if not webrtc.get("enable", True):
+        return await softphone_ws.refuse(ws, softphone_ws.REFUSED_DISABLED)
     try:
         runtime = await asyncio.to_thread(engine.unit_runtime, str(iid))
     except Exception as exc:  # noqa: BLE001 - an id outside 1-10, or systemctl unavailable
         log.warning("softphone relay: cannot inspect engine %s: %s", iid, exc)
-        await ws.close(code=1013)
-        return
+        return await softphone_ws.refuse(ws, softphone_ws.REFUSED_UNAVAILABLE)
     if not runtime["running"] or not runtime["ip"]:
-        await ws.close(code=1013)
-        return
+        return await softphone_ws.refuse(ws, softphone_ws.REFUSED_NOT_RUNNING)
     await softphone_ws.relay(ws, softphone_ws.engine_url(runtime["ip"]))

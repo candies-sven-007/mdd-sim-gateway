@@ -26,6 +26,29 @@ ENGINE_WS_PORT = 8088
 MAX_MESSAGE = 256 * 1024
 OPEN_TIMEOUT = 5
 
+# Why a line refused the softphone. Closing before the handshake reached the browser only as
+# an anonymous failure (1006), which JsSIP retried every few seconds for ever and the uvicorn
+# log showed as 403s. The relay now accepts and closes with one of these instead; the page
+# reads the code, says why, and backs off on its own (webui/src/softphone.js).
+REFUSED_NO_LINE = 4404
+REFUSED_DISABLED = 4410
+REFUSED_NOT_RUNNING = 4409
+REFUSED_UNAVAILABLE = 4503
+REFUSED_UNREACHABLE = 4502
+REFUSAL_REASONS = {
+    REFUSED_NO_LINE: "no such SIM line",
+    REFUSED_DISABLED: "the browser softphone is turned off for this line",
+    REFUSED_NOT_RUNNING: "this line is not running",
+    REFUSED_UNAVAILABLE: "the line's state could not be read",
+    REFUSED_UNREACHABLE: "this line is not answering",
+}
+
+
+async def refuse(browser: WebSocket, code: int) -> None:
+    """Accept on the sip subprotocol, then close with an explicit code and reason."""
+    await browser.accept(subprotocol=SUBPROTOCOL)
+    await browser.close(code=code, reason=REFUSAL_REASONS[code])
+
 
 def path(iid: str) -> str:
     return f"/api/instances/{quote(str(iid), safe='')}/softphone/ws"
@@ -41,14 +64,14 @@ def offers_sip(header: str | None) -> bool:
 
 async def relay(browser: WebSocket, url: str) -> None:
     """Open the engine side first, then accept the browser, then pump both ways until either
-    side closes. A line whose Asterisk is down fails the browser handshake instead of accepting
-    a socket that can never register; JsSIP retries with its own backoff."""
+    side closes. A line whose Asterisk is down is refused with REFUSED_UNREACHABLE rather than
+    relayed to a socket that can never register."""
     try:
         engine = await connect(url, subprotocols=[SUBPROTOCOL], open_timeout=OPEN_TIMEOUT,
                                max_size=MAX_MESSAGE, compression=None, proxy=None)
     except Exception as e:  # noqa: BLE001 - any failure means the same thing to the browser
         log.info("softphone relay: engine %s unreachable: %s", url, e)
-        await browser.close(code=1011)
+        await refuse(browser, REFUSED_UNREACHABLE)
         return
 
     try:
