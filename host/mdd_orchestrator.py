@@ -148,6 +148,35 @@ def b64_padded(value: str) -> str:
 SUPPORTED_LINK_TRANSPORTS = {"", "tcp", "ws", "xhttp"}
 
 
+def link_port(value) -> int:
+    """A node's port as an int in 1..65535, or a ValueError an operator can read.
+
+    Share links, subscriptions and vmess JSON all hand ports over as text; a stray character
+    ("20450/") used to surface as int()'s own message deep in the converter.
+    """
+    text = str(value if value is not None else "").strip()
+    if not text.isdigit() or not 0 < int(text) <= 65535:
+        raise ValueError(f"node port {text or '(missing)'!r} is not a valid port (1-65535)")
+    return int(text)
+
+
+def _split_link(text: str):
+    """urlsplit() a share link, with host and port checked; never a bare int()/split()."""
+    from urllib.parse import urlsplit
+    parsed = urlsplit(text)
+    try:
+        port = parsed.port
+    except ValueError:
+        # urlsplit raises for a non-numeric or out-of-range port; name what was pasted.
+        raw = parsed.netloc.rpartition("@")[2].rpartition(":")[2]
+        raise ValueError(f"node port {raw!r} is not a valid port (1-65535)") from None
+    if not parsed.hostname:
+        raise ValueError("node link is missing a host")
+    if port is None:
+        raise ValueError("node link is missing a port")
+    return parsed, link_port(port)
+
+
 def parse_share_link(url: str) -> dict:
     """Convert one protocol share link into the Clash-style node dict clash_outbound() takes.
 
@@ -155,14 +184,20 @@ def parse_share_link(url: str) -> dict:
     nodes on exactly the same code path as subscription nodes, including the UDP admission
     rules that decide whether a node may carry IKE at all.
     """
-    from urllib.parse import parse_qs, unquote, urlsplit
+    from urllib.parse import parse_qs, quote, unquote
     text = url.strip()
     scheme = text.split("://", 1)[0].lower() if "://" in text else ""
 
     if scheme == "vmess":
         # vmess links are a base64 JSON blob rather than a URL.
-        payload = json.loads(b64_padded(text.split("://", 1)[1].split("#", 1)[0]))
-        node = {"type": "vmess", "server": payload.get("add"), "port": payload.get("port"),
+        try:
+            payload = json.loads(b64_padded(text.split("://", 1)[1].split("#", 1)[0]))
+        except (ValueError, UnicodeError) as exc:
+            raise ValueError("vmess link is not base64-encoded JSON") from exc
+        if not isinstance(payload, dict) or not str(payload.get("add") or "").strip():
+            raise ValueError("vmess link is missing a host")
+        node = {"type": "vmess", "server": str(payload["add"]).strip(),
+                "port": link_port(payload.get("port")),
                 "uuid": payload.get("id"), "alterId": payload.get("aid") or 0,
                 "cipher": payload.get("scy") or "auto",
                 "tls": str(payload.get("tls") or "").lower() in ("tls", "true"),
@@ -175,21 +210,40 @@ def parse_share_link(url: str) -> dict:
         return node
 
     if scheme == "ss":
-        # Either ss://base64(method:password)@host:port or ss://base64(method:password@host:port)
-        body = text.split("://", 1)[1].split("#", 1)[0].split("?", 1)[0]
-        if "@" in body:
-            credentials, _, hostport = body.rpartition("@")
-            credentials = b64_padded(credentials)
+        # SIP002: ss://userinfo@host:port[/][?plugin=...][#name], where userinfo is
+        # base64url(method:password) or, for 2022 ciphers, percent-encoded method:password.
+        # Legacy: ss://base64(method:password@host:port)[#name]. Both go through urlsplit, so
+        # "host:port/?q", "[IPv6]:port" and "#name" are read the same way as other schemes.
+        # Standard base64 may contain "/", so the userinfo is everything before the last "@"
+        # (ahead of any query or fragment) and is percent-encoded before urlsplit sees it.
+        body = text.split("://", 1)[1]
+        head = re.split(r"[?#]", body, maxsplit=1)[0]
+        tail = body[len(head):]
+        if "@" not in head:
+            try:
+                decoded = b64_padded(head.rstrip("/"))
+            except ValueError as exc:
+                raise ValueError("ss link is neither SIP002 nor base64-encoded") from exc
+            if "@" not in decoded:
+                raise ValueError("ss link is neither SIP002 nor base64-encoded")
+            head = decoded.strip()
+        userinfo, _, hostport = head.rpartition("@")
+        text = "ss://" + quote(userinfo, safe=":%") + "@" + hostport + tail
+        parsed, port = _split_link(text)
+        if parsed.password is not None:
+            credentials = unquote(parsed.username or "") + ":" + unquote(parsed.password)
         else:
-            credentials, _, hostport = b64_padded(body).rpartition("@")
-        method, _, password = credentials.partition(":")
-        host, _, port = hostport.rpartition(":")
-        return {"type": "ss", "server": host, "port": port,
+            try:
+                credentials = b64_padded(unquote(parsed.username or ""))
+            except ValueError as exc:
+                raise ValueError("ss link credentials are not base64-encoded") from exc
+        method, sep, password = credentials.partition(":")
+        if not sep or not method:
+            raise ValueError("ss link credentials must be method:password")
+        return {"type": "ss", "server": parsed.hostname, "port": port,
                 "cipher": method, "password": password}
 
-    parsed = urlsplit(text)
-    if not parsed.hostname or not parsed.port:
-        raise ValueError("node link is missing a host or port")
+    parsed, port = _split_link(text)
     query = {key: value[0] for key, value in parse_qs(parsed.query).items()}
     # Hysteria2 carries its whole auth string in userinfo, and that string is allowed to
     # contain a colon ("user:pass"). Reading only .username silently truncated it, so the
@@ -197,7 +251,7 @@ def parse_share_link(url: str) -> dict:
     userinfo = unquote(parsed.username or "")
     if parsed.password is not None:
         userinfo = userinfo + ":" + unquote(parsed.password)
-    node = {"server": parsed.hostname, "port": parsed.port,
+    node = {"server": parsed.hostname, "port": port,
             "network": query.get("type") or query.get("network") or "tcp",
             "servername": query.get("sni") or query.get("peer") or query.get("host") or "",
             "skip-cert-verify": str(query.get("allowInsecure")
@@ -444,10 +498,10 @@ def outbound_supports_udp(outbound: dict) -> bool:
 def clash_outbound(node: dict, tag: str) -> dict:
     """Convert the common Clash subscription node types used by the gateway."""
     kind = str(node.get("type", "")).lower()
+    if not node.get("server"):
+        raise ValueError("node lacks a server")
     base = {"type": kind, "tag": tag, "server": node.get("server"),
-            "server_port": int(node.get("port") or 0)}
-    if not base["server"] or not base["server_port"]:
-        raise ValueError("subscription node lacks server/port")
+            "server_port": link_port(node.get("port"))}
     if kind == "trojan":
         base["password"] = node.get("password", "")
     elif kind == "vless":

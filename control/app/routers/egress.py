@@ -87,6 +87,10 @@ async def api_egress_profile_test(profile_id: str, body: dict | None = None):
     parsed = await asyncio.to_thread(egress.describe_proxy_profile, profile)
     try:
         latency = await asyncio.to_thread(egress.test_proxy_profile, profile)
+    except egress.EgressInputError as exc:
+        # The link itself is unreadable (e.g. a port of "20450/"): the operator's input,
+        # not the exit, is what needs fixing.
+        raise HTTPException(400, {"message": str(exc), "parsed": parsed}) from exc
     except egress.EgressError as exc:
         # The parsed view travels with the failure: it is what tells an operator whether the
         # gateway read their link the same way their other client did.

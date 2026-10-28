@@ -450,6 +450,11 @@ nft table inet mdd:
   - 原因：这个组件是蜂窝模块的"未识别 USB 设备"探测（`api.usbCandidates`/`probeUsbCandidate`），阶段 2（b18256e）删除模块路径时删掉了组件与接口，但设备页里两处引用没删。vite 只转译不检查，所以构建能通过。slim 只支持 USB 读卡器，这个组件不该存在，修正为删除引用（349c:0418 不是读卡器，显示出来也没有可用的操作）。
   - 防再犯：前端是纯 JS（无 TypeScript），所以用 ESLint 而不是 tsc：`no-undef` 和 `react/jsx-no-undef`，不开风格规则。`npm run build` 改为 `eslint . && vite build`，CI 的 webui job 随之检查；CI 另加 `node --test tests/*.test.mjs`。`webui/tests/lint-guard.test.mjs` 确认引用未定义组件或标识符会报错、build 脚本先跑 lint。手动验证过：故意插入 `<NoSuchPanel />` 时 `npm run build` 退出码为 1。新增的 devDependencies 都固定版本（eslint 9.39.5、eslint-plugin-react 7.37.5、eslint-plugin-react-hooks 5.2.0（只注册，让已有的 disable 注释能解析）、globals 17.13.0），原有包版本不变，只用于构建。
   - 全仓排查：ESLint 在前端只报出这两处；pyflakes 在 control/engine/host 里没有未定义名称；control/app 的所有模块都能导入；`api.js` 调用的 63 个路径后端全部存在，前端没有绕过 api.js 的 `/api/` 调用。
+- 2026-10-28 Bug 3：测试分享链接时返回 500，报 `int('20450/')`。
+  - 原因：vless/trojan/hysteria2 已经用 `urlsplit` 解析；出错的是 ss 分支，它手工切分，只去掉了 `#` 和 `?`，所以 `host:port/?...` 里的 `/` 进了端口。同一分支对 `[IPv6]:port` 也会把方括号留在主机名里；vmess 的 JSON 端口没有校验。
+  - 修正：新增 `link_port()`（只接受 1–65535 的十进制数，否则报可读的 ValueError）和 `_split_link()`（`urlsplit` + `.hostname`/`.port`，并把 urlsplit 自己的端口异常换成可读信息）。ss 分支改为先确定 userinfo（最后一个 `@` 之前，标准 base64 里可能有 `/`，先百分号编码），再交给 `urlsplit`，SIP002 base64、2022 明文、整段 base64 三种写法都支持。vmess 校验 host 与端口；`clash_outbound` 也改用 `link_port()`（订阅节点同样受益）。
+  - 400：`egress.EgressInputError`（EgressError 的子类）表示输入无法解析；`test_proxy_profile` 把所有读取链接的步骤（包括 Xray 出站的构建）放进同一个 try，路由对它返回 400 `{message, parsed}`，前端已经读取 `detail.message`。缺少 sing-box 等网关自身问题仍为 503。
+  - 测试：`tests/test_share_link_ports.py`（11 个，含子用例）覆盖 vless、trojan、hysteria2/hy2、ss 三种写法、vmess 与 `host:port/?q`、`host:port?q`、`host:port/`、`#备注`、`[IPv6]:port`、无端口、非法端口等组合，以及路由的 400/503。确认过这些测试在修改前的代码上会失败（包括设备上那种链接格式）。
 
 ---
 

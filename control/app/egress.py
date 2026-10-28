@@ -44,6 +44,10 @@ class EgressError(RuntimeError):
     pass
 
 
+class EgressInputError(EgressError):
+    """What the operator pasted cannot be read (bad link, port, JSON): a 400, not a 503."""
+
+
 def udp_probe_targets() -> list[str]:
     """Public resolvers the UDP probe may use, in order.
 
@@ -432,9 +436,12 @@ def test_proxy_profile(profile: dict, timeout: float = 8.0) -> int:
     kind = str(profile.get("type") or "").lower()
     if kind == "socks5":
         host = str(profile.get("server") or "").strip()
-        port = int(profile.get("port") or 1080)
+        try:
+            port = int(profile.get("port") or 1080)
+        except (TypeError, ValueError):
+            port = 0
         if not host or not 0 < port <= 65535:
-            raise EgressError("SOCKS5 server or port is invalid")
+            raise EgressInputError("SOCKS5 server or port is invalid")
         return test_udp_proxy(host, port, timeout, str(profile.get("username") or ""),
                               str(profile.get("password") or ""))
     if kind != "node":
@@ -442,22 +449,30 @@ def test_proxy_profile(profile: dict, timeout: float = 8.0) -> int:
 
     value = str(profile.get("value") or "").strip()
     if not value:
-        raise EgressError("node share link is empty")
+        raise EgressInputError("node share link is empty")
     singbox = shutil.which(os.environ.get("MDD_SINGBOX_BIN", "sing-box"))
     if not singbox:
         raise EgressError("sing-box executable not found")
     helper = _orchestrator_module()
-    node = helper.parse_share_link(value) if value.lower().startswith("vless://") else None
-    # REALITY and XHTTP are Xray protocols; testing them through sing-box measured sing-box's
-    # compatibility with the server's Xray build rather than whether the node works.
-    via_xray = bool(node and helper.node_needs_xray(node))
     local_port, bridge_port = _free_loopback_port(), _free_loopback_port()
-    if via_xray:
-        outbound = {"type": "socks", "tag": "test-out", "version": "5",
-                    "server": "127.0.0.1", "server_port": bridge_port}
-    else:
-        outbound = (helper.clash_outbound(node, "test-out") if node
-                    else helper.parse_manual_outbound(value, "test-out"))
+    # Everything read from the pasted value happens here, so an unreadable link is reported
+    # as such (400) instead of escaping as a ValueError (500).
+    try:
+        node = helper.parse_share_link(value) if value.lower().startswith("vless://") else None
+        # REALITY and XHTTP are Xray protocols; testing them through sing-box measured
+        # sing-box's compatibility with the server's Xray build rather than whether the node
+        # works.
+        via_xray = bool(node and helper.node_needs_xray(node))
+        if via_xray:
+            outbound = {"type": "socks", "tag": "test-out", "version": "5",
+                        "server": "127.0.0.1", "server_port": bridge_port}
+            xray_out = helper.xray_outbound(node, "test-out")
+        else:
+            outbound = (helper.clash_outbound(node, "test-out") if node
+                        else helper.parse_manual_outbound(value, "test-out"))
+            xray_out = None
+    except ValueError as exc:
+        raise EgressInputError(f"node link could not be read: {exc}") from exc
     if not helper.outbound_supports_udp(outbound):
         raise EgressError("this node protocol does not support UDP")
 
@@ -489,7 +504,7 @@ def test_proxy_profile(profile: dict, timeout: float = 8.0) -> int:
                                   "protocol": "socks", "tag": "test-in",
                                   "settings": {"auth": "noauth", "udp": True,
                                                "ip": "127.0.0.1"}}],
-                    "outbounds": [helper.xray_outbound(node, "test-out")],
+                    "outbounds": [xray_out],
                     "routing": {"domainStrategy": "AsIs", "rules": [{"type": "field",
                                 "inboundTag": ["test-in"], "outboundTag": "test-out"}]},
                 }
