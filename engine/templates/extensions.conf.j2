@@ -18,8 +18,8 @@
 exten => {{ any_extension }},1,NoOp(Incoming call from ${CALLERID(num)})
 same => n,Set(CALLPEER=${CALLERID(num)})
 same => n,Progress()
-same => n,Set(FILE(/logs/calls.txt,,,a)=IN call from ${CALLERID(num)} at ${STRFTIME(${EPOCH},,%Y-%m-%d %H:%M:%S)})
-same => n,TrySystem(/usr/local/bin/notify.py call_in "${CALLERID(num)}" &)
+same => n,Set(FILE({{ logdir }}/calls.txt,,,a)=IN call from ${CALLERID(num)} at ${STRFTIME(${EPOCH},,%Y-%m-%d %H:%M:%S)})
+same => n,TrySystem({{ python }} {{ engine_dir }}/notify.py call_in "${CALLERID(num)}" &)
 same => n,WaitForPrecondition(10,2000)
 same => n,Ringing()
 {% if dialstr %}
@@ -59,7 +59,7 @@ exten => t,1,Hangup()
 ; the call log. Hangup() terminates the ordinary 'h' routine so no fall-through happens; Return()
 ; is invalid here because this special extension was not entered through Gosub().
 exten => h,1,Gosub(hangup-by,s,1)
-same => n,TrySystem(/usr/local/bin/notify.py call_result in "${CALLPEER}" "${DIALSTATUS}" "${HANGUPCAUSE}" "${GOSUB_RETVAL}" &)
+same => n,TrySystem({{ python }} {{ engine_dir }}/notify.py call_result in "${CALLPEER}" "${DIALSTATUS}" "${HANGUPCAUSE}" "${GOSUB_RETVAL}" &)
 same => n,Hangup()
 
 ; ===== Incoming SMS from the IMS/VoWiFi side =====
@@ -82,11 +82,11 @@ same => n,Hangup()
 ; and still cannot match.
 exten => _[+0-9*#].,1,NoOp(Outgoing call to ${EXTEN} from ${CALLERID(num)})
 same => n,Set(CALLPEER=${EXTEN})
-same => n,Set(FILE(/logs/calls.txt,,,a)=OUT call to ${EXTEN} at ${STRFTIME(${EPOCH},,%Y-%m-%d %H:%M:%S)})
+same => n,Set(FILE({{ logdir }}/calls.txt,,,a)=OUT call to ${EXTEN} at ${STRFTIME(${EPOCH},,%Y-%m-%d %H:%M:%S)})
 ; Quote ${EXTEN}: TrySystem runs this through a shell, where '#' starting a word begins a
 ; comment. An unquoted #225# swallowed the argument and every following one, so the call
 ; record was never created — while *#21# survived only because its '#' is mid-word.
-same => n,TrySystem(/usr/local/bin/notify.py call_out "${EXTEN}" &)
+same => n,TrySystem({{ python }} {{ engine_dir }}/notify.py call_out "${EXTEN}" &)
 ; Ring timeout {{ ring_timeout }}s (configurable): if the callee never answers, Asterisk
 ; CANCELs the outbound INVITE at this deadline instead of leaving it open. The carrier keeps
 ; the early dialog alive and RE-ALERTS the callee (repeated 180 Ringing) for as long as our
@@ -134,7 +134,7 @@ same => n,Hangup()
 exten => h,1,Set(ST=${IF($["${REALSTATUS}" != ""]?${REALSTATUS}:${DIALSTATUS})})
 same => n,Set(CS=${IF($["${REALCAUSE}" != ""]?${REALCAUSE}:${HANGUPCAUSE})})
 same => n,Gosub(hangup-by,s,1)
-same => n,TrySystem(/usr/local/bin/notify.py call_result out "${CALLPEER}" "${ST}" "${CS}" "${GOSUB_RETVAL}" &)
+same => n,TrySystem({{ python }} {{ engine_dir }}/notify.py call_result out "${CALLPEER}" "${ST}" "${CS}" "${GOSUB_RETVAL}" &)
 same => n,Hangup()
 
 [hangup-by]

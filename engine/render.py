@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-render.py - Render /config/instance.json into Asterisk configs + the SWu launch env.
+render.py - Render the line's instance.json into Asterisk configs + the SWu launch env.
 
 Reads the per-SIM instance descriptor (written by the manager, or hand-authored for
-bring-up), fills the Jinja2 templates in /opt/mdd-sim-gateway/templates, and writes the final
-config files. Also derives values (NAI, realm, ePDG FQDN) and computes the container
-source IP used as the SWu tunnel local address.
+bring-up), fills the Jinja2 templates in $MDD_TPL, and writes the final config files. Also
+derives values (NAI, realm, ePDG FQDN) and computes the namespace source IP used as the SWu
+tunnel local address.
+
+Paths come from the environment the engine unit sets (packaging/systemd/mdd-engine@.service);
+the defaults are the old container paths, which a hand-run bring-up may still use.
 
 Env overrides (used by entrypoint / keeper / ami_usim after render): USIM_PIN, USIM_READER.
 """
@@ -31,7 +34,16 @@ def env_value(value) -> str:
 from jinja2 import Environment, FileSystemLoader
 
 TPL_DIR = os.environ.get("MDD_TPL", "/opt/mdd-sim-gateway/templates")
-CFG_PATH = os.environ.get("MDD_INSTANCE", "/config/instance.json")
+CFG_PATH = (os.environ.get("MDD_CONFIG") or os.environ.get("MDD_INSTANCE")
+            or "/config/instance.json")
+RUNDIR = os.environ.get("MDD_RUNDIR", "/run/mdd-sim-gateway")
+LOGDIR = os.environ.get("MDD_LOGDIR", "/logs")
+AST_LOGDIR = os.environ.get("MDD_AST_LOGDIR") or os.path.join(LOGDIR, "asterisk")
+ENGINE_DIR = os.environ.get("MDD_ENGINE_DIR", "/usr/local/bin")
+# Generated files that are not Asterisk's: per line, outside the read-only system tree.
+ENGINE_ETC = os.environ.get("MDD_ENGINE_ETC", "/usr/local/etc")
+# Asterisk's compiled-in configuration directory; the engine unit gives each line a private one.
+AST_ETC = os.environ.get("MDD_AST_ETC", "/etc/asterisk")
 
 
 def _default_gateway_ipv4():
@@ -66,17 +78,14 @@ def _outside(address: str, excluded: str) -> bool:
 
 
 def container_ipv4(exclude: str = ""):
-    """The container's own docker-bridge IPv4 (e.g. 172.17.0.3). MUST be the bridge address, never
-    the VoWiFi tunnel inner IP: it is used as the IKE source (SWU_SOURCE) and as the local SIP
-    transport bind, both of which must sit on the docker bridge. A public-IP connect() probe would
-    pick the tunnel's inner IP once an IPv4 PDN has made the tunnel the default route (the re-render
-    after P-CSCF discovery runs post-tunnel), so probe the DOCKER GATEWAY instead — that next hop is
-    always reached over the bridge, so the chosen source is the bridge IP.
+    """The line's own IPv4 on its namespace veth (10.88.N.2). MUST be that address, never the
+    VoWiFi tunnel inner IP: it is used as the IKE source (SWU_SOURCE) and as the local SIP
+    transport bind. A public-IP connect() probe would pick the tunnel's inner IP once an IPv4
+    PDN has made the tunnel the default route (the re-render after P-CSCF discovery runs
+    post-tunnel), so probe the veth GATEWAY instead -- that next hop is always reached over the
+    veth, so the chosen source is the veth address.
 
-    ``exclude`` is the relay media network. Its address must never be chosen: on the container
-    stack the engine network is internal and the uplink is joined only after start, so the first
-    render has no default route and falls through to the address list, where the media address
-    may come first. A line whose IKE source or SIP bind lands there never registers."""
+    ``exclude`` names a network whose address must never be chosen (empty excludes nothing)."""
     gw = _default_gateway_ipv4()
     if gw:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -107,78 +116,10 @@ def container_ipv4(exclude: str = ""):
     finally:
         s.close()
     if not _outside(ip, exclude):
-        # Better a failed render (the entrypoint stops, Docker restarts the engine) than a
-        # line bound to the media network, which the relay can reach.
-        raise RuntimeError("no engine address outside the media network")
+        # Better a failed render (the entrypoint stops, systemd restarts the engine) than a
+        # line bound to an excluded network.
+        raise RuntimeError("no engine address outside the excluded network")
     return ip
-
-
-def media_interface(subnet: str) -> tuple[str, str]:
-    """(interface, IPv4 address) this container holds on ``subnet``, or ("", "") when it is not
-    attached. Used for the relay media network (control/app/media.py) and the Engine network."""
-    try:
-        network = ipaddress.ip_network(subnet)
-        out = subprocess.check_output(["ip", "-o", "-4", "addr", "show"], text=True,
-                                      stderr=subprocess.DEVNULL)
-    except Exception:
-        return "", ""
-    for line in out.splitlines():
-        fields = line.split()
-        if "inet" not in fields:
-            continue
-        address = fields[fields.index("inet") + 1].split("/")[0]
-        try:
-            if ipaddress.ip_address(address) in network:
-                return fields[1].split("@")[0], address
-        except ValueError:
-            continue
-    return "", ""
-
-
-def media_ruleset(interface: str, rtp_start: int, rtp_end: int) -> str:
-    """The media interface accepts the browser leg's RTP and nothing else.
-
-    The relay can reach every engine address on the media network, and Asterisk's other
-    listeners (AMI, SIP on 5060, the softphone WebSocket, pjsip's resolver sockets) bind the
-    wildcard address, so the boundary is drawn here rather than in each of them. The port range
-    alone is not enough: the IMS leg shares it, and for an IPv4 PDN its RTP socket is bound to
-    the wildcard address too. Only the browser leg binds to the media address
-    (bind_rtp_to_media_address), so a packet is admitted only when it lands on a socket bound
-    to a specific address. inet covers IPv6 link-local too. control/app/media.py checks that
-    the kernel supports this before relay mode can be switched on."""
-    return (
-        "table inet mdd_media\n"
-        "delete table inet mdd_media\n"
-        "table inet mdd_media {\n"
-        "  chain input {\n"
-        "    type filter hook input priority filter; policy accept;\n"
-        f'    iifname "{interface}" udp dport {int(rtp_start)}-{int(rtp_end)} '
-        "socket wildcard 0 accept\n"
-        f'    iifname "{interface}" drop\n'
-        "  }\n"
-        "}\n")
-
-
-def media_legacy_ruleset(interface: str, rtp_start: int, rtp_end: int) -> str:
-    """The same boundary for iptables-legacy-restore, loaded by the entrypoint only when the
-    kernel refuses media_ruleset (e.g. Synology DSM's 4.4: no nf_tables, no xt_socket).
-
-    Without the socket match the port range is all it can go by, so the IMS leg's RTP on an
-    IPv4 PDN (bound to the wildcard address, same range) is reachable through the relay too.
-    That still takes valid TURN credentials, where direct mode publishes the same ports with
-    none; AMI, SIP and the WebSocket stay outside the range and are dropped. The text is fed
-    to both iptables-legacy-restore and ip6tables-legacy-restore, which accept it as is. It
-    replaces the filter table of this container's own namespace, which nothing else uses, so
-    loading it twice gives the same result."""
-    rule = f"-A INPUT -i {interface}"
-    return (
-        "*filter\n"
-        ":INPUT ACCEPT [0:0]\n"
-        ":FORWARD ACCEPT [0:0]\n"
-        ":OUTPUT ACCEPT [0:0]\n"
-        f"{rule} -p udp -m udp --dport {int(rtp_start)}:{int(rtp_end)} -j ACCEPT\n"
-        f"{rule} -j DROP\n"
-        "COMMIT\n")
 
 
 def imeisv_from_imei(imei, imeisv="", svn="00"):
@@ -242,9 +183,10 @@ def build_context(cfg):
     nai = f"0{imsi}@nai.epc.mnc{mnc}.mcc{mcc}.3gppnetwork.org"
     # P-CSCF: explicit config wins; else a discovered address exported by entrypoint.
     pcscf = cfg.get("pcscf", "")
-    if not pcscf and os.path.exists("/run/mdd-sim-gateway/pcscf"):
+    pcscf_path = os.path.join(RUNDIR, "pcscf")
+    if not pcscf and os.path.exists(pcscf_path):
         try:
-            pcscf = open("/run/mdd-sim-gateway/pcscf").read().strip()
+            pcscf = open(pcscf_path).read().strip()
         except Exception:
             pcscf = ""
     sip = cfg.get("sip", {})
@@ -255,16 +197,9 @@ def build_context(cfg):
         raise ValueError("AMI credential is missing from instance configuration")
     if webrtc.get("enable", True) and not webrtc_password:
         raise ValueError("WebRTC credential is missing from instance configuration")
-    media = cfg.get("media") or {}
-    media_subnet = (media.get("subnet") or "") if media.get("mode") == "relay" else ""
-    media_if, media_addr = (media_interface(media_subnet) if media.get("mode") == "relay"
-                            else ("", ""))
-    local_addr = cfg.get("local_addr") or container_ipv4(media_subnet)
-    # The softphone listener must sit where the control surface relay connects: the Engine
-    # network. A line going direct also joins the uplink, whose default route makes local_addr
-    # the uplink address after the post-tunnel re-render (#195).
-    ws_addr = (media_interface(cfg["engine_subnet"])[1] if cfg.get("engine_subnet")
-               else "") or local_addr
+    local_addr = cfg.get("local_addr") or container_ipv4()
+    # The softphone listener sits where the control surface relay connects: the veth address.
+    ws_addr = local_addr
     ike = cfg.get("ike", {}) or {}
     default_ike = ("aes256-sha256-prfsha256-modp2048,aes128-sha256-prfsha256-modp2048,"
                    "aes256-sha1-prfsha1-modp2048,aes128-sha1-prfsha1-modp2048,"
@@ -339,11 +274,13 @@ def build_context(cfg):
         "rtp_bind_addr": local_addr,
         "rtp_start": cfg.get("rtp_start", 10000),
         "rtp_end": cfg.get("rtp_end", 11000),
-        # Relay media mode: the browser leg's RTP binds to this line's media network address
-        # and is reached only through the relay. Empty in direct mode.
-        "media_relay": media.get("mode") == "relay",
-        "media_if": media_if,
-        "media_addr": media_addr,
+        # Where the dialplan and Asterisk write, and what runs notify.py (it need not be
+        # executable in the package).
+        "logdir": LOGDIR,
+        "ast_logdir": AST_LOGDIR,
+        "rundir": RUNDIR,
+        "engine_dir": ENGINE_DIR,
+        "python": sys.executable or "python3",
         "debug_asterisk": cfg.get("debug", {}).get("asterisk", False),
         "debug_charon": cfg.get("debug", {}).get("charon", False),
     }
@@ -359,26 +296,26 @@ def main():
                       keep_trailing_newline=True)
 
     outputs = {
-        "asterisk.conf.j2": "/etc/asterisk/asterisk.conf",
-        "modules.conf.j2": "/etc/asterisk/modules.conf",
-        "logger.conf.j2": "/etc/asterisk/logger.conf",
-        "manager.conf.j2": "/etc/asterisk/manager.conf",
-        "acl.conf.j2": "/etc/asterisk/acl.conf",
-        "cdr.conf.j2": "/etc/asterisk/cdr.conf",
-        "cel.conf.j2": "/etc/asterisk/cel.conf",
-        "features.conf.j2": "/etc/asterisk/features.conf",
-        "ccss.conf.j2": "/etc/asterisk/ccss.conf",
-        "indications.conf.j2": "/etc/asterisk/indications.conf",
-        "pjproject.conf.j2": "/etc/asterisk/pjproject.conf",
-        "stasis.conf.j2": "/etc/asterisk/stasis.conf",
-        "udptl.conf.j2": "/etc/asterisk/udptl.conf",
-        "rtp.conf.j2": "/etc/asterisk/rtp.conf",
-        "http.conf.j2": "/etc/asterisk/http.conf",
-        "pjsip.conf.j2": "/etc/asterisk/pjsip.conf",
-        "extensions.conf.j2": "/etc/asterisk/extensions.conf",
-        "ami_usim.ini.j2": "/usr/local/etc/ami_usim.ini",
+        "asterisk.conf.j2": os.path.join(AST_ETC, "asterisk.conf"),
+        "modules.conf.j2": os.path.join(AST_ETC, "modules.conf"),
+        "logger.conf.j2": os.path.join(AST_ETC, "logger.conf"),
+        "manager.conf.j2": os.path.join(AST_ETC, "manager.conf"),
+        "acl.conf.j2": os.path.join(AST_ETC, "acl.conf"),
+        "cdr.conf.j2": os.path.join(AST_ETC, "cdr.conf"),
+        "cel.conf.j2": os.path.join(AST_ETC, "cel.conf"),
+        "features.conf.j2": os.path.join(AST_ETC, "features.conf"),
+        "ccss.conf.j2": os.path.join(AST_ETC, "ccss.conf"),
+        "indications.conf.j2": os.path.join(AST_ETC, "indications.conf"),
+        "pjproject.conf.j2": os.path.join(AST_ETC, "pjproject.conf"),
+        "stasis.conf.j2": os.path.join(AST_ETC, "stasis.conf"),
+        "udptl.conf.j2": os.path.join(AST_ETC, "udptl.conf"),
+        "rtp.conf.j2": os.path.join(AST_ETC, "rtp.conf"),
+        "http.conf.j2": os.path.join(AST_ETC, "http.conf"),
+        "pjsip.conf.j2": os.path.join(AST_ETC, "pjsip.conf"),
+        "extensions.conf.j2": os.path.join(AST_ETC, "extensions.conf"),
+        "ami_usim.ini.j2": os.path.join(ENGINE_ETC, "ami_usim.ini"),
     }
-    os.makedirs("/etc/asterisk", exist_ok=True)
+    os.makedirs(AST_ETC, exist_ok=True)
     for tpl, dest in outputs.items():
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         rendered = env.get_template(tpl).render(**ctx)
@@ -387,18 +324,8 @@ def main():
         print(f"[render] {tpl} -> {dest}")
 
     # Export env for keeper / ami_usim / swu_ike
-    env_path = os.environ.get("MDD_ENV", "/run/mdd-sim-gateway/engine.env")
+    env_path = os.environ.get("MDD_ENV") or os.path.join(RUNDIR, "engine.env")
     os.makedirs(os.path.dirname(env_path), exist_ok=True)
-    # Relay media mode: the entrypoint loads one of these before Asterisk starts, the nftables
-    # ruleset when the kernel takes it and the iptables-legacy one otherwise.
-    rulesets = {"media.nft": media_ruleset, "media.iptables": media_legacy_ruleset}
-    for name, ruleset in rulesets.items():
-        ruleset_path = os.path.join(os.path.dirname(env_path), name)
-        if ctx["media_addr"]:
-            with open(ruleset_path, "w") as f:
-                f.write(ruleset(ctx["media_if"], ctx["rtp_start"], ctx["rtp_end"]))
-        elif os.path.exists(ruleset_path):
-            os.unlink(ruleset_path)
     with open(env_path, "w") as f:
         # This file is sourced by entrypoint.sh. Reader names routinely contain spaces and
         # parentheses; writing raw values makes the shell execute the second word as a command
@@ -416,9 +343,9 @@ def main():
         # Policy that used to arrive as container environment.
         put("SWU_LIVENESS_PERIOD", cfg.get("liveness_period", 0))
         put("SWU_PCSCF_APPLY_MODE", cfg.get("pcscf_apply_mode") or "restart")
-        if ctx["media_relay"]:
-            put("MDD_MEDIA_MODE", "relay")
-            put("MDD_MEDIA_IF", ctx["media_if"])
+        # The bounded Asterisk debug window around a P-CSCF apply exists only while the line's
+        # Asterisk debug is on: DEBUG output carries SIP MESSAGE bodies (SMS as RP-DATA hex).
+        put("SWU_PCSCF_DEBUG_SECONDS", 90 if ctx["debug_asterisk"] else 0)
         # SWu (python IKEv2/IPsec) launch params — consumed by entrypoint.sh to start
         # swu_ike.py. Reader is addressed by index for swu_ike's smartcard path; source is the
         # container IP; ePDG FQDN is resolved by swu_ike.

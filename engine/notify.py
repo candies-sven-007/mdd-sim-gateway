@@ -8,7 +8,7 @@ Usage (from the Asterisk dialplan or swu_ike tunnel hooks):
 Events: call_in <from>, call_out <to>, call_result <dir> <peer> <dialstatus> <cause> <by>,
         tunnel_up, tunnel_down, registered, unregistered, cp_mode_resolved, engine_stopped
 
-Reads MANAGER_URL and MDD_ID from /run/mdd-sim-gateway/engine.env (written by render.py).
+Reads MANAGER_URL and MDD_ID from $MDD_RUNDIR/engine.env (written by render.py).
 Never fails the caller (all exceptions swallowed).
 """
 import os
@@ -16,10 +16,13 @@ import sys
 import json
 import time
 
+LOGDIR = os.environ.get("MDD_LOGDIR", "/logs")
+
 
 def load_env():
     env = {}
-    path = os.environ.get("MDD_ENV", "/run/mdd-sim-gateway/engine.env")
+    path = os.environ.get("MDD_ENV") or os.path.join(
+        os.environ.get("MDD_RUNDIR", "/run/mdd-sim-gateway"), "engine.env")
     try:
         with open(path) as f:
             for line in f:
@@ -42,8 +45,8 @@ def main():
     payload = {"ts": int(time.time()), "instance": inst_id, "event": event, "args": args}
     # Always append to a local event log so nothing is lost if the manager is down.
     try:
-        os.makedirs("/logs", exist_ok=True)
-        with open("/logs/events.jsonl", "a") as f:
+        os.makedirs(LOGDIR, exist_ok=True)
+        with open(os.path.join(LOGDIR, "events.jsonl"), "a") as f:
             f.write(json.dumps(payload) + "\n")
     except Exception:
         pass
@@ -92,7 +95,7 @@ def main():
 
 def _warn(msg: str):
     try:
-        print(f"[notify] event not delivered: {msg} (kept in /logs/events.jsonl)",
+        print(f"[notify] event not delivered: {msg} (kept in {LOGDIR}/events.jsonl)",
               file=sys.stderr, flush=True)
     except Exception:
         pass

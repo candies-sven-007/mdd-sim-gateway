@@ -1,9 +1,9 @@
 [general]
 enabled=yes
 {% if webrtc_enable and webrtc_ws_addr %}
-; Browser softphone SIP-over-WebSocket. Plain WS on the Engine network address only: the control
-; surface relays it by line path and terminates TLS itself, nothing publishes this port to the
-; host, and the VoWiFi tunnel's inner address is deliberately not bound.
+; Browser softphone SIP-over-WebSocket. Plain WS on the line's veth address only: the control
+; surface relays it by line path and terminates TLS itself, nothing forwards this port from the
+; LAN, and the VoWiFi tunnel's inner address is deliberately not bound.
 bindaddr={{ webrtc_ws_addr }}
 bindport={{ webrtc_ws_port }}
 {% else %}

@@ -9,24 +9,31 @@
 # address, and requests the IPv6 P-CSCF. A supervisor restarts it on exit; because every fresh
 # start re-runs EAP-AKA WITH the PIN verify, the tunnel self-heals after a rekey/reauth teardown.
 #
-# PC/SC: this container is a pcscd CLIENT — it talks to the HOST pcscd via the bind-mounted
-# /run/pcscd socket. The pcsc-lite client library is pinned to the same version as the host
-# pcscd (see Dockerfile PCSC_VERSION) so the client/server protocol always matches.
+# Runs as the ExecStart of mdd-engine@N.service, inside the line's network namespace
+# (packaging/systemd/mdd-engine@.service). PC/SC: the engine is a client of the host pcscd
+# (/run/pcscd), built from the same pcsc-lite release.
+#
+# Paths come from the unit's environment; the defaults are the old container paths.
 set -u
 
 export MDD_RUNDIR="${MDD_RUNDIR:-/run/mdd-sim-gateway}"
-# /logs is bind-mounted from the host and survives both a container restart and a rebuild, so
-# Asterisk's own logs live there (astlogdir in asterisk.conf). Until this existed, every
-# investigation into "the engine restarted on its own" had to work from `docker logs` alone,
-# which loses everything the moment the manager recreates the container.
-export MDD_AST_LOGDIR="${MDD_AST_LOGDIR:-/logs/asterisk}"
-mkdir -p "$MDD_RUNDIR" /logs "$MDD_AST_LOGDIR" /etc/asterisk
+export MDD_LOGDIR="${MDD_LOGDIR:-/logs}"
+# The line's log directory survives engine restarts, so Asterisk's own logs live there
+# (astlogdir in asterisk.conf). Until this existed, every investigation into "the engine
+# restarted on its own" had to work from the process output alone.
+export MDD_AST_LOGDIR="${MDD_AST_LOGDIR:-$MDD_LOGDIR/asterisk}"
+ENGINE_DIR="${MDD_ENGINE_DIR:-/usr/local/bin}"
+ENGINE_ETC="${MDD_ENGINE_ETC:-/usr/local/etc}"
+export SWU_NOTIFY="${SWU_NOTIFY:-$ENGINE_DIR/notify.py}"
+export SWU_RENDER="${SWU_RENDER:-$ENGINE_DIR/render.py}"
+mkdir -p "$MDD_RUNDIR" "$MDD_RUNDIR/asterisk" "$MDD_LOGDIR" "$MDD_AST_LOGDIR" "$ENGINE_ETC" \
+    /etc/asterisk
 
 log() { echo "[entrypoint] $*"; }
 
 # One machine-readable line per supervised lifecycle transition (Asterisk exit, swu_ike exit,
-# backoff reset). The manager reads this to tell a docker-restart-policy bounce apart from a
-# rebuild it performed itself; `docker logs` cannot express that difference.
+# backoff reset). The manager reads this to tell a bounce systemd performed on its own apart
+# from a restart it asked for; the process output cannot express that difference.
 supervisor_record() {
     python3 - "$@" <<'PY' 2>/dev/null || true
 import json, os, sys, time
@@ -39,7 +46,7 @@ for pair in sys.argv[2:]:
         rec[key] = int(value)
     except ValueError:
         rec[key] = value
-path = os.path.join(os.environ.get("MDD_AST_LOGDIR", "/logs/asterisk"), "supervisor.jsonl")
+path = os.path.join(os.environ["MDD_AST_LOGDIR"], "supervisor.jsonl")
 try:
     # Bounded: this file must never be the reason a 15G SD card fills up.
     lines = []
@@ -79,9 +86,9 @@ rotate_asterisk_logs() {
 
 rotate_asterisk_logs
 
-# --- 1. Render configs from /config/instance.json --------------------------------
+# --- 1. Render configs from the line's instance.json ---------------------------------
 log "rendering configs..."
-python3 /usr/local/bin/render.py || { log "render failed"; exit 1; }
+python3 "$ENGINE_DIR/render.py" || { log "render failed"; exit 1; }
 # shellcheck disable=SC1091
 set -a; . "$MDD_RUNDIR/engine.env"; set +a
 export USIM_PIN USIM_READER USIM_READER_INDEX USIM_READER_PORT USIM_IMSI MDD_ID MANAGER_URL MANAGER_EVENT_TOKEN MDD_RUNDIR
@@ -89,53 +96,11 @@ export PIN_USIM_READER
 export SWU_SOURCE SWU_EPDG SWU_APN SWU_MCC SWU_MNC SWU_IMEI SWU_IMEISV SWU_CHILD_REKEY_MINUTES SWU_IDR_MODE SWU_CP_MODE SWU_CP_MODE_ORDER
 export SWU_ACCEPT_EPDG_ESP_REKEY
 
-# --- 1b. Relay media mode: the media interface accepts call media only ------------
-# The relay can reach this container's media address, and AMI, SIP and the softphone WebSocket
-# listen on every address. render.py wrote the ruleset that admits only UDP to the RTP range
-# there. If it cannot be loaded, the interface goes down instead: browser calls lose audio,
-# registration and SMS carry on, and nothing else is left reachable.
-# nftables comes first and, where the kernel takes it, is all that runs. A kernel without
-# nf_tables or its socket match (Synology DSM's 4.4) gets the iptables-legacy ruleset instead,
-# which admits the same port range but cannot tell the browser leg from the IMS leg (see
-# media_legacy_ruleset in render.py). IPv6 is filtered too unless the kernel has none at all.
-load_media_firewall() {
-  media_filter=""
-  if nft -f "$MDD_RUNDIR/media.nft"; then
-    media_filter=nft
-    return 0
-  fi
-  log "relay media: nftables ruleset refused by this kernel, trying iptables-legacy"
-  if ! iptables-legacy-restore < "$MDD_RUNDIR/media.iptables"; then
-    log "relay media: iptables-legacy (IPv4) failed too"
-    return 1
-  fi
-  if [ -e /proc/net/if_inet6 ] && ! ip6tables-legacy-restore < "$MDD_RUNDIR/media.iptables"; then
-    log "relay media: iptables-legacy (IPv6) failed"
-    return 1
-  fi
-  media_filter=iptables-legacy
-}
-
-if [ "${MDD_MEDIA_MODE:-direct}" = relay ]; then
-  media_filter=""
-  if [ -z "${MDD_MEDIA_IF:-}" ]; then
-    media_state=no_media_address
-  elif load_media_firewall; then
-    media_state=ready
-  else
-    ip link set dev "$MDD_MEDIA_IF" down || true
-    media_state=firewall_failed
-  fi
-  log "relay media: $media_state${media_filter:+ ($media_filter)}"
-  printf '{"mode": "relay", "state": "%s", "filter": "%s"}\n' "$media_state" "$media_filter" \
-    > "$MDD_RUNDIR/media.json"
-fi
-
 # --- 2. Start PIN keeper and wait for the SIM to be usable ------------------------
 # pin_keeper holds CHV1 verified for ami_usim's SIP IMS-AKA. swu_ike verifies the PIN itself
 # in its own connection for EAP-AKA, so both auth paths work on PIN-enabled SIMs.
 log "starting pin_keeper (reader=${PIN_USIM_READER:-$USIM_READER})..."
-USIM_READER="${PIN_USIM_READER:-$USIM_READER}" python3 -u /usr/local/bin/pin_keeper.py &
+USIM_READER="${PIN_USIM_READER:-$USIM_READER}" python3 -u "$ENGINE_DIR/pin_keeper.py" &
 KEEPER_PID=$!
 
 wait_pin() {
@@ -158,14 +123,14 @@ rm -f "$MDD_RUNDIR/swu.ctl" "$MDD_RUNDIR/swu_status.json"
 
 # swu_ike is very chatty (per-packet IKE decode dumps). Send ITS stdout+stderr ONLY to the IKE
 # log (run/charon.log) through log_capture.py, which timestamps every physical line and rotates
-# complete segments into persistent /logs/ike storage. This keeps it separate from Asterisk's
-# console (docker logs); the manager surfaces IKE and Asterisk as two separate views.
-# The supervisor's own status lines still go to the container stdout via log().
+# complete segments into persistent $MDD_LOGDIR/ike storage. This keeps it separate from
+# Asterisk's console (the journal); the manager surfaces IKE and Asterisk as two separate views.
+# The supervisor's own status lines still go to stdout via log().
 # A run that carried traffic for this long counts as a successful connection, so the next
 # teardown starts from the short delay again. Without the reset the delay only ever doubled
 # (4 -> 8 -> ... -> 60) for the life of the process; that stayed invisible only because the
-# container itself was being restarted after nearly every teardown, which re-seeded it to 4.
-# Once Asterisk stops taking the container down with it, an unreset backoff would leave a
+# engine itself was being restarted after nearly every teardown, which re-seeded it to 4.
+# Once Asterisk stops taking the engine down with it, an unreset backoff would leave a
 # healthy line waiting a full minute to re-establish.
 SWU_STABLE_SECONDS="${SWU_STABLE_SECONDS:-120}"
 (
@@ -173,7 +138,7 @@ SWU_STABLE_SECONDS="${SWU_STABLE_SECONDS:-120}"
   while true; do
     log "swu_ike starting"
     started=$(date +%s)
-    python3 -u /usr/local/bin/swu_ike.py \
+    python3 -u "$ENGINE_DIR/swu_ike.py" \
         -m "${USIM_READER_INDEX:-0}" \
         -s "$SWU_SOURCE" \
         -d "$SWU_EPDG" \
@@ -183,9 +148,9 @@ SWU_STABLE_SECONDS="${SWU_STABLE_SECONDS:-120}"
         -N "$SWU_MNC" \
         -E "${SWU_IMEI:-}" \
         -V "${SWU_IMEISV:-}" 2>&1 | \
-      python3 -u /usr/local/bin/log_capture.py \
+      python3 -u "$ENGINE_DIR/log_capture.py" \
         --current "$MDD_RUNDIR/charon.log" \
-        --archive-dir /logs/ike
+        --archive-dir "$MDD_LOGDIR/ike"
     rc=${PIPESTATUS[0]}
     ran=$(( $(date +%s) - started ))
     if [ "$ran" -ge "$SWU_STABLE_SECONDS" ]; then
@@ -218,7 +183,7 @@ done
 addr=$(cat "$MDD_RUNDIR/pcscf" 2>/dev/null)
 if [ -n "$addr" ]; then
   log "discovered P-CSCF: $addr"
-  python3 /usr/local/bin/render.py || true   # re-render pjsip.conf with pcscf
+  python3 "$ENGINE_DIR/render.py" || true   # re-render pjsip.conf with pcscf
   # Seed the applied-marker so swu_ike's in-process P-CSCF watcher only re-renders + reloads
   # Asterisk on a LATER change (reconnect/reauth), not redundantly right after this render.
   printf '%s' "$addr" > "$MDD_RUNDIR/pcscf.applied"
@@ -228,27 +193,26 @@ fi
 
 # --- 5. Start USIM<->AMI bridge and Asterisk -------------------------------------
 log "starting ami_usim bridge..."
-python3 -u /usr/local/bin/ami_usim.py /usr/local/etc/ami_usim.ini &
+python3 -u "$ENGINE_DIR/ami_usim.py" "$ENGINE_ETC/ami_usim.ini" &
 
-# Asterisk used to be exec'd as PID 1, which meant that when it went away the container simply
-# vanished and the only surviving evidence was "ExitCode=0" from `docker inspect` — not enough
-# to tell a clean shutdown from a crash, and `exit 0` with no kernel segfault record fits
-# neither. Supervise it instead so the exact disposition (exit status vs terminating signal) is
-# recorded before the container goes down. Signals are forwarded so `docker stop` still stops
-# Asterisk the way it did before.
+# Asterisk used to be exec'd as PID 1, which meant that when it went away the engine simply
+# vanished and the only surviving evidence was an exit code of 0 — not enough to tell a clean
+# shutdown from a crash, and `exit 0` with no kernel segfault record fits neither. Supervise it
+# instead so the exact disposition (exit status vs terminating signal) is recorded before the
+# engine goes down. Signals are forwarded so `systemctl stop` stops Asterisk the same way.
 #
-# -g makes Asterisk dump core if it is ever actually killed by a signal; the container needs a
-# core ulimit for that to produce a file (the manager sets it). It costs nothing when, as the
-# evidence so far suggests, the process is leaving through a normal exit path.
+# -g makes Asterisk dump core if it is ever killed by a signal. Off by default (the unit sets
+# LimitCORE=0 and MDD_ASTERISK_CORE_DUMP=0: a core on the device's small root filesystem costs
+# more than it tells); switch both on in a unit drop-in to investigate a crash.
 ASTERISK_ARGS="-f"
-[ "${MDD_ASTERISK_CORE_DUMP:-1}" = "1" ] && ASTERISK_ARGS="$ASTERISK_ARGS -g"
+[ "${MDD_ASTERISK_CORE_DUMP:-0}" = "1" ] && ASTERISK_ARGS="$ASTERISK_ARGS -g"
 
 log "starting Asterisk... (args: $ASTERISK_ARGS)"
 # shellcheck disable=SC2086
 asterisk $ASTERISK_ARGS &
 AST_PID=$!
 AST_RC=0
-# Asterisk's own logs are now persistent, so nothing prunes them when the container stays up
+# Asterisk's own logs are now persistent, so nothing prunes them when the engine stays up
 # for weeks. Check hourly; rotate_asterisk_logs is a no-op below the size cap.
 (
   while true; do
@@ -278,5 +242,5 @@ else
     log "asterisk exited normally with status $AST_RC"
     supervisor_record asterisk_exited "rc=$AST_RC" "disposition=exit"
 fi
-python3 /usr/local/bin/notify.py engine_stopped "$AST_RC" >/dev/null 2>&1 || true
+python3 "$ENGINE_DIR/notify.py" engine_stopped "$AST_RC" >/dev/null 2>&1 || true
 exit "$AST_RC"

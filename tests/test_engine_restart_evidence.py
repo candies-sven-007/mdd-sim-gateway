@@ -135,11 +135,11 @@ class EntrypointSupervisionTests(unittest.TestCase):
         delays = result.stdout.split()
         self.assertEqual(delays, ["4", "8", "16", "32", "4", "8"])
 
-    def test_asterisk_logs_are_written_to_the_bind_mounted_volume(self):
-        """/logs survives both a container restart and a manager rebuild; the image's default
-        log directory survives neither."""
+    def test_asterisk_logs_are_written_to_the_lines_log_directory(self):
+        """The line's log directory survives an engine restart; Asterisk's default log
+        directory (private to each engine run) does not."""
         conf = (REPO / "engine" / "templates" / "asterisk.conf.j2").read_text()
-        self.assertRegex(conf, r"astlogdir\s*=\s*/logs/asterisk")
+        self.assertRegex(conf, r"astlogdir\s*=\s*\{\{ ast_logdir \}\}")
         self.assertIn("mkdir -p", ENTRYPOINT.read_text())
         self.assertIn("MDD_AST_LOGDIR", ENTRYPOINT.read_text())
 

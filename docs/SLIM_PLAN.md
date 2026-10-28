@@ -416,6 +416,12 @@ nft table inet mdd:
   - 删除：`rtp_forward.py`、media relay 全部代码（`media.py` 只剩 direct）、`media_supervisor` 后台任务、requirements 里的 `docker`；docker 依赖去掉后，operations/sysinfo/system 路由里的镜像清理、构建缓存、容器重启执行器、Docker 存储统计也在本项一起删除（WebUI 部分留在第 6 项）。设置接口校验 `max_lines` ∈ {1,2}，调小后立即停止超出的线路。
   - P-1：关闭 `/docs`、`/redoc`、`/openapi.json`，加测试。
   - 测试：删除 `test_media_relay`、`test_rtp_forward`；Docker 机制相关的用例随功能删除；新增 `tests/test_engine_systemd.py`（27 个）；`test_runtime_registry`、`test_media_control`、`test_engine_manager_url`、`test_product_boundaries` 按新行为重写。全量 1009 个通过。
+- 2026-10-28 §12.11 第 5 项完成：引擎侧。
+  - `entrypoint.sh`：删除 relay 防火墙段；脚本、日志、ami_usim.ini 路径改用 `MDD_ENGINE_DIR`/`MDD_LOGDIR`/`MDD_ENGINE_ETC`（默认仍是容器路径）；创建 `$MDD_RUNDIR/asterisk`；core dump 默认关闭（P-7）。
+  - `render.py`：读 `MDD_CONFIG`；`MDD_RUNDIR`/`MDD_LOGDIR`/`MDD_AST_LOGDIR`/`MDD_ENGINE_ETC`/`MDD_AST_ETC`；删除 relay 与 `engine_subnet` 分支（软电话监听固定在 veth 地址）。`notify.py` 同样改为读环境变量。
+  - 模板：`asterisk.conf` 的 `astlogdir`/`astrundir` 指向线路目录，`astctlpermissions = 0660`（控制面经组 mdd 用 `asterisk -r -s`）；拨号计划里 `calls.txt` 与 `notify.py` 走线路路径，`notify.py` 用 Python 解释器显式调用（不依赖可执行位）；rtp/pjsip/http 模板去掉 relay 分支。
+  - **修正一处违反硬约束的默认行为**：swu_ike 每次应用 P-CSCF 都会执行 `core set debug 3` 90 秒（`SWU_PCSCF_DEBUG_SECONDS` 默认 90），DEBUG 输出写进持久的 `reload_debug` 日志，期间收到的短信 RP-DATA 十六进制会落盘。改为：swu_ike 默认 0；render.py 只在该线路开启 Asterisk 调试时写 90；`logger.conf` 的 `reload_debug` 通道也只在调试时出现。
+  - 测试：`tests/test_media_engine.py` 重写为 direct 渲染、线路路径、默认无 debug（含"任何地方都不打开 pjsip logger"）、engine.env 注入（`$(...)`、反引号、换行、引号等被 `set -a; .` 读入后原样保留且不执行）。全量 1004 个通过（relay 渲染与入口防火墙相关用例随功能删除）。
 
 ---
 

@@ -347,7 +347,9 @@ def swu_apply_pcscf(addr, tunnel_rebuilt=False):
             swu_log("P-CSCF changed (%s -> %s); re-rendering pjsip + applying via %s"
                     % (last, addr, mode))
         swu_notify("pcscf_apply_start", mode)
-        _pcscf_debug_window(int(os.environ.get("SWU_PCSCF_DEBUG_SECONDS", "90") or 0))
+        # Off unless the line's Asterisk debug is switched on (render.py): DEBUG output holds
+        # SIP MESSAGE bodies, so it must never run by default.
+        _pcscf_debug_window(int(os.environ.get("SWU_PCSCF_DEBUG_SECONDS", "0") or 0))
         subprocess.call(["python3", render], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # Write the applied-marker BEFORE touching Asterisk. Under `restart` the config is
         # already on disk and a cold start picks it up, so a restart that never returns must not
