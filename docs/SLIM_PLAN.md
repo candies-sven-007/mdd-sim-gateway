@@ -431,6 +431,8 @@ nft table inet mdd:
   - 代码改动：orchestrator 以 root 写入数据目录的文件改为属主与数据目录一致（`hand_to_data_owner`），否则控制面（mdd）读不到 proxy-status.json；asterisk.conf 增加 `astdatadir` 指向包内 `var/lib/asterisk`，因为单元把 `/var/lib/asterisk` 挂成空 tmpfs，Asterisk 缺 documentation/ 会退出；`SWU_LIVENESS_PERIOD`/`SWU_PCSCF_APPLY_MODE` 原来是 Docker 环境变量，现在写进 instance.json 再由 render.py 写入 engine.env；P-CSCF 调试窗口默认 0 秒，只有 `debug_asterisk` 时为 90 秒。
   - 测试：删除依赖旧 install.sh/Docker 镜像的 `test_install_media`、`test_install_tun_mtu`、`test_install_requirements`、`test_engine_image_refresh`；新增 `tests/test_install_script.py`（15 个）。全量 993 个通过，WebUI 构建与 node 测试通过。
   - 未在 arm64 上实测的点：sysmocom Asterisk 在 gcc 10 下能否编过（R3）、pcsc-lite 2.x 的 meson 选项、各组件在 Debian 11 glibc 2.31 上的运行，均由 build-arm64.yml 的冒烟测试先检查一遍。
+- 2026-10-28 build-arm64 首次运行（run 40640355602，1225304）失败在容器的第一次 apt：bullseye-security 的包在 deb.debian.org/debian-security 上 404（LTS 结束后已挪到 archive.debian.org；那里的 Release 日期 2026-09-12，没有 Valid-Until，openssl 等包可下载）。修正：workflow 在 apt 之前把容器里的 `deb.debian.org/debian-security` 改写为 `archive.debian.org/debian-security`（.list 与 .sources 都改），build-arm64.sh 开头重复一次（幂等）。只改构建容器。
+  - 待定：设备上 install.sh 的 apt 会遇到同样问题。是自动改写安全源，还是只检测并提示手动修改，等设备上 `grep -rn security /etc/apt/sources.list /etc/apt/sources.list.d/` 的输出再决定；在此之前 install.sh 不改 apt 源。
 
 ---
 

@@ -73,6 +73,10 @@ grep -q 'VERSION_CODENAME=bullseye' /etc/os-release || { echo "build in debian:b
 # ---------------------------------------------------------------------------------- toolchain
 log "build dependencies"
 export DEBIAN_FRONTEND=noninteractive
+# bullseye-security now lives on archive.debian.org; deb.debian.org answers 404 for its pool.
+for sources in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+  if [ -f "$sources" ]; then sed -i 's|deb.debian.org/debian-security|archive.debian.org/debian-security|g' "$sources"; fi
+done
 apt-get update -q
 apt-get install -y -q --no-install-recommends \
   build-essential pkg-config autoconf automake libtool flex bison gettext patch perl \

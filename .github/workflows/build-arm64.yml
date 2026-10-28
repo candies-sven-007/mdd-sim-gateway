@@ -43,6 +43,15 @@ jobs:
     container: debian:bullseye
     timeout-minutes: 180
     steps:
+      # bullseye-security left deb.debian.org for archive.debian.org after LTS ended (its pool
+      # answers 404 there; bullseye/main is still served). Build container only; the device's
+      # apt sources are never changed by this project. build-arm64.sh repeats this, idempotently.
+      - name: Point bullseye-security at archive.debian.org
+        run: |
+          for file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            if [ -f "$file" ]; then sed -i 's|deb.debian.org/debian-security|archive.debian.org/debian-security|g' "$file"; fi
+          done
+          grep -rn security /etc/apt/sources.list /etc/apt/sources.list.d/ || true
       - name: Tools the checkout needs
         run: apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
