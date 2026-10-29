@@ -478,6 +478,7 @@ nft table inet mdd:
   - 设备上的临时补丁（`index-BQK4vjq9.js` 首行插入的组件桩及其 .bak）随旧版本目录 /opt/mdd/1.14.0-slim.5 一起被 install.sh 清掉（安装新版本后删除 /opt/mdd 下其他版本目录）。
 - 2026-10-28 设备反馈：英国出口报 `'str' object has no attribute 'get'`。订阅（Sub Store 导出）返回的是 base64 编码的分享链接列表，不是 Clash YAML，YAML 把它读成字符串，`subscription()` 随后对字符串调用 `.get("proxies")`。修正：新增 `parse_subscription()`，接受 Clash YAML（只保留映射类型的节点）以及明文或 base64 的分享链接列表（每行用 `parse_share_link` 转换，名称取 `#` 后的备注、vmess 取 `ps`；本网关不支持的链接跳过）；没有可用节点时报出说明两种格式的错误。测试 `tests/test_subscription_formats.py`。另：局域网网页慢查明是棒子 Wi-Fi 链路丢包（ping 平均 186 ms、大包丢失 50–75%），与 mdd 无关。
 - 2026-10-29 用户确认：线路上限从"默认 1、可配置为 2"改为"默认 1、可配置 1–10"（恢复 slim 之前的上限）。`PRODUCT_MAX_LINES = 10`；合规提示改回"最多 10 条 SIM 线路 / at most ten SIM lines"；设置页的内存提示改为说明只有插着卡的线路才运行。引擎侧（mdd-enginectl、netns 10.88.N、地址段）本来就覆盖 1–10，不用改。测试 `test_product_boundaries`、`test_ui_slim` 同步更新。
+- 2026-10-29 eSIM 页显示"未安装 lpac"（1.14.0-slim.13）。设备上以 mdd 身份直接运行 `/opt/mdd/current/lpac/lpac chip info` 和 `profile list` 都成功（EID、6 个配置文件都读到了），所以 lpac 本身和读卡路径没有问题。原因是 `lpa.lpac_bin()` 只认设置里保存的路径、旧容器的 `/usr/local/bin/lpac` 和数据目录下的默认路径，不看 mdd-control.service 设置的 `MDD_LPAC_BIN`（slim 打包时只在 `config.default_lpac_bin()` 里读了它，而这个函数没有被 `lpac_bin()` 调用）。修正：`lpac_bin()` 在回退前先检查 `MDD_LPAC_BIN`；设置里显式写的自定义路径仍然优先。同时把两处过时的提示（"运行 install.sh build-lpac"）改为"重新执行 install.sh install"。测试 `test_lpa_packaged_binary` 增加一个用例。
 
 ---
 

@@ -240,7 +240,7 @@ const zh = {
   'Click Load to stop the line and read eSIM info — lpac needs exclusive PC/SC access.': '点击“读取”将停止线路并读取 eSIM 信息；lpac 需要独占 PC/SC 访问。',
   'Stopping…': '正在停止…', 'Stop line': '停止线路', 'Download complete': '下载完成', 'Cancelling…': '正在取消…', 'Downloading…': '正在下载…',
   Dismiss: '关闭', Preview: '预览', profile: '配置文件', Chip: '芯片',
-  'lpac is not installed. Run "sudo ./install.sh build-lpac" on the host.': '未安装 lpac。请在主机运行“sudo ./install.sh build-lpac”。',
+  'lpac was not found. Reinstall this release with "sudo ./install.sh install"; it ships lpac.': '未找到 lpac。请重新执行“sudo ./install.sh install”，发布包内自带 lpac。',
   'Reading…': '正在读取…', 'Click Load to read chip info from this card (uses lpac / PC/SC).': '点击“读取”以读取此卡的芯片信息（使用 lpac / PC/SC）。',
   'This card is not an eUICC / eSIM. Ordinary USIM cards cannot be managed here.': '此卡不是 eUICC/eSIM，普通 USIM 卡无法在这里管理。',
   'This reader holds no card, so nothing could be read. For a cellular module the card arrives over its SIM bridge — check that the module is still connected.': '此读卡器中没有卡片，因此读不到任何信息。蜂窝模块的卡片经由 SIM 桥接通道提供，请确认模块仍处于连接状态。',

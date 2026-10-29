@@ -530,7 +530,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
       setStatusError(false)
       setStatusLoading(false)
       if (!st.available) {
-        setErr(t('lpac is not installed. Run "sudo ./install.sh build-lpac" on the host.'))
+        setErr(t('lpac was not found. Reinstall this release with "sudo ./install.sh install"; it ships lpac.'))
         setLoaded(false)
         return
       }
@@ -824,7 +824,7 @@ export default function Esim({ cards, instances, refresh, subscribe, showToast, 
               : statusError
                 ? t('Loading failed')
                 : status && !status.available
-              ? t('lpac is not installed. Run "sudo ./install.sh build-lpac" on the host.')
+              ? t('lpac was not found. Reinstall this release with "sudo ./install.sh install"; it ships lpac.')
               : loading
                 ? t('Reading…')
                 : !loaded

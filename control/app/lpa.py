@@ -72,9 +72,11 @@ def lpac_bin() -> str:
     default_path = os.path.join(cfg.DATA_DIR, "lpac", "lpac")
     if path and (path != default_path or os.path.isfile(path)):
         return path
-    packaged = "/usr/local/bin/lpac"
-    if os.path.isfile(packaged):
-        return packaged
+    # The release's lpac (MDD_LPAC_BIN, set by mdd-control.service) wins over the data-directory
+    # default that older settings saved; "/usr/local/bin/lpac" is the old container's path.
+    for packaged in (os.environ.get("MDD_LPAC_BIN") or "", "/usr/local/bin/lpac"):
+        if packaged and os.path.isfile(packaged):
+            return packaged
     return path or default_path
 
 
