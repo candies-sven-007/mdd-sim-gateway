@@ -520,3 +520,7 @@ label:has(>.u-toggle) { display:flex; align-items:center; gap:10px; min-height:3
 .u-bt-row .u-proxy-actions .u-note { margin:0; font-size:12px; }
 .u-inline-check { display:inline-flex; align-items:center; gap:6px; margin-top:6px; font-size:13px; cursor:pointer; }
 .u-bt-volume input[type=range] { width:100%; }
+/* Received texts page (views/Sms.jsx) */
+.u-sms-row { margin-top:14px; padding-top:14px; border-top:1px solid var(--border); }
+.u-sms-head { margin-bottom:6px; font-size:13px; overflow-wrap:anywhere; }
+.u-sms-body { white-space:pre-wrap; overflow-wrap:anywhere; font-size:14px; line-height:1.5; margin-bottom:8px; }

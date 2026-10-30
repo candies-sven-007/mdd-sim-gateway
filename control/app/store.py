@@ -1,12 +1,12 @@
 """
-store.py - SQLite persistence for the call log and the per-line connectivity timeline.
+store.py - SQLite persistence for the call log, received texts and the connectivity timeline.
 
 One database per gateway at $MDD_DATA/mdd-sim-gateway.sqlite. Rows carry the line (instance)
 id. New rows are broadcast to the WebSocket layer by the caller (main.py).
 
-This build keeps no SMS, MMS, voicemail or contact data, so none of the former message tables
-or their migrations exist here. It is installed fresh; there is no upgrade path from the
-container deployment's database.
+This build only RECEIVES text messages (table `sms`, kept SMS_RETENTION_SECONDS); it keeps no
+MMS, voicemail, sent-message or contact data. It is installed fresh; there is no upgrade path
+from the container deployment's database.
 """
 from __future__ import annotations
 
@@ -33,7 +33,12 @@ LINE_STATES = ("up", "down", "off")
 LINE_STATE_CONTINUITY_SECONDS = 90
 LINE_STATE_RETENTION_SECONDS = 3 * 24 * 3600
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# Received texts are deleted after this long (the page can delete them sooner).
+SMS_RETENTION_SECONDS = 30 * 24 * 3600
+# Parts of a long text that never complete are saved as the part of the text that did arrive.
+SMS_SEGMENT_WAIT_SECONDS = 600
 
 
 @contextlib.contextmanager
@@ -76,6 +81,29 @@ def init():
                 detail TEXT NOT NULL DEFAULT ''   -- evidence behind it (names, resolvers...)
             );
             CREATE INDEX IF NOT EXISTS idx_line_states ON line_states(instance, start_ts);
+            CREATE TABLE IF NOT EXISTS sms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                body TEXT NOT NULL,
+                sent_ts INTEGER,                -- the service centre's timestamp, if known
+                received_ts INTEGER NOT NULL,
+                read INTEGER NOT NULL DEFAULT 0,
+                parts INTEGER NOT NULL DEFAULT 1,   -- how many parts the text had
+                complete INTEGER NOT NULL DEFAULT 1 -- 0: saved before every part arrived
+            );
+            CREATE INDEX IF NOT EXISTS idx_sms ON sms(instance, received_ts);
+            CREATE TABLE IF NOT EXISTS sms_parts (
+                instance TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                ref INTEGER NOT NULL,
+                total INTEGER NOT NULL,
+                seq INTEGER NOT NULL,
+                body TEXT NOT NULL,
+                sent_ts INTEGER,
+                received_ts INTEGER NOT NULL,
+                PRIMARY KEY (instance, sender, ref, total, seq)
+            );
             """
         )
         c.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -360,3 +388,141 @@ def clear_line_states(instance: str) -> int:
     with _lock, _conn() as c:
         cur = c.execute("DELETE FROM line_states WHERE instance=?", (str(instance),))
         return cur.rowcount
+
+
+# ----------------------------------------------------------------------- received texts
+def _sms_row(row) -> dict:
+    return {"id": row["id"], "instance": row["instance"], "sender": row["sender"],
+            "body": row["body"], "sent_ts": row["sent_ts"], "received_ts": row["received_ts"],
+            "read": bool(row["read"]), "parts": row["parts"], "complete": bool(row["complete"])}
+
+
+def add_sms(instance: str, sender: str, body: str, sent_ts: int | None = None,
+            parts: int = 1, complete: bool = True, now: int | None = None) -> dict | None:
+    """Store one received text; None when the same text from the same sender is already there.
+
+    A carrier re-delivers a message whose RP-ACK it did not get, and an IMS fork can deliver one
+    twice. The service centre timestamp makes the repeat recognisable; without one, a repeat
+    within a minute is treated as the same text.
+    """
+    now = int(now if now is not None else time.time())
+    with _lock, _conn() as c:
+        if sent_ts is not None:
+            same = c.execute("SELECT 1 FROM sms WHERE instance=? AND sender=? AND body=? "
+                             "AND sent_ts=?", (instance, sender, body, sent_ts)).fetchone()
+        else:
+            same = c.execute("SELECT 1 FROM sms WHERE instance=? AND sender=? AND body=? "
+                             "AND received_ts>=?", (instance, sender, body, now - 60)).fetchone()
+        if same:
+            return None
+        cur = c.execute(
+            "INSERT INTO sms (instance, sender, body, sent_ts, received_ts, parts, complete) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (instance, sender, body, sent_ts, now, parts, 1 if complete else 0))
+        row = c.execute("SELECT * FROM sms WHERE id=?", (cur.lastrowid,)).fetchone()
+    return _sms_row(row)
+
+
+def add_sms_part(instance: str, sender: str, ref: int, total: int, seq: int, body: str,
+                 sent_ts: int | None = None, now: int | None = None) -> dict | None:
+    """Buffer one part of a long text. Returns the joined text once every part is in, else None.
+
+    The parts of one message are not guaranteed to arrive in order, and each is acknowledged to
+    the network as it comes, so they are kept here until the set is complete.
+    {"body", "sent_ts", "parts"} is returned (and the parts removed) when it is.
+    """
+    now = int(now if now is not None else time.time())
+    with _lock, _conn() as c:
+        c.execute("INSERT OR REPLACE INTO sms_parts (instance, sender, ref, total, seq, body, "
+                  "sent_ts, received_ts) VALUES (?,?,?,?,?,?,?,?)",
+                  (instance, sender, ref, total, seq, body, sent_ts, now))
+        rows = c.execute("SELECT seq, body, sent_ts FROM sms_parts WHERE instance=? AND sender=? "
+                         "AND ref=? AND total=? ORDER BY seq", (instance, sender, ref, total)
+                         ).fetchall()
+        if len(rows) < total:
+            return None
+        c.execute("DELETE FROM sms_parts WHERE instance=? AND sender=? AND ref=? AND total=?",
+                  (instance, sender, ref, total))
+    stamps = [r["sent_ts"] for r in rows if r["sent_ts"] is not None]
+    return {"body": "".join(r["body"] for r in rows), "parts": total,
+            "sent_ts": min(stamps) if stamps else sent_ts}
+
+
+def flush_stale_sms_parts(now: int | None = None) -> list[dict]:
+    """Save, as incomplete texts, the groups whose missing parts never arrived."""
+    now = int(now if now is not None else time.time())
+    saved = []
+    with _lock, _conn() as c:
+        groups = c.execute("SELECT instance, sender, ref, total, MIN(received_ts) AS first "
+                           "FROM sms_parts GROUP BY instance, sender, ref, total "
+                           "HAVING first < ?", (now - SMS_SEGMENT_WAIT_SECONDS,)).fetchall()
+        collected = []
+        for g in groups:
+            rows = c.execute("SELECT seq, body, sent_ts FROM sms_parts WHERE instance=? AND "
+                             "sender=? AND ref=? AND total=? ORDER BY seq",
+                             (g["instance"], g["sender"], g["ref"], g["total"])).fetchall()
+            c.execute("DELETE FROM sms_parts WHERE instance=? AND sender=? AND ref=? AND "
+                      "total=?", (g["instance"], g["sender"], g["ref"], g["total"]))
+            collected.append((g, rows))
+    for g, rows in collected:
+        stamps = [r["sent_ts"] for r in rows if r["sent_ts"] is not None]
+        rec = add_sms(g["instance"], g["sender"], "".join(r["body"] for r in rows),
+                      sent_ts=min(stamps) if stamps else None, parts=g["total"],
+                      complete=False, now=now)
+        if rec:
+            saved.append(rec)
+    return saved
+
+
+def list_sms(instance: str | None = None, limit: int = 200) -> list[dict]:
+    limit = max(1, min(int(limit), 1000))
+    with _lock, _conn() as c:
+        if instance:
+            rows = c.execute("SELECT * FROM sms WHERE instance=? ORDER BY received_ts DESC, "
+                             "id DESC LIMIT ?", (str(instance), limit)).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM sms ORDER BY received_ts DESC, id DESC LIMIT ?",
+                             (limit,)).fetchall()
+    return [_sms_row(r) for r in rows]
+
+
+def unread_sms_count() -> dict:
+    with _lock, _conn() as c:
+        rows = c.execute("SELECT instance, COUNT(*) AS n FROM sms WHERE read=0 "
+                         "GROUP BY instance").fetchall()
+    return {r["instance"]: r["n"] for r in rows}
+
+
+def mark_sms_read(ids: list[int] | None = None, instance: str | None = None) -> int:
+    with _lock, _conn() as c:
+        if ids:
+            cur = c.execute(f"UPDATE sms SET read=1 WHERE read=0 AND id IN "
+                            f"({_placeholders(len(ids))})", [int(i) for i in ids])
+        elif instance:
+            cur = c.execute("UPDATE sms SET read=1 WHERE read=0 AND instance=?",
+                            (str(instance),))
+        else:
+            cur = c.execute("UPDATE sms SET read=1 WHERE read=0")
+        return cur.rowcount
+
+
+def delete_sms(ids: list[int] | None = None, instance: str | None = None) -> int:
+    """Delete the listed texts, or every text of a line, or (neither given) all of them."""
+    with _lock, _conn() as c:
+        if ids:
+            cur = c.execute(f"DELETE FROM sms WHERE id IN ({_placeholders(len(ids))})",
+                            [int(i) for i in ids])
+        elif instance:
+            cur = c.execute("DELETE FROM sms WHERE instance=?", (str(instance),))
+            c.execute("DELETE FROM sms_parts WHERE instance=?", (str(instance),))
+        else:
+            cur = c.execute("DELETE FROM sms")
+            c.execute("DELETE FROM sms_parts")
+        return cur.rowcount
+
+
+def prune_sms(now: int | None = None) -> int:
+    """Delete texts older than the retention period."""
+    cutoff = int(now if now is not None else time.time()) - SMS_RETENTION_SECONDS
+    with _lock, _conn() as c:
+        return c.execute("DELETE FROM sms WHERE received_ts < ?", (cutoff,)).rowcount

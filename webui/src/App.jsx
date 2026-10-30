@@ -4,11 +4,12 @@ import Softphone from './views/Softphone.jsx'
 import GlobalSoftphone from './GlobalSoftphone.jsx'
 import Esim from './views/Esim.jsx'
 import BluetoothPage from './views/Bluetooth.jsx'
+import SmsPage from './views/Sms.jsx'
 import { UnifiedOverview, DevicesPage, EgressPage, SystemPage, DiagnosticsPage } from './views/UnifiedPages.jsx'
 import { useI18n } from './i18n.jsx'
 
 const NAV = [
-  ['overview', 'Overview', '⌂'], ['devices', 'Devices', '▣'], ['calls', 'Calls', '☎'],
+  ['overview', 'Overview', '⌂'], ['devices', 'Devices', '▣'], ['calls', 'Calls', '☎'], ['sms', 'Messages', '✉'],
   ['esim', 'eSIM', '◎'],
   ['egress', 'Network exits', '⇄'], ['bluetooth', 'Bluetooth audio', '♫'],
   ['settings', 'System settings', '⚙'], ['diagnostics', 'Diagnostics', '≣'],
@@ -173,6 +174,9 @@ export default function App() {
   // The event socket was refused for the page's origin: live updates and the softphone are off
   // until the reverse proxy is fixed, so this stays up rather than being a passing toast.
   const [originRefused, setOriginRefused] = useState(false)
+  // Unread received texts, for the dot on the Messages entry; the page itself keeps it exact.
+  const [smsUnread, setSmsUnread] = useState(0)
+  useEffect(()=>{ if(!authState?.authenticated)return; const load=()=>api.smsList().then(r=>setSmsUnread(Object.values(r.unread||{}).reduce((a,n)=>a+n,0))).catch(()=>{}); load(); const timer=setInterval(load,60*1000); return()=>clearInterval(timer) },[authState?.authenticated])
 
   useEffect(()=>{ if(!authState?.authenticated)return; return connectWs(msg=>{
     if(msg.type==='status'){
@@ -190,6 +194,7 @@ export default function App() {
     }
     if(['device','capability','engine'].includes(msg.type)) refresh()
     wsEvents.current.handlers.forEach(h=>h(msg))
+    if(msg.type==='sms'&&msg.message){setSmsUnread(n=>n+1);showToast(t('New message from {sender}',{sender:msg.message.sender||t('Unknown')}))}
     if(msg.type==='call'&&msg.call?.direction==='in')showToast(t('Incoming call from {peer}',{peer:msg.call.peer}))
   },expireAuth,()=>setOriginRefused(true))},[refresh,showToast,t,authState?.authenticated,expireAuth])
   const subscribe=useCallback(h=>{wsEvents.current.handlers.add(h);return()=>wsEvents.current.handlers.delete(h)},[])
@@ -201,6 +206,7 @@ export default function App() {
     overview:<UnifiedOverview {...common}/>, devices:<DevicesPage {...common}/>, calls:<Softphone {...common}/>,
     esim:<Esim {...common}/>,
     bluetooth:<BluetoothPage showToast={showToast}/>,
+    sms:<SmsPage instances={instances} subscribe={subscribe} showToast={showToast} onUnread={setSmsUnread}/>,
     egress:<EgressPage {...common}/>,
     settings:<SystemPage {...common}/>, diagnostics:<DiagnosticsPage {...common}/>,
   }[view]
@@ -209,7 +215,7 @@ export default function App() {
     <GlobalSoftphone instances={instances} excludedId={view === 'calls' ? sel?.id : null} showToast={showToast} />
     <aside className={`u-sidebar ${menuOpen?'open':''}`}>
       <div className="u-brand"><img src="/logo.svg" alt="" /><div>MDD Sim Gateway<small>{t('4G + VoWiFi unified')}</small></div></div>
-      <nav>{NAV.map(([key,label,icon])=><button key={key} className={view===key?'active':''} onClick={()=>{setView(key);setMenuOpen(false)}}><span>{icon}</span>{t(label)}{key==='diagnostics'&&!!systemMeta.host_alerts?.length&&<i className={`u-nav-dot ${systemMeta.host_alerts.some(a=>a.severity==='critical')?'critical':'warning'}`} title={t('The gateway host needs attention')}/>}</button>)}</nav>
+      <nav>{NAV.map(([key,label,icon])=><button key={key} className={view===key?'active':''} onClick={()=>{setView(key);setMenuOpen(false)}}><span>{icon}</span>{t(label)}{key==='sms'&&smsUnread>0&&<i className="u-nav-dot warning" title={t('Unread messages')}/>}{key==='diagnostics'&&!!systemMeta.host_alerts?.length&&<i className={`u-nav-dot ${systemMeta.host_alerts.some(a=>a.severity==='critical')?'critical':'warning'}`} title={t('The gateway host needs attention')}/>}</button>)}</nav>
       <div className="u-sidebar-foot"><div className="u-theme">{[['auto','◐'],['light','☀'],['dark','☾']].map(([k,x])=><button key={k} className={theme===k?'active':''} onClick={()=>setTheme(k)} title={t(k)}>{x}</button>)}</div><small>{discovering&&!devices.length?t('Detecting devices…'):`${devices.length} ${t(devices.length === 1 ? 'device' : 'devices')}`}</small><a className="u-feedback-link" href={issueUrl} target="_blank" rel="noreferrer"><span>◉</span>{t('Issues and suggestions')}<b>↗</b></a><div className="u-project-meta"><span className="u-version">{systemMeta.version ? `v${systemMeta.version}` : '—'}</span>{systemMeta.repository_url&&<a className="u-repo-actions" href={systemMeta.repository_url} target="_blank" rel="noreferrer">{t('Source code')}</a>}</div><button className="btn btn-ghost" onClick={async()=>{try{await api.authLogout()}finally{setCsrf('');setAuthState(s=>({...s,configured:true,authenticated:false,csrf:''}))}}}>{t('Sign out')}</button></div>
     </aside>
     <button className="u-menu" onClick={()=>setMenuOpen(!menuOpen)}>☰</button>

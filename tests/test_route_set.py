@@ -89,6 +89,11 @@ ADDED_HTTP = frozenset({
     ("POST", "/api/bluetooth/devices/{mac}/{action}"),
     ("PUT", "/api/bluetooth/volume"),
     ("PUT", "/api/bluetooth/autoconnect"),
+    # Received texts (receive only), 2026-10-30.
+    ("GET", "/api/sms"),
+    ("POST", "/api/sms/read"),
+    ("DELETE", "/api/sms/{message_id}"),
+    ("DELETE", "/api/sms"),
 })
 SERVED_HTTP = BASELINE_HTTP | ADDED_HTTP
 

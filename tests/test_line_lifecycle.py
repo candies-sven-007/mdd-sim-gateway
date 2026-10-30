@@ -120,11 +120,13 @@ class LineDeleteApiTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(main.engine, "delete_instance_data") as delete_data, \
                 patch.object(main.store, "clear_calls", return_value=3) as clear_calls, \
                 patch.object(main.store, "clear_line_states", return_value=7) as clear_states, \
+                patch.object(main.store, "delete_sms", return_value=2) as delete_sms, \
                 patch.object(lines_routes, "_refresh_card_matches"), \
                 patch.object(app_state.hub, "broadcast", new=AsyncMock()):
             result = await lines_routes.api_instance_delete("1", delete_history=True, confirm_id="1")
 
         suppress.assert_called_once_with("test-iccid")
+        delete_sms.assert_called_once_with(None, "1")      # a reused line id inherits no texts
         delete_config.assert_called_once_with("1")
         delete_data.assert_called_once_with("1")
         clear_calls.assert_called_once_with("1")

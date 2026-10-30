@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import time
 from fastapi import APIRouter
 
 from .. import config as cfg
+from .. import sms_pdu
 from .. import store
 from .. import state as app_state
 
@@ -90,17 +93,52 @@ def _call_disposition(dialstatus: str, cause: int, direction: str = "out",
     return (dialstatus.lower() if dialstatus else "cancelled")
 
 
+async def _receive_sms(iid: str, args: list) -> dict:
+    """One text delivered to a line. Nothing here logs the sender or the body."""
+    if len(args) < 2 or not cfg.get_instance(iid):
+        return {"ok": True, "dropped": "unknown_line"}
+    sender = str(args[0] or "").strip()
+    try:
+        body = base64.b64decode(str(args[1] or ""), validate=False).decode(errors="replace")
+    except Exception:  # noqa: BLE001 - not base64: nothing readable to keep
+        return {"ok": True, "dropped": "bad_body"}
+    pdu = sms_pdu.parse_event_args(args)
+    # A machine payload (8-bit data, SIM-addressed, SIM data download) is not a text for a
+    # person: it was acknowledged inside Asterisk and is dropped here, never stored.
+    if pdu.is_machine_payload or (not pdu.known and sms_pdu.looks_binary(body)):
+        return {"ok": True, "dropped": "machine_payload"}
+    sent_ts = sms_pdu.deliver_timestamp(pdu.tpdu_hex)
+    segment = sms_pdu.concat_triplet(args)
+    parts, complete = 1, True
+    if segment:
+        ref, total, seq = segment
+        joined = await asyncio.to_thread(store.add_sms_part, iid, sender, ref, total, seq,
+                                         body, sent_ts)
+        if joined is None:
+            return {"ok": True, "buffered": f"{seq}/{total}"}
+        body, sent_ts, parts = joined["body"], joined["sent_ts"], joined["parts"]
+    elif not body.strip():
+        # IMS-internal signalling arrives as MESSAGEs with a bare private-IP sender and no text.
+        return {"ok": True, "dropped": "empty_body"}
+    rec = await asyncio.to_thread(store.add_sms, iid, sender, body, sent_ts, parts, complete)
+    if rec is None:
+        return {"ok": True, "duplicate": True}
+    await app_state.hub.broadcast({"type": "sms", "instance": iid, "message": rec})
+    return {"ok": True, "id": rec["id"]}
+
+
 @router.post("/api/engine/event")
 async def api_engine_event(payload: dict):
     """Receives notify.py callbacks from engine containers."""
     iid = str(payload.get("instance", ""))
     event = payload.get("event", "")
     args = payload.get("args", [])
-    if event in ("sms_in", "sms_out", "ussd", "voicemail_new"):
-        # Messaging, USSD and voicemail are not part of this build. The network's SMS is
-        # acknowledged inside Asterisk and its content discarded there; an event that still
-        # arrives (an older engine) is dropped here and never stored or broadcast.
+    if event in ("sms_out", "ussd", "voicemail_new"):
+        # Sending, USSD and voicemail are not part of this build; an event that still arrives
+        # (an older engine) is dropped here and never stored or broadcast.
         return {"ok": True, "ignored": True}
+    if event == "sms_in":
+        return await _receive_sms(iid, args)
     if event == "call_in":
         # Log inbound calls even when the caller withholds/omits their number (peer "") so an
         # anonymous call still gets a record that the 'h' disposition can finalize. The IMS

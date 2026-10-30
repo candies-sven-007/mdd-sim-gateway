@@ -135,6 +135,11 @@ export const api = {
   call: (id, to, from_endpoint = 'webrtc') => j('POST', `/api/instances/${id}/call`, { to, from_endpoint }),
   hangup: (id) => j('POST', `/api/instances/${id}/hangup`),
   softphone: (id) => j('GET', `/api/instances/${id}/softphone`),
+  // Received texts (control/app/routers/sms.py); receive only.
+  smsList: (instance = '') => j('GET', `/api/sms${instance ? `?instance=${encodeURIComponent(instance)}` : ''}`),
+  smsRead: (body) => j('POST', '/api/sms/read', body || {}),
+  smsDelete: (id) => j('DELETE', `/api/sms/${encodeURIComponent(id)}`),
+  smsClear: (instance = '') => j('DELETE', `/api/sms${instance ? `?instance=${encodeURIComponent(instance)}` : ''}`),
   // Bluetooth speaker (control/app/routers/bluetooth.py). The MAC is validated server-side too.
   bluetoothStatus: () => j('GET', '/api/bluetooth/status'),
   bluetoothScan: () => j('POST', '/api/bluetooth/scan'),

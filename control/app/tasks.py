@@ -627,6 +627,12 @@ async def status_poller():
                 last_prune = time.monotonic()
                 await asyncio.to_thread(store.prune_line_states,
                                         int(time.time()) - store.LINE_STATE_RETENTION_SECONDS)
+                # Received texts live SMS_RETENTION_SECONDS; parts of a long text that never
+                # completed are saved as far as they got.
+                await asyncio.to_thread(store.prune_sms)
+                for rec in await asyncio.to_thread(store.flush_stale_sms_parts):
+                    await app_state.hub.broadcast({"type": "sms", "instance": rec["instance"],
+                                                   "message": rec})
         except Exception as e:  # noqa
             log.debug("poller error: %r", e)
         try:

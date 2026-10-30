@@ -6,7 +6,7 @@ Usage (from the Asterisk dialplan or swu_ike tunnel hooks):
   notify.py <event> [arg1] [arg2] ...
 
 Events: call_in <from>, call_out <to>, call_result <dir> <peer> <dialstatus> <cause> <by>,
-        tunnel_up, tunnel_down, registered, unregistered, cp_mode_resolved, engine_stopped
+        sms_in <from> <body_b64> <concat ref/total/seq> <pid> <dcs> <udh> <tpdu>, tunnel_up, tunnel_down, registered, unregistered, cp_mode_resolved, engine_stopped
 
 Reads MANAGER_URL and MDD_ID from $MDD_RUNDIR/engine.env (written by render.py).
 Never fails the caller (all exceptions swallowed).
@@ -43,8 +43,11 @@ def main():
     manager_url = os.environ.get("MANAGER_URL") or env.get("MANAGER_URL", "")
     inst_id = os.environ.get("MDD_ID") or env.get("MDD_ID", "1")
     payload = {"ts": int(time.time()), "instance": inst_id, "event": event, "args": args}
-    # Always append to a local event log so nothing is lost if the manager is down.
+    # Always append to a local event log so nothing is lost if the manager is down. A received
+    # text is the exception: its body stays out of every log and goes to the manager only.
     try:
+        if event == "sms_in":
+            raise OSError("not logged")
         os.makedirs(LOGDIR, exist_ok=True)
         with open(os.path.join(LOGDIR, "events.jsonl"), "a") as f:
             f.write(json.dumps(payload) + "\n")

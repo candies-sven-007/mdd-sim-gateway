@@ -1110,6 +1110,7 @@ async def api_instance_delete(iid: str, delete_history: bool = True, confirm_id:
     deleted_calls = 0
     if delete_history:
         deleted_calls = await asyncio.to_thread(store.clear_calls, iid)
+        await asyncio.to_thread(store.delete_sms, None, str(iid))
     # Line ids are reused by the next created line, so its connectivity timeline always goes
     # with the line it describes — a new SIM must never inherit another SIM's outages.
     app_state._line_state_written.pop(str(iid), None)

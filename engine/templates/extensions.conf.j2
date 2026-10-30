@@ -62,14 +62,18 @@ exten => h,1,Gosub(hangup-by,s,1)
 same => n,TrySystem({{ python }} {{ engine_dir }}/notify.py call_result in "${CALLPEER}" "${DIALSTATUS}" "${HANGUPCAUSE}" "${GOSUB_RETVAL}" &)
 same => n,Hangup()
 
-; ===== Incoming SMS from the IMS/VoWiFi side =====
-; This build does not handle SMS, but the network still delivers it (receive_sms=yes keeps the
-; registration SMS-capable) and the SMSC waits for an RP-ACK. res_pjsip_messaging answers 200 and
-; sends that RP-ACK only when the message has somewhere to go in the dialplan; with no matching
-; extension it answers 404 and the SMSC keeps re-sending. So the message is routed here, where
-; nothing reads, logs or forwards it: no MESSAGE(from), no MESSAGE(body), no file, no event.
+; ===== Incoming SMS from the IMS/VoWiFi side (receive only) =====
+; res_pjsip_messaging answers 200 and sends the RP-ACK the SMSC waits for only when the message
+; has a destination in the dialplan, so every MT message is routed here. The text goes to the
+; control plane through notify.py and nowhere else: no file is written here and notify.py keeps
+; sms_in out of its local event log, because a message body (a verification code, say) must not
+; sit in a plain log. Arguments 3-5 are the concatenated-SMS segment triplet (ref/total/seq)
+; and 6-9 the PDU header (TP-PID, TP-DCS, UDH, raw PDU) from patches/asterisk/mt_concat_udh.py;
+; all are plain integers or lowercase hex, empty when absent, so nothing here can be
+; shell-injected from the network. The parts of a long text are joined by the control plane.
 [volte_ims_msg]
-exten => {{ any_extension }},1,NoOp(MT SMS acknowledged and discarded)
+exten => {{ any_extension }},1,NoOp(Incoming SMS)
+same => n,TrySystem({{ python }} {{ engine_dir }}/notify.py sms_in "${MESSAGE(from)}" "${BASE64_ENCODE(${MESSAGE(body)})}" "${MESSAGE_DATA(SMS_CONCAT_REF)}" "${MESSAGE_DATA(SMS_CONCAT_TOTAL)}" "${MESSAGE_DATA(SMS_CONCAT_SEQ)}" "${MESSAGE_DATA(SMS_TP_PID)}" "${MESSAGE_DATA(SMS_TP_DCS)}" "${MESSAGE_DATA(SMS_UDH_HEX)}" "${MESSAGE_DATA(SMS_TPDU_HEX)}" &)
 same => n,Hangup()
 
 ; ===== Outgoing call from the authenticated browser softphone =====

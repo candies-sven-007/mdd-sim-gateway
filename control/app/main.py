@@ -31,6 +31,7 @@ from .routers import engine as engine_routes
 from .routers import esim as esim_routes
 from .routers import lines as lines_routes
 from .routers import logs as logs_routes
+from .routers import sms as sms_routes
 from .routers import softphone as softphone_routes
 from .routers import system as system_routes
 
@@ -106,6 +107,7 @@ app.include_router(auth_routes.router)
 app.include_router(lines_routes.router)
 app.include_router(engine_routes.router)
 app.include_router(softphone_routes.router)
+app.include_router(sms_routes.router)
 app.include_router(esim_routes.router)
 app.include_router(egress_routes.router)
 app.include_router(logs_routes.router)
