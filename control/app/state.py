@@ -1334,20 +1334,29 @@ def _apply_current_hardware_imei(inst: dict) -> dict:
 
 def refresh_egress() -> dict:
     """Drop the cached subscriptions and ask the orchestrator to fetch and reconcile again."""
-    cache = os.path.join(cfg.DATA_DIR, "orchestrator", "subscription.yaml")
-    try:
-        os.remove(cache)
-    except FileNotFoundError:
-        pass
     cache_dir = os.path.join(cfg.DATA_DIR, "orchestrator", "subscriptions")
+    stale = [os.path.join(cfg.DATA_DIR, "orchestrator", "subscription.yaml")]
     try:
-        for name in os.listdir(cache_dir):
-            if name.endswith(".yaml"):
-                os.remove(os.path.join(cache_dir, name))
-    except FileNotFoundError:
+        stale += [os.path.join(cache_dir, name) for name in os.listdir(cache_dir)
+                  if name.endswith(".yaml")]
+    except OSError:
         pass
+    kept = []
+    for path in stale:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            # A cache written by an older orchestrator may belong to root. The refresh must
+            # not fail on that: the exit is still re-published, the old copy is simply kept.
+            log.warning("could not remove the subscription cache %s: %s", path, exc)
+            kept.append(os.path.basename(path))
     egress.publish()
-    return {"ok": True, "requested_at": int(time.time())}
+    result = {"ok": True, "requested_at": int(time.time())}
+    if kept:
+        result["kept"] = kept
+    return result
 
 
 async def push_status(iid: str):

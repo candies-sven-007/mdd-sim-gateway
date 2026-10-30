@@ -820,6 +820,9 @@ class Orchestrator:
                 cache.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 cache.write_bytes(body)
                 os.chmod(cache, 0o600)
+                # The control plane (user mdd) deletes these to force a refresh; a root-owned
+                # directory made it fail with PermissionError, i.e. a 500 on /api/egress/refresh.
+                hand_to_data_owner(cache)
             except Exception:
                 # A refresh outage must not discard the last known-good subscription. The
                 # urltest pool keeps probing its members while we retry the feed next cycle.
