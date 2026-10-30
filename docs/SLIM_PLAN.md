@@ -480,6 +480,12 @@ nft table inet mdd:
 - 2026-10-29 用户确认：线路上限从"默认 1、可配置为 2"改为"默认 1、可配置 1–10"（恢复 slim 之前的上限）。`PRODUCT_MAX_LINES = 10`；合规提示改回"最多 10 条 SIM 线路 / at most ten SIM lines"；设置页的内存提示改为说明只有插着卡的线路才运行。引擎侧（mdd-enginectl、netns 10.88.N、地址段）本来就覆盖 1–10，不用改。测试 `test_product_boundaries`、`test_ui_slim` 同步更新。
 - 2026-10-29 eSIM 页显示"未安装 lpac"（1.14.0-slim.13）。设备上以 mdd 身份直接运行 `/opt/mdd/current/lpac/lpac chip info` 和 `profile list` 都成功（EID、6 个配置文件都读到了），所以 lpac 本身和读卡路径没有问题。原因是 `lpa.lpac_bin()` 只认设置里保存的路径、旧容器的 `/usr/local/bin/lpac` 和数据目录下的默认路径，不看 mdd-control.service 设置的 `MDD_LPAC_BIN`（slim 打包时只在 `config.default_lpac_bin()` 里读了它，而这个函数没有被 `lpac_bin()` 调用）。修正：`lpac_bin()` 在回退前先检查 `MDD_LPAC_BIN`；设置里显式写的自定义路径仍然优先。同时把两处过时的提示（"运行 install.sh build-lpac"）改为"重新执行 install.sh install"。测试 `test_lpa_packaged_binary` 增加一个用例。
 - 2026-10-30 设备反馈：网络出口页 `POST /api/egress/refresh` 返回 500，英国/德国出口提示 "no subscription node matched country keywords"。订阅地址先前输入有误（`doenload`），用户已改正。500 的栈只拿到了开头，推断原因（未在设备上确认）：orchestrator 以 root 创建了 `orchestrator/subscriptions/`，控制面（mdd）刷新时删除缓存文件得到 PermissionError，`refresh_egress()` 未处理。修正：orchestrator 写完订阅缓存后用 `hand_to_data_owner` 交还属主；`refresh_egress()` 删不掉的缓存文件只记警告并在结果里返回 `kept`，仍然重新发布出口，不再 500。测试 `tests/test_refresh_egress.py`。已存在的 root 属主目录需要一次 `chown`（见交付说明）。我之前让用户查看订阅缓存时用错了目录（`/var/lib/mdd/subscriptions`，正确的是 `/var/lib/mdd/orchestrator/subscriptions`），空输出不能说明什么。
+- 2026-10-30 变更请求（用户）：加回"只接收短信"。这改动 §10 的 D2（"收到的短信只回 RP-ACK、丢弃内容"），经用户确认后执行；发送、彩信、USSD 仍然不做。设计：
+  - 范围与保留：只收。内容保存在数据库 `mdd-sim-gateway.sqlite`（会进入本地备份），超过 30 天自动删除（后台每小时清理一次）；页面可单条或全部删除。这一条取代 D2 的"内容不落盘"，其余硬约束不变：Asterisk 默认不开 debug、pjsip logger 保持关闭；新增约束：短信正文不进入任何日志（引擎的 `events.jsonl`、控制面日志、审计日志）。
+  - 引擎：`[volte_ims_msg]` 把 `MESSAGE(from)`、正文（base64）、拼接三元组（ref/total/seq）与 PDU 头（PID/DCS/UDH）交给 `notify.py sms_in`；恢复 `mt_concat_udh.py`（暴露这些字段，不做重组）；不写 `/logs/messages.txt`；`notify.py` 对 `sms_in` 不写本地 `events.jsonl`。`[msg-from-local]` 仍为空（不发送）。
+  - 控制面：恢复精简的 `sms_pdu.py`（判断是文字还是机器载荷：8 位数据、class 2、PID 0x7F 的直接丢弃，不保存）；`store.py` 增加 `sms`（收到的短信）与 `sms_parts`（长短信分段，凑齐后合并；超过 10 分钟未凑齐的按已收到的部分合并保存）；同一发送方、同一时间戳、同一正文的重复投递只保存一次；空正文丢弃（IMS 内部信令）。接口：`GET /api/sms`、`POST /api/sms/read`、`DELETE /api/sms/{id}`、`DELETE /api/sms`；收到新短信时通过 WebSocket 广播 `sms` 事件（只有管理员会话收到）。
+  - 页面："短信"导航项，按线路筛选、未读标记、一键复制验证码（4–8 位数字）、删除。
+  - 测试：把 `test_mt_sms_discard` 改写为新行为；新增存储、分段重组、机器载荷、日志不含正文、路由与鉴权的测试；对 sysmocom 源码试打补丁（本地 bullseye 环境）。
 
 ---
 
